@@ -26,14 +26,33 @@ async fn git(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
 }
 
 impl Worktree {
-    /// `git worktree add -b <branch> <path> <base_ref>` inside `repo`.
+    /// Check out `branch` into a new worktree at `path`, creating the branch from
+    /// `base_ref` if it does not exist yet (so successive stages share a task branch).
     pub async fn create(repo: &Path, base_ref: &str, path: &Path, branch: &str) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let path_str = path.to_str().context("worktree path is not valid UTF-8")?;
-        git(repo, &["worktree", "add", "-b", branch, path_str, base_ref]).await?;
+        git(repo, &["worktree", "prune"]).await?;
+        let exists = git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).await.is_ok();
+        if exists {
+            git(repo, &["worktree", "add", path_str, branch]).await?;
+        } else {
+            git(repo, &["worktree", "add", "-b", branch, path_str, base_ref]).await?;
+        }
         Ok(Self { repo: repo.to_owned(), path: path.to_owned(), branch: branch.to_owned() })
+    }
+
+    /// Stage and commit everything the agent changed. Returns the new commit sha,
+    /// or `None` when there was nothing to commit.
+    pub async fn commit_all(&self, message: &str) -> anyhow::Result<Option<String>> {
+        git(&self.path, &["add", "-A"]).await?;
+        if git(&self.path, &["status", "--porcelain"]).await?.is_empty() {
+            return Ok(None);
+        }
+        git(&self.path, &["-c", "user.name=WorkHub", "-c", "user.email=workhub@localhost", "commit", "-q", "-m", message])
+            .await?;
+        Ok(Some(git(&self.path, &["rev-parse", "HEAD"]).await?))
     }
 
     /// Remove the worktree directory. The branch is kept so any commits the agent made survive.

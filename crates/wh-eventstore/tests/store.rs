@@ -12,7 +12,7 @@ fn ev(task: TaskId, e: TaskEvent) -> NewEvent {
 }
 
 fn created(task: TaskId) -> NewEvent {
-    ev(task, TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli })
+    ev(task, TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: None })
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
@@ -23,7 +23,7 @@ async fn append_assigns_versions_and_round_trips(pool: PgPool) {
     store
         .append(&stream, ExpectedVersion::NoStream, vec![
             created(task),
-            ev(task, TaskEvent::StageEntered { stage: "triage".into() }),
+            ev(task, TaskEvent::StageEntered { stage: "triage".into(), feedback: None }),
         ])
         .await
         .unwrap();
@@ -31,6 +31,8 @@ async fn append_assigns_versions_and_round_trips(pool: PgPool) {
         .append(&stream, ExpectedVersion::Exact(2), vec![ev(task, TaskEvent::StageExited {
             stage: "triage".into(),
             outcome: StageOutcome::Succeeded,
+            summary: None,
+            session: None,
         })])
         .await
         .unwrap();
@@ -92,9 +94,7 @@ async fn catch_up_resumes_from_checkpoint_in_global_order(pool: PgPool) {
     assert_eq!(sub.catch_up(&mut c).await.unwrap(), 0, "checkpoint must prevent redelivery");
 
     store
-        .append(&a.stream_id(), ExpectedVersion::Exact(1), vec![ev(a, TaskEvent::StageEntered {
-            stage: "spec".into(),
-        })])
+        .append(&a.stream_id(), ExpectedVersion::Exact(1), vec![ev(a, TaskEvent::StageEntered { stage: "spec".into(), feedback: None })])
         .await
         .unwrap();
     assert_eq!(sub.catch_up(&mut c).await.unwrap(), 1);
@@ -112,9 +112,7 @@ async fn concurrent_appends_to_one_stream_never_duplicate_versions(pool: PgPool)
             let (store, stream) = (store.clone(), stream.clone());
             tokio::spawn(async move {
                 store
-                    .append(&stream, ExpectedVersion::Any, vec![ev(task, TaskEvent::StageEntered {
-                        stage: "x".into(),
-                    })])
+                    .append(&stream, ExpectedVersion::Any, vec![ev(task, TaskEvent::StageEntered { stage: "x".into(), feedback: None })])
                     .await
             })
         })

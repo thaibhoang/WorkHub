@@ -1,0 +1,49 @@
+# WorkHub's own factory (dogfooding). Edit prompts/policies here; every change
+# produces a new factory_version so before/after metrics can be compared.
+name: workhub-dev
+repo: ..
+base_ref: main
+max_rework_loops: 3
+
+defaults:
+  model: claude-sonnet-5-5
+  budget_usd: 2.0
+  timeout_min: 30
+  max_retries: 2
+  permission_mode: acceptEdits
+  allowed_tools:
+    - "Bash(cargo build:*)"
+    - "Bash(cargo test:*)"
+    - "Bash(cargo clippy:*)"
+    - "Bash(cargo fmt:*)"
+    - "Bash(git status:*)"
+    - "Bash(git diff:*)"
+    - "Bash(git log:*)"
+
+stages:
+  - { id: triage, agent: triage }
+  - { id: spec, agent: spec, gate: spec-review }
+  - { id: implement, agent: implementation }
+  - { id: code_review, agent: code-review, on_reject: implement }
+  - { id: verify, agent: verify, on_reject: implement }
+
+agents:
+  triage:
+    prompt: agents/triage.md
+    model: claude-haiku-5-5
+    budget_usd: 0.3
+    timeout_min: 5
+  spec:
+    prompt: agents/spec.md
+    budget_usd: 1.0
+  implementation:
+    prompt: agents/implementation.md
+    budget_usd: 3.0
+    timeout_min: 45
+  code-review:
+    prompt: agents/code-review.md
+    budget_usd: 1.0
+  verify:
+    prompt: agents/verify.md
+    budget_usd: 0.5
+    timeout_min: 15

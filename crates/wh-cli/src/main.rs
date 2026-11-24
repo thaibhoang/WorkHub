@@ -5,9 +5,11 @@ use clap::{Args, Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 use wh_core::{
     Actor, EventMeta, NewEvent, RecordedEvent, TaskId,
-    task::{TaskEvent, TaskSource},
+    task::{TaskEvent, TaskSource, TaskState, TaskStatus},
 };
 use wh_eventstore::{EventStore, ExpectedVersion, Subscription};
+use wh_factory::Factory;
+use wh_foreman::{Dispatch, Foreman};
 use wh_metrics::{sessions::SessionFactsProjection, tasks::TasksProjection};
 use wh_runner::{OutcomeStatus, RunSpec, Runner, RunnerConfig, Signal, claude_code::ClaudeCode};
 
@@ -34,6 +36,26 @@ enum Cmd {
     },
     /// Run one agent session on a repo (in a fresh git worktree)
     Run(RunArgs),
+    /// Drive factory tasks through the pipeline (plus projections) until Ctrl+C
+    Foreman {
+        #[arg(long, env = "WH_FACTORY", default_value = "factory/factory.yaml")]
+        factory: PathBuf,
+        /// Max stages running at the same time
+        #[arg(long, default_value_t = 2)]
+        max_parallel: usize,
+        #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
+        claude_bin: PathBuf,
+    },
+    /// Approve or reject a task waiting at a human gate
+    Gate {
+        #[command(subcommand)]
+        cmd: GateCmd,
+    },
+    /// Inspect a factory definition
+    Factory {
+        #[arg(long, env = "WH_FACTORY", default_value = "factory/factory.yaml")]
+        file: PathBuf,
+    },
     /// List recent agent sessions
     Sessions {
         #[arg(long, default_value_t = 20)]
@@ -67,9 +89,42 @@ enum TaskCmd {
         title: String,
         #[arg(long)]
         body: Option<String>,
+        /// Factory file whose pipeline should run this task (picked up by `wh foreman`)
+        #[arg(long)]
+        factory: Option<PathBuf>,
     },
     /// List tasks from the tasks_view read model
     List,
+    /// Show a task's timeline and its agent sessions
+    Show { task: TaskId },
+    /// Restart a blocked task (optionally at another stage, with guidance for the agent)
+    Resume {
+        task: TaskId,
+        #[arg(long)]
+        stage: Option<String>,
+        #[arg(long)]
+        comment: Option<String>,
+    },
+    Cancel {
+        task: TaskId,
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GateCmd {
+    Approve {
+        task: TaskId,
+        #[arg(long)]
+        comment: Option<String>,
+    },
+    /// Send the stage back to its agent with your comment as feedback
+    Reject {
+        task: TaskId,
+        #[arg(long)]
+        comment: String,
+    },
 }
 
 #[derive(Args)]
@@ -145,6 +200,11 @@ enum ProjCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Die quietly on a closed pipe (`wh task list | head`) instead of panicking.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -163,24 +223,100 @@ async fn main() -> Result<()> {
             println!("migrations applied");
         }
         Cmd::Task { cmd } => match cmd {
-            TaskCmd::Create { title, body } => {
-                let id = create_task(&store, title, body).await?;
+            TaskCmd::Create { title, body, factory } => {
+                let factory = factory.map(|p| Factory::load(&p)).transpose()?.map(|f| f.name);
+                let id = create_task(&store, title, body, factory).await?;
                 wh_metrics::catch_up_all(&store).await?;
                 println!("{id}");
             }
             TaskCmd::List => {
+                wh_metrics::catch_up_all(&store).await?;
+                println!("{:<36}  {:<13}  {:<12}  {:>6}  title", "task", "status", "stage", "rework");
                 for t in TasksProjection::list(&pool).await? {
                     println!(
-                        "{}  {:<11}  {:<10}  {}  ({})",
+                        "{}  {:<13}  {:<12}  {:>6}  {}{}",
                         t.task_id,
                         t.status,
                         t.current_stage.as_deref().unwrap_or("-"),
+                        t.rework_loops,
                         t.title,
-                        t.created_at.format("%Y-%m-%d %H:%M")
+                        t.blocked_reason.map(|r| format!("  [blocked: {}]", first_line(&r))).unwrap_or_default()
                     );
                 }
             }
+            TaskCmd::Show { task } => show_task(&store, task).await?,
+            TaskCmd::Resume { task, stage, comment } => {
+                let state = load_task(&store, task).await?;
+                anyhow::ensure!(
+                    matches!(state.status, TaskStatus::Blocked { .. }),
+                    "task is {:?}, only blocked tasks can be resumed",
+                    state.status
+                );
+                human_append(&store, task, &state, TaskEvent::TaskResumed { stage, comment }).await?;
+                println!("resumed; `wh foreman` will pick it up");
+            }
+            TaskCmd::Cancel { task, reason } => {
+                let state = load_task(&store, task).await?;
+                human_append(&store, task, &state, TaskEvent::TaskCancelled { reason }).await?;
+                println!("cancelled");
+            }
         },
+        Cmd::Gate { cmd } => {
+            let (task, approved, comment) = match cmd {
+                GateCmd::Approve { task, comment } => (task, true, comment),
+                GateCmd::Reject { task, comment } => (task, false, Some(comment)),
+            };
+            let state = load_task(&store, task).await?;
+            let TaskStatus::AwaitingGate { gate, stage } = state.status.clone() else {
+                anyhow::bail!("task is not waiting at a gate (status: {:?})", state.status);
+            };
+            let reviewer = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+            let ev = TaskEvent::GateDecided { gate: gate.clone(), stage, approved, reviewer, comment };
+            human_append(&store, task, &state, ev).await?;
+            println!("gate '{gate}' {}", if approved { "approved" } else { "rejected" });
+        }
+        Cmd::Factory { file } => {
+            let f = Factory::load(&file)?;
+            println!("factory {} (version {})  repo {}  base {}", f.name, f.version, f.repo.display(), f.base_ref);
+            println!("max rework loops: {}\n", f.max_rework_loops);
+            for st in &f.stages {
+                let a = f.agent(st);
+                println!(
+                    "  {:<12} agent {:<15} model {:<18} budget ${:<5} retries {}{}{}",
+                    st.id,
+                    a.name,
+                    a.model.as_deref().unwrap_or("(default)"),
+                    a.budget_usd,
+                    a.max_retries,
+                    st.gate.as_ref().map(|g| format!("  gate: {g}")).unwrap_or_default(),
+                    st.on_reject.as_ref().map(|t| format!("  on_reject → {t}")).unwrap_or_default(),
+                );
+            }
+        }
+        Cmd::Foreman { factory, max_parallel, claude_bin } => {
+            let f = Factory::load(&factory)?;
+            println!("foreman for factory '{}' (version {}), Ctrl+C to stop", f.name, f.version);
+            let runner = Runner::new(store.clone(), ClaudeCode::new(claude_bin), RunnerConfig { data_dir: data_dir() });
+            let dispatch = Dispatch::Spawn(std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel)));
+            let mut foreman = Foreman::new(store.clone(), f, runner, dispatch);
+            for task in foreman.recover_interrupted().await? {
+                println!("task {task} was interrupted mid-stage → blocked. Restart it with: wh task resume {task}");
+            }
+            let stop = || async {
+                tokio::signal::ctrl_c().await.ok();
+            };
+            let subs = (Subscription::new(store.clone()), Subscription::new(store.clone()), Subscription::new(store.clone()));
+            let (mut tasks, mut sessions) =
+                (TasksProjection::new(pool.clone()), SessionFactsProjection::new(pool.clone()));
+            let (a, b, c) = tokio::join!(
+                subs.0.run(&mut foreman, stop()),
+                subs.1.run(&mut tasks, stop()),
+                subs.2.run(&mut sessions, stop())
+            );
+            a?;
+            b?;
+            c?;
+        }
         Cmd::Run(args) => run_agent(&store, args).await?,
         Cmd::Sessions { limit } => {
             println!(
@@ -263,10 +399,80 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn create_task(store: &EventStore, title: String, body: Option<String>) -> Result<TaskId> {
+async fn load_task(store: &EventStore, task: TaskId) -> Result<TaskState> {
+    let events = store.read_stream(&task.stream_id()).await?;
+    anyhow::ensure!(!events.is_empty(), "task {task} not found");
+    let mut state = TaskState::default();
+    for e in &events {
+        state.apply(e.stream_version, e.decode()?);
+    }
+    Ok(state)
+}
+
+/// Append a human decision, failing if the task changed since it was read.
+async fn human_append(store: &EventStore, task: TaskId, state: &TaskState, ev: TaskEvent) -> Result<()> {
+    let meta = EventMeta::new(task.0, current_user());
+    store
+        .append(&task.stream_id(), ExpectedVersion::Exact(state.version), vec![NewEvent::from_domain(&ev, meta)?])
+        .await?;
+    wh_metrics::catch_up_all(store).await?;
+    Ok(())
+}
+
+async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {
+    let state = load_task(store, task).await?;
+    println!("{}  [{:?}]  rework loops: {}", state.title, state.status, state.rework_loops);
+    for e in store.read_stream(&task.stream_id()).await? {
+        let detail = match e.decode::<TaskEvent>()? {
+            TaskEvent::StageEntered { stage, feedback } => {
+                format!("{stage}{}", feedback.map(|f| format!(" (rework: {})", first_line(&f))).unwrap_or_default())
+            }
+            TaskEvent::StageExited { stage, outcome, summary, .. } => format!(
+                "{stage} → {}{}",
+                outcome.as_str(),
+                summary.map(|s| format!(": {}", first_line(&s))).unwrap_or_default()
+            ),
+            TaskEvent::GateRequested { gate, stage } => format!("{gate} after {stage}"),
+            TaskEvent::GateDecided { gate, approved, reviewer, comment, .. } => format!(
+                "{gate} {} by {reviewer}{}",
+                if approved { "approved" } else { "rejected" },
+                comment.map(|c| format!(": {c}")).unwrap_or_default()
+            ),
+            TaskEvent::TaskBlocked { reason, .. } => first_line(&reason).to_string(),
+            TaskEvent::TaskCompleted { branch } => branch.unwrap_or_default(),
+            _ => String::new(),
+        };
+        println!("  {}  {:<14} {detail}", e.meta.occurred_at.format("%H:%M:%S"), e.event_type);
+    }
+    let pool = store.pool();
+    wh_metrics::catch_up_all(store).await?;
+    let sessions: Vec<_> =
+        SessionFactsProjection::recent(pool, 1000).await?.into_iter().filter(|s| s.task_id == task.0).collect();
+    if !sessions.is_empty() {
+        let total: f64 = sessions.iter().map(|s| s.cost_usd).sum();
+        println!("\nsessions ({}, total ${total:.4}):", sessions.len());
+        for s in sessions.iter().rev() {
+            println!(
+                "  {:<15} try {}  {:<9}  ${:.4}  {}",
+                s.agent,
+                s.attempt,
+                s.status,
+                s.cost_usd,
+                s.duration_ms.map(|d| fmt_ms(d as f64)).unwrap_or_else(|| "-".into())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn first_line(s: &str) -> &str {
+    s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim()
+}
+
+async fn create_task(store: &EventStore, title: String, body: Option<String>, factory: Option<String>) -> Result<TaskId> {
     let id = TaskId::new();
     let meta = EventMeta::new(id.0, current_user());
-    let ev = TaskEvent::TaskCreated { title, body, source: TaskSource::Cli };
+    let ev = TaskEvent::TaskCreated { title, body, source: TaskSource::Cli, factory };
     store
         .append(&id.stream_id(), ExpectedVersion::NoStream, vec![NewEvent::from_domain(&ev, meta)?])
         .await?;
@@ -279,7 +485,7 @@ async fn run_agent(store: &EventStore, a: RunArgs) -> Result<()> {
         Some(t) => t,
         None => {
             let title: String = a.prompt.chars().take(80).collect();
-            create_task(store, title, Some(a.prompt.clone())).await?
+            create_task(store, title, Some(a.prompt.clone()), None).await?
         }
     };
     let spec = RunSpec {
@@ -298,6 +504,12 @@ async fn run_agent(store: &EventStore, a: RunArgs) -> Result<()> {
         keep_worktree: !a.cleanup,
         max_retries: a.max_retries,
         retry_backoff: Duration::from_secs(a.retry_backoff_secs),
+        branch: None,
+        commit_on_success: false,
+        verdict_required: false,
+        task_expected_version: None,
+        feedback: None,
+        factory_version: None,
     };
     println!("task {task_id}");
     let runner = Runner::new(store.clone(), ClaudeCode::new(a.claude_bin), RunnerConfig { data_dir: data_dir() });

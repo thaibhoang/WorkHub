@@ -60,6 +60,9 @@ pub enum SessionEvent {
         duration_ms: u64,
         summary: Option<String>,
         transcript: Option<String>,
+        /// Commit WorkHub made on the task branch with the agent's changes.
+        #[serde(default)]
+        commit: Option<String>,
     },
     AgentSessionFailed {
         failure_class: FailureClass,

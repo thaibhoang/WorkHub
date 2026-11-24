@@ -1204,6 +1204,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1755,6 +1768,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "993ad287eb20e8ba755312801cfe1413e0f25d604075863acaddca10b04c1833"
 
 [[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+
+[[package]]
 name = "url"
 version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1880,12 +1899,15 @@ dependencies = [
  "anyhow",
  "clap",
  "dotenvy",
+ "libc",
  "serde_json",
  "sqlx",
  "tokio",
  "tracing-subscriber",
  "wh-core",
  "wh-eventstore",
+ "wh-factory",
+ "wh-foreman",
  "wh-metrics",
  "wh-runner",
 ]
@@ -1913,6 +1935,33 @@ dependencies = [
  "tracing",
  "uuid",
  "wh-core",
+]
+
+[[package]]
+name = "wh-factory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_yaml_ng",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "wh-foreman"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "wh-core",
+ "wh-eventstore",
+ "wh-factory",
+ "wh-metrics",
+ "wh-runner",
 ]
 
 [[package]]

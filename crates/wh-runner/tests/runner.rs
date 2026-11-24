@@ -58,6 +58,12 @@ fn spec(repo: &Path, task: TaskId, base_ref: &str) -> RunSpec {
         keep_worktree: false,
         max_retries: 0,
         retry_backoff: Duration::ZERO,
+        branch: None,
+        commit_on_success: false,
+        verdict_required: false,
+        task_expected_version: None,
+        feedback: None,
+        factory_version: None,
     }
 }
 

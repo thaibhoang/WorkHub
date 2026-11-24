@@ -25,3 +25,5 @@ wh-core = { path = "crates/wh-core" }
 wh-eventstore = { path = "crates/wh-eventstore" }
 wh-metrics = { path = "crates/wh-metrics" }
 wh-runner = { path = "crates/wh-runner" }
+wh-factory = { path = "crates/wh-factory" }
+wh-foreman = { path = "crates/wh-foreman" }

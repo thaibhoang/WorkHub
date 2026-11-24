@@ -1,0 +1,19 @@
+[package]
+name = "wh-foreman"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+wh-core.workspace = true
+wh-eventstore.workspace = true
+wh-factory.workspace = true
+wh-runner.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+wh-metrics.workspace = true
+sqlx.workspace = true
+tempfile = "3"

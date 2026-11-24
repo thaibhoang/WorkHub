@@ -143,6 +143,18 @@ impl EventStore {
         rows.iter().map(from_row).collect()
     }
 
+    /// Latest (version, event_type) of every stream whose id starts with `prefix`.
+    pub async fn stream_heads(&self, prefix: &str) -> Result<Vec<(String, i64, String)>, StoreError> {
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT DISTINCT ON (stream_id) stream_id, stream_version, event_type FROM events \
+             WHERE starts_with(stream_id, $1) ORDER BY stream_id, stream_version DESC",
+        )
+        .bind(prefix)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     pub async fn load_checkpoint(&self, consumer: &str) -> Result<i64, StoreError> {
         let seq: Option<i64> =
             sqlx::query_scalar("SELECT last_seq FROM consumer_checkpoints WHERE consumer = $1")

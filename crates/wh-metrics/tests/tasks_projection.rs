@@ -18,9 +18,9 @@ async fn append(store: &EventStore, task: TaskId, e: TaskEvent) {
 async fn projection_tracks_state_and_rebuild_is_identical(pool: PgPool) {
     let store = EventStore::new(pool.clone());
     let (a, b) = (TaskId::new(), TaskId::new());
-    append(&store, a, TaskEvent::TaskCreated { title: "A".into(), body: None, source: TaskSource::Cli }).await;
-    append(&store, b, TaskEvent::TaskCreated { title: "B".into(), body: None, source: TaskSource::Cli }).await;
-    append(&store, a, TaskEvent::StageEntered { stage: "spec".into() }).await;
+    append(&store, a, TaskEvent::TaskCreated { title: "A".into(), body: None, source: TaskSource::Cli, factory: None }).await;
+    append(&store, b, TaskEvent::TaskCreated { title: "B".into(), body: None, source: TaskSource::Cli, factory: None }).await;
+    append(&store, a, TaskEvent::StageEntered { stage: "spec".into(), feedback: None }).await;
     append(&store, b, TaskEvent::TaskCancelled { reason: "dup".into() }).await;
 
     let mut proj = TasksProjection::new(pool.clone());
@@ -32,7 +32,7 @@ async fn projection_tracks_state_and_rebuild_is_identical(pool: PgPool) {
     };
     let before = snapshot(TasksProjection::list(&pool).await.unwrap());
     assert_eq!(before, vec![
-        ("A".into(), "in_progress".into(), Some("spec".into())),
+        ("A".into(), "running".into(), Some("spec".into())),
         ("B".into(), "cancelled".into(), None),
     ]);
 
@@ -44,9 +44,9 @@ async fn projection_tracks_state_and_rebuild_is_identical(pool: PgPool) {
 async fn redelivered_events_are_ignored(pool: PgPool) {
     let store = EventStore::new(pool.clone());
     let a = TaskId::new();
-    append(&store, a, TaskEvent::TaskCreated { title: "A".into(), body: None, source: TaskSource::Cli }).await;
-    append(&store, a, TaskEvent::StageEntered { stage: "spec".into() }).await;
-    append(&store, a, TaskEvent::StageEntered { stage: "implement".into() }).await;
+    append(&store, a, TaskEvent::TaskCreated { title: "A".into(), body: None, source: TaskSource::Cli, factory: None }).await;
+    append(&store, a, TaskEvent::StageEntered { stage: "spec".into(), feedback: None }).await;
+    append(&store, a, TaskEvent::StageEntered { stage: "implement".into(), feedback: None }).await;
 
     let mut proj = TasksProjection::new(pool.clone());
     let sub = Subscription::new(store.clone());

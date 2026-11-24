@@ -297,7 +297,7 @@ MVP chạy **một binary** (`workhubd`) chứa mọi consumer dưới dạng to
 |---|---|---|
 | **0. Nền** ✅ | Workspace, event store, envelope, migrations, CLI replay | Ghi/đọc event, dựng lại projection từ đầu |
 | **1. Một agent** ✅ | Runner + adapter Claude Code, `session_facts` | `wh run "task…"` → thấy cost/tokens/duration/outcome |
-| **2. Pipeline** | Foreman + factory.yaml, triage→spec→implement→review→verify, gate qua CLI | Một task đi hết vòng, có rework loop |
+| **2. Pipeline** ✅ | Foreman + factory.yaml, triage→spec→implement→review→verify, gate qua CLI | Một task đi hết vòng, có rework loop |
 | **3. Quan sát** | API + SSE + UI: Runs, Run timeline, Dashboard | Xem live, metrics cycle time/cost/fail rate |
 | **4. Chất lượng** | Scorers | Pass rate theo scorer, cost scorer |
 | **5. Tự cải tiến** | Improver + Inbox duyệt + so sánh theo factory_version | Proposal → PR → đo delta |
@@ -324,4 +324,11 @@ Nên **dogfood** từ phase 2: dùng WorkHub để phát triển chính WorkHub.
 - Runner chạy Claude Code với `--strict-mcp-config` (không nạp MCP cá nhân → tiết kiệm context), `--max-budget-usd` (chặn chi phí), `--no-session-persistence`; timeout do Runner tự kill process.
 - `--max-turns` không có trong CLI hiện tại nên dùng budget + timeout để giới hạn.
 - **Retry**: tối đa 2 lần chạy lại (tổng 3 lần) cho lỗi `retryable` (timeout, unknown); budget/env_setup không retry. Mỗi lần là session mới trên worktree sạch, `AgentDispatched` ghi `attempt` + `retry_of` → đo được retry rate. Task chỉ thấy một `StageEntered`/`StageExited`. Ở phase 2, chính sách retry sẽ chuyển vào `factory.yaml` do Foreman áp dụng.
-- Sau `StageExited`, `tasks_view.status` vẫn là `in_progress` vì chưa có Foreman quyết định bước tiếp theo.
+
+### Ghi chú phase 2 (Foreman + factory)
+- `factory_version` = sha256 (12 hex) của `factory.yaml` + toàn bộ prompt agent — đổi một chữ trong prompt là ra version mới.
+- Mỗi task một branch `wh/task/<id>`; runner commit khi stage thành công → stage sau thấy code stage trước. Stage fail thì worktree bị xoá, thay đổi bị bỏ.
+- Verdict: stage có `on_reject` bắt buộc kết thúc bằng `VERDICT: APPROVE|REJECT`; thiếu verdict = stage failed → blocked.
+- Chính sách: thành công → gate (nếu có) hoặc stage kế / hoàn thành; REJECT → `on_reject` kèm feedback, quá `max_rework_loops` → blocked; failed (sau retry) → blocked; gate reject → chạy lại chính stage đó với comment.
+- Khôi phục: foreman khởi động sẽ block task đang dở `StageEntered` (lý do `interrupted`) và fail session mồ côi; `wh task resume` chạy lại đúng stage đó.
+- Chạy thật trên repo demo (Haiku, $0.029 cho 7 session) phát hiện vấn đề quy trình đầu tiên: agent implement thiếu quyền `chmod` (`acceptEdits`, không có `allowed_tools`) nên review reject liên tục tới khi chạm giới hạn — đúng loại dữ liệu mà improver (phase 5) sẽ dùng.
