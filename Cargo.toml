@@ -24,3 +24,4 @@ dotenvy = "0.15"
 wh-core = { path = "crates/wh-core" }
 wh-eventstore = { path = "crates/wh-eventstore" }
 wh-metrics = { path = "crates/wh-metrics" }
+wh-runner = { path = "crates/wh-runner" }

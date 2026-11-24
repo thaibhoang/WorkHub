@@ -1,0 +1,19 @@
+[package]
+name = "wh-runner"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+wh-core.workspace = true
+wh-eventstore.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+wh-metrics.workspace = true
+sqlx.workspace = true
+tempfile = "3"

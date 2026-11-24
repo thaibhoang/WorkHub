@@ -295,8 +295,8 @@ MVP chạy **một binary** (`workhubd`) chứa mọi consumer dưới dạng to
 
 | Phase | Mục tiêu | Kết quả kiểm chứng |
 |---|---|---|
-| **0. Nền** | Workspace, event store, envelope, migrations, CLI replay | Ghi/đọc event, dựng lại projection từ đầu |
-| **1. Một agent** | Runner + adapter Claude Code, `session_facts` | `wh run "task…"` → thấy cost/tokens/duration/outcome |
+| **0. Nền** ✅ | Workspace, event store, envelope, migrations, CLI replay | Ghi/đọc event, dựng lại projection từ đầu |
+| **1. Một agent** ✅ | Runner + adapter Claude Code, `session_facts` | `wh run "task…"` → thấy cost/tokens/duration/outcome |
 | **2. Pipeline** | Foreman + factory.yaml, triage→spec→implement→review→verify, gate qua CLI | Một task đi hết vòng, có rework loop |
 | **3. Quan sát** | API + SSE + UI: Runs, Run timeline, Dashboard | Xem live, metrics cycle time/cost/fail rate |
 | **4. Chất lượng** | Scorers | Pass rate theo scorer, cost scorer |
@@ -318,3 +318,10 @@ Nên **dogfood** từ phase 2: dùng WorkHub để phát triển chính WorkHub.
 - Mọi lệnh append lấy một **advisory lock toàn cục** trong transaction → `global_seq` tăng đúng theo thứ tự commit, consumer đọc `global_seq > checkpoint` không bao giờ bỏ sót event. Đủ cho chạy local; khi cần throughput cao sẽ thay bằng cơ chế khác.
 - Bảng `events` có trigger chặn UPDATE/DELETE.
 - `factory_id`/`factory_version` trong `EventMeta` tạm là `Option` cho tới khi có `wh-factory` (phase 2).
+
+### Ghi chú phase 1 (Runner)
+- Chưa có aggregate `Run`: session gắn trực tiếp vào task qua `AgentDispatched.task_id`. Run sẽ do Foreman tạo ở phase 2.
+- Runner chạy Claude Code với `--strict-mcp-config` (không nạp MCP cá nhân → tiết kiệm context), `--max-budget-usd` (chặn chi phí), `--no-session-persistence`; timeout do Runner tự kill process.
+- `--max-turns` không có trong CLI hiện tại nên dùng budget + timeout để giới hạn.
+- **Retry**: tối đa 2 lần chạy lại (tổng 3 lần) cho lỗi `retryable` (timeout, unknown); budget/env_setup không retry. Mỗi lần là session mới trên worktree sạch, `AgentDispatched` ghi `attempt` + `retry_of` → đo được retry rate. Task chỉ thấy một `StageEntered`/`StageExited`. Ở phase 2, chính sách retry sẽ chuyển vào `factory.yaml` do Foreman áp dụng.
+- Sau `StageExited`, `tasks_view.status` vẫn là `in_progress` vì chưa có Foreman quyết định bước tiếp theo.

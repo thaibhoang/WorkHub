@@ -1,0 +1,277 @@
+use std::{path::PathBuf, time::Duration};
+
+use anyhow::Context;
+use tokio::sync::mpsc;
+use uuid::Uuid;
+use wh_core::{
+    Actor, EventMeta, FailureClass, NewEvent, SessionId, TaskId,
+    session::SessionEvent,
+    task::{StageOutcome, TaskEvent},
+};
+use wh_eventstore::{EventStore, ExpectedVersion};
+
+use crate::{
+    runtime::{AgentRequest, AgentRuntime, Outcome, OutcomeStatus, Signal},
+    worktree::Worktree,
+};
+
+#[derive(Debug, Clone)]
+pub struct RunnerConfig {
+    /// Root for worktrees (`<data_dir>/worktrees/<session>`) and transcripts.
+    pub data_dir: PathBuf,
+}
+
+/// What to run. Agent/stage are free-form until factory-as-code (phase 2) defines them.
+#[derive(Debug, Clone)]
+pub struct RunSpec {
+    pub task_id: TaskId,
+    pub agent: String,
+    pub stage: String,
+    pub prompt: String,
+    pub repo: PathBuf,
+    pub base_ref: String,
+    pub model: Option<String>,
+    pub budget_usd: Option<f64>,
+    pub permission_mode: Option<String>,
+    pub allowed_tools: Vec<String>,
+    pub with_user_mcp: bool,
+    pub timeout: Duration,
+    pub keep_worktree: bool,
+    /// Extra attempts after a *retryable* failure (timeout, unknown). 2 = at most 3 runs.
+    pub max_retries: u32,
+    /// Wait before retry n is `retry_backoff * n`.
+    pub retry_backoff: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionReport {
+    pub session_id: SessionId,
+    pub attempt: u32,
+    pub outcome: Outcome,
+    pub workdir: Option<PathBuf>,
+    pub branch: Option<String>,
+}
+
+/// All attempts for one stage run, in order; the last one is final.
+#[derive(Debug, Clone)]
+pub struct RunReport {
+    pub attempts: Vec<SessionReport>,
+}
+
+impl RunReport {
+    pub fn last(&self) -> &SessionReport {
+        self.attempts.last().expect("at least one attempt")
+    }
+
+    pub fn total_cost_usd(&self) -> f64 {
+        self.attempts.iter().map(|a| a.outcome.cost_usd).sum()
+    }
+}
+
+pub struct Runner<R> {
+    store: EventStore,
+    runtime: R,
+    config: RunnerConfig,
+}
+
+impl<R: AgentRuntime> Runner<R> {
+    pub fn new(store: EventStore, runtime: R, config: RunnerConfig) -> Self {
+        Self { store, runtime, config }
+    }
+
+    /// Run a stage for a task: one agent session, retried on retryable failures up to
+    /// `spec.max_retries` times. Each attempt is its own session (fresh worktree) linked
+    /// by `retry_of`. The task stream gets one `StageEntered` and one final `StageExited`.
+    /// Agent failures are recorded and returned; `Err` means WorkHub itself failed.
+    pub async fn run(&self, spec: RunSpec, mut on_signal: impl FnMut(&Signal) + Send) -> anyhow::Result<RunReport> {
+        let mut attempts = Vec::new();
+        let mut retry_of = None;
+        for attempt in 1..=spec.max_retries + 1 {
+            let session_id = SessionId::new();
+            let mut rec = Recorder::new(&self.store, session_id, spec.task_id);
+            if attempt == 1 {
+                rec.task(TaskEvent::StageEntered { stage: spec.stage.clone() }).await?;
+            }
+            let report = self.attempt(&spec, &mut rec, attempt, retry_of, &mut on_signal).await?;
+            let retry = attempt <= spec.max_retries
+                && matches!(report.outcome.status, OutcomeStatus::Failed { retryable: true, .. });
+            if !retry {
+                let outcome = match report.outcome.status {
+                    OutcomeStatus::Succeeded => StageOutcome::Succeeded,
+                    OutcomeStatus::Failed { .. } => StageOutcome::Failed,
+                };
+                rec.task(TaskEvent::StageExited { stage: spec.stage.clone(), outcome }).await?;
+                attempts.push(report);
+                break;
+            }
+            if let OutcomeStatus::Failed { class, message, .. } = &report.outcome.status {
+                tracing::warn!(attempt, max = spec.max_retries + 1, class = class.as_str(), "{message}; retrying");
+            }
+            retry_of = Some(session_id);
+            attempts.push(report);
+            tokio::time::sleep(spec.retry_backoff * attempt).await;
+        }
+        Ok(RunReport { attempts })
+    }
+
+    async fn attempt(
+        &self,
+        spec: &RunSpec,
+        s: &mut Recorder<'_>,
+        attempt: u32,
+        retry_of: Option<SessionId>,
+        on_signal: &mut (impl FnMut(&Signal) + Send),
+    ) -> anyhow::Result<SessionReport> {
+        let session_id = s.session_id;
+        s.session(SessionEvent::AgentDispatched {
+            task_id: spec.task_id,
+            agent: spec.agent.clone(),
+            stage: spec.stage.clone(),
+            runtime: self.runtime.name().to_owned(),
+            model: spec.model.clone(),
+            prompt: spec.prompt.clone(),
+            budget_usd: spec.budget_usd,
+            timeout_secs: spec.timeout.as_secs(),
+            attempt,
+            retry_of,
+        })
+        .await?;
+
+        let suffix = &session_id.0.simple().to_string()[20..];
+        let branch = format!("wh/{}/{suffix}", spec.agent);
+        let path = self.config.data_dir.join("worktrees").join(session_id.to_string());
+        let worktree = match Worktree::create(&spec.repo, &spec.base_ref, &path, &branch).await {
+            Ok(w) => w,
+            Err(e) => {
+                let outcome = Outcome::failed(FailureClass::EnvSetup, format!("{e:#}"), false, Duration::ZERO);
+                s.finish(&outcome, None).await?;
+                return Ok(SessionReport { session_id, attempt, outcome, workdir: None, branch: None });
+            }
+        };
+        s.session(SessionEvent::AgentSessionStarted {
+            workdir: worktree.path.display().to_string(),
+            branch: worktree.branch.clone(),
+            base_ref: spec.base_ref.clone(),
+        })
+        .await?;
+
+        let transcripts = self.config.data_dir.join("transcripts");
+        tokio::fs::create_dir_all(&transcripts).await.context("create transcripts dir")?;
+        let transcript_path = transcripts.join(format!("{session_id}.jsonl"));
+        let req = AgentRequest {
+            prompt: spec.prompt.clone(),
+            workdir: worktree.path.clone(),
+            transcript_path: transcript_path.clone(),
+            model: spec.model.clone(),
+            budget_usd: spec.budget_usd,
+            permission_mode: spec.permission_mode.clone(),
+            allowed_tools: spec.allowed_tools.clone(),
+            with_user_mcp: spec.with_user_mcp,
+            timeout: spec.timeout,
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fut = self.runtime.run(&req, tx);
+        tokio::pin!(fut);
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut fut => break outcome,
+                Some(sig) = rx.recv() => {
+                    on_signal(&sig);
+                    s.signal(sig).await?;
+                }
+            }
+        };
+        while let Ok(sig) = rx.try_recv() {
+            on_signal(&sig);
+            s.signal(sig).await?;
+        }
+
+        let transcript = transcript_path.exists().then(|| transcript_path.display().to_string());
+        s.finish(&outcome, transcript).await?;
+
+        let workdir = if spec.keep_worktree {
+            Some(worktree.path.clone())
+        } else {
+            if let Err(e) = worktree.remove().await {
+                tracing::warn!("failed to remove worktree {}: {e:#}", worktree.path.display());
+            }
+            None
+        };
+        Ok(SessionReport { session_id, attempt, outcome, workdir, branch: Some(worktree.branch) })
+    }
+}
+
+/// Appends session events with optimistic concurrency (the runner is the only
+/// writer of its session stream) and chains `causation_id`s.
+struct Recorder<'a> {
+    store: &'a EventStore,
+    session_id: SessionId,
+    stream_id: String,
+    version: i64,
+    task_id: TaskId,
+    last_event: Option<Uuid>,
+}
+
+impl<'a> Recorder<'a> {
+    fn new(store: &'a EventStore, session: SessionId, task_id: TaskId) -> Self {
+        Self { store, session_id: session, stream_id: session.stream_id(), version: 0, task_id, last_event: None }
+    }
+
+    fn meta(&self) -> EventMeta {
+        let meta = EventMeta::new(self.task_id.0, Actor::System { component: "runner".into() });
+        match self.last_event {
+            Some(id) => meta.caused_by(id),
+            None => meta,
+        }
+    }
+
+    async fn session(&mut self, ev: SessionEvent) -> anyhow::Result<()> {
+        let expected = match self.version {
+            0 => ExpectedVersion::NoStream,
+            v => ExpectedVersion::Exact(v),
+        };
+        let rec = self.store.append(&self.stream_id, expected, vec![NewEvent::from_domain(&ev, self.meta())?]).await?;
+        self.version += 1;
+        self.last_event = rec.last().map(|r| r.event_id);
+        Ok(())
+    }
+
+    async fn task(&mut self, ev: TaskEvent) -> anyhow::Result<()> {
+        let rec = self
+            .store
+            .append(&self.task_id.stream_id(), ExpectedVersion::Any, vec![NewEvent::from_domain(&ev, self.meta())?])
+            .await?;
+        self.last_event = rec.last().map(|r| r.event_id);
+        Ok(())
+    }
+
+    async fn signal(&mut self, sig: Signal) -> anyhow::Result<()> {
+        self.session(match sig {
+            Signal::Ready { runtime_session_id, model } => SessionEvent::AgentRuntimeReady { runtime_session_id, model },
+            Signal::ToolCalled { tool, ok, duration_ms } => SessionEvent::AgentToolCalled { tool, ok, duration_ms },
+        })
+        .await
+    }
+
+    async fn finish(&mut self, o: &Outcome, transcript: Option<String>) -> anyhow::Result<()> {
+        self.session(SessionEvent::AgentUsageReported { usage: o.usage, cost_usd: o.cost_usd }).await?;
+        self.session(match &o.status {
+            OutcomeStatus::Succeeded => SessionEvent::AgentSessionCompleted {
+                num_turns: o.num_turns,
+                duration_ms: o.duration_ms,
+                summary: o.summary.clone(),
+                transcript,
+            },
+            OutcomeStatus::Failed { class, message, retryable } => SessionEvent::AgentSessionFailed {
+                failure_class: *class,
+                message: message.clone(),
+                retryable: *retryable,
+                num_turns: o.num_turns,
+                duration_ms: o.duration_ms,
+                transcript,
+            },
+        })
+        .await
+    }
+}

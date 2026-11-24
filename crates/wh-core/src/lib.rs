@@ -4,6 +4,7 @@
 pub mod event;
 pub mod failure;
 pub mod ids;
+pub mod session;
 pub mod task;
 
 pub use event::{Actor, DomainEvent, EventMeta, NewEvent, RecordedEvent};

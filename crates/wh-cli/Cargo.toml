@@ -12,6 +12,7 @@ path = "src/main.rs"
 wh-core.workspace = true
 wh-eventstore.workspace = true
 wh-metrics.workspace = true
+wh-runner.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
