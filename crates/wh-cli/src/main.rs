@@ -3,11 +3,12 @@ use std::{path::PathBuf, time::Duration};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
+use wh_api::commands::{self, NewTask, local_user};
 use wh_core::{
-    Actor, EventMeta, NewEvent, RecordedEvent, TaskId,
-    task::{TaskEvent, TaskSource, TaskState, TaskStatus},
+    RecordedEvent, TaskId,
+    task::{TaskEvent, TaskSource},
 };
-use wh_eventstore::{EventStore, ExpectedVersion, Subscription};
+use wh_eventstore::{EventStore, Subscription};
 use wh_factory::Factory;
 use wh_foreman::{Dispatch, Foreman};
 use wh_metrics::{sessions::SessionFactsProjection, tasks::TasksProjection};
@@ -45,6 +46,25 @@ enum Cmd {
         max_parallel: usize,
         #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
         claude_bin: PathBuf,
+    },
+    /// Serve the HTTP API + live event stream (and the built UI); runs projections,
+    /// and with --foreman also drives the pipeline (everything in one process)
+    Serve {
+        #[arg(long, env = "WH_ADDR", default_value = "127.0.0.1:7070")]
+        addr: std::net::SocketAddr,
+        /// Factory for tasks created in the UI (and for --foreman)
+        #[arg(long, env = "WH_FACTORY", default_value = "factory/factory.yaml")]
+        factory: PathBuf,
+        /// Also run the foreman (pipeline daemon) in this process
+        #[arg(long)]
+        foreman: bool,
+        #[arg(long, default_value_t = 2)]
+        max_parallel: usize,
+        #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
+        claude_bin: PathBuf,
+        /// Built UI to serve at / (skipped if missing)
+        #[arg(long, env = "WH_WEB_DIR", default_value = "web/dist")]
+        web_dir: PathBuf,
     },
     /// Approve or reject a task waiting at a human gate
     Gate {
@@ -225,9 +245,8 @@ async fn main() -> Result<()> {
         Cmd::Task { cmd } => match cmd {
             TaskCmd::Create { title, body, factory } => {
                 let factory = factory.map(|p| Factory::load(&p)).transpose()?.map(|f| f.name);
-                let id = create_task(&store, title, body, factory).await?;
-                wh_metrics::catch_up_all(&store).await?;
-                println!("{id}");
+                let t = NewTask { title, body, source: TaskSource::Cli, factory };
+                println!("{}", commands::create_task(&store, local_user(), t).await?);
             }
             TaskCmd::List => {
                 wh_metrics::catch_up_all(&store).await?;
@@ -246,18 +265,11 @@ async fn main() -> Result<()> {
             }
             TaskCmd::Show { task } => show_task(&store, task).await?,
             TaskCmd::Resume { task, stage, comment } => {
-                let state = load_task(&store, task).await?;
-                anyhow::ensure!(
-                    matches!(state.status, TaskStatus::Blocked { .. }),
-                    "task is {:?}, only blocked tasks can be resumed",
-                    state.status
-                );
-                human_append(&store, task, &state, TaskEvent::TaskResumed { stage, comment }).await?;
+                commands::resume(&store, local_user(), task, stage, comment).await?;
                 println!("resumed; `wh foreman` will pick it up");
             }
             TaskCmd::Cancel { task, reason } => {
-                let state = load_task(&store, task).await?;
-                human_append(&store, task, &state, TaskEvent::TaskCancelled { reason }).await?;
+                commands::cancel(&store, local_user(), task, reason).await?;
                 println!("cancelled");
             }
         },
@@ -266,13 +278,7 @@ async fn main() -> Result<()> {
                 GateCmd::Approve { task, comment } => (task, true, comment),
                 GateCmd::Reject { task, comment } => (task, false, Some(comment)),
             };
-            let state = load_task(&store, task).await?;
-            let TaskStatus::AwaitingGate { gate, stage } = state.status.clone() else {
-                anyhow::bail!("task is not waiting at a gate (status: {:?})", state.status);
-            };
-            let reviewer = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-            let ev = TaskEvent::GateDecided { gate: gate.clone(), stage, approved, reviewer, comment };
-            human_append(&store, task, &state, ev).await?;
+            let gate = commands::decide_gate(&store, local_user(), task, approved, comment).await?;
             println!("gate '{gate}' {}", if approved { "approved" } else { "rejected" });
         }
         Cmd::Factory { file } => {
@@ -296,23 +302,41 @@ async fn main() -> Result<()> {
         Cmd::Foreman { factory, max_parallel, claude_bin } => {
             let f = Factory::load(&factory)?;
             println!("foreman for factory '{}' (version {}), Ctrl+C to stop", f.name, f.version);
-            let runner = Runner::new(store.clone(), ClaudeCode::new(claude_bin), RunnerConfig { data_dir: data_dir() });
-            let dispatch = Dispatch::Spawn(std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel)));
-            let mut foreman = Foreman::new(store.clone(), f, runner, dispatch);
-            for task in foreman.recover_interrupted().await? {
-                println!("task {task} was interrupted mid-stage → blocked. Restart it with: wh task resume {task}");
-            }
-            let stop = || async {
-                tokio::signal::ctrl_c().await.ok();
+            let (a, b) = tokio::join!(run_foreman(&store, f, max_parallel, claude_bin), run_projections(&store));
+            a?;
+            b?;
+        }
+        Cmd::Serve { addr, factory, foreman, max_parallel, claude_bin, web_dir } => {
+            let f = match Factory::load(&factory) {
+                Ok(f) => Some(f),
+                Err(e) if !foreman => {
+                    eprintln!("warning: no factory ({e:#}); UI tasks will not run through a pipeline");
+                    None
+                }
+                Err(e) => return Err(e),
             };
-            let subs = (Subscription::new(store.clone()), Subscription::new(store.clone()), Subscription::new(store.clone()));
-            let (mut tasks, mut sessions) =
-                (TasksProjection::new(pool.clone()), SessionFactsProjection::new(pool.clone()));
-            let (a, b, c) = tokio::join!(
-                subs.0.run(&mut foreman, stop()),
-                subs.1.run(&mut tasks, stop()),
-                subs.2.run(&mut sessions, stop())
-            );
+            let web_dir = web_dir.join("index.html").is_file().then_some(web_dir);
+            match &web_dir {
+                Some(d) => println!("serving UI from {}", d.display()),
+                None => println!("no built UI found (run `npm run build` in web/); API only"),
+            }
+            let state = wh_api::AppState {
+                store: store.clone(),
+                factory: f.clone().map(std::sync::Arc::new),
+                live: wh_api::Live::start(store.clone()).await?,
+            };
+            println!("WorkHub on http://{addr}  (Ctrl+C to stop)");
+            let api = wh_api::serve(addr, state, web_dir, ctrl_c());
+            let pipeline = async {
+                match (foreman, f) {
+                    (true, Some(f)) => {
+                        println!("foreman for factory '{}' (version {})", f.name, f.version);
+                        run_foreman(&store, f, max_parallel, claude_bin).await
+                    }
+                    _ => Ok(()),
+                }
+            };
+            let (a, b, c) = tokio::join!(api, pipeline, run_projections(&store));
             a?;
             b?;
             c?;
@@ -379,15 +403,7 @@ async fn main() -> Result<()> {
             }
             ProjCmd::Run { follow: true } => {
                 println!("following events, Ctrl+C to stop");
-                let stop = || async {
-                    tokio::signal::ctrl_c().await.ok();
-                };
-                let (sa, sb) = (Subscription::new(store.clone()), Subscription::new(store.clone()));
-                let (mut tasks, mut sessions) =
-                    (TasksProjection::new(pool.clone()), SessionFactsProjection::new(pool.clone()));
-                let (a, b) = tokio::join!(sa.run(&mut tasks, stop()), sb.run(&mut sessions, stop()));
-                a?;
-                b?;
+                run_projections(&store).await?;
             }
             ProjCmd::Rebuild => {
                 for (name, n) in wh_metrics::rebuild_all(&store).await? {
@@ -399,28 +415,33 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn load_task(store: &EventStore, task: TaskId) -> Result<TaskState> {
-    let events = store.read_stream(&task.stream_id()).await?;
-    anyhow::ensure!(!events.is_empty(), "task {task} not found");
-    let mut state = TaskState::default();
-    for e in &events {
-        state.apply(e.stream_version, e.decode()?);
-    }
-    Ok(state)
+async fn ctrl_c() {
+    tokio::signal::ctrl_c().await.ok();
 }
 
-/// Append a human decision, failing if the task changed since it was read.
-async fn human_append(store: &EventStore, task: TaskId, state: &TaskState, ev: TaskEvent) -> Result<()> {
-    let meta = EventMeta::new(task.0, current_user());
-    store
-        .append(&task.stream_id(), ExpectedVersion::Exact(state.version), vec![NewEvent::from_domain(&ev, meta)?])
-        .await?;
-    wh_metrics::catch_up_all(store).await?;
-    Ok(())
+/// Foreman daemon until Ctrl+C (recovers interrupted stages first).
+async fn run_foreman(store: &EventStore, f: Factory, max_parallel: usize, claude_bin: PathBuf) -> Result<()> {
+    let runner = Runner::new(store.clone(), ClaudeCode::new(claude_bin), RunnerConfig { data_dir: data_dir() });
+    let dispatch = Dispatch::Spawn(std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel)));
+    let mut foreman = Foreman::new(store.clone(), f, runner, dispatch);
+    for task in foreman.recover_interrupted().await? {
+        println!("task {task} was interrupted mid-stage → blocked. Restart it with: wh task resume {task}");
+    }
+    Subscription::new(store.clone()).run(&mut foreman, ctrl_c()).await
+}
+
+/// Keep every projection following the log until Ctrl+C.
+async fn run_projections(store: &EventStore) -> Result<()> {
+    let pool = store.pool().clone();
+    let (sa, sb) = (Subscription::new(store.clone()), Subscription::new(store.clone()));
+    let (mut tasks, mut sessions) = (TasksProjection::new(pool.clone()), SessionFactsProjection::new(pool));
+    let (a, b) = tokio::join!(sa.run(&mut tasks, ctrl_c()), sb.run(&mut sessions, ctrl_c()));
+    a?;
+    b
 }
 
 async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {
-    let state = load_task(store, task).await?;
+    let state = commands::load_task(store, task).await?;
     println!("{}  [{:?}]  rework loops: {}", state.title, state.status, state.rework_loops);
     for e in store.read_stream(&task.stream_id()).await? {
         let detail = match e.decode::<TaskEvent>()? {
@@ -469,23 +490,14 @@ fn first_line(s: &str) -> &str {
     s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim()
 }
 
-async fn create_task(store: &EventStore, title: String, body: Option<String>, factory: Option<String>) -> Result<TaskId> {
-    let id = TaskId::new();
-    let meta = EventMeta::new(id.0, current_user());
-    let ev = TaskEvent::TaskCreated { title, body, source: TaskSource::Cli, factory };
-    store
-        .append(&id.stream_id(), ExpectedVersion::NoStream, vec![NewEvent::from_domain(&ev, meta)?])
-        .await?;
-    Ok(id)
-}
-
 async fn run_agent(store: &EventStore, a: RunArgs) -> Result<()> {
     let repo = std::fs::canonicalize(&a.repo).with_context(|| format!("repo not found: {}", a.repo.display()))?;
     let task_id = match a.task {
         Some(t) => t,
         None => {
             let title: String = a.prompt.chars().take(80).collect();
-            create_task(store, title, Some(a.prompt.clone()), None).await?
+            let t = NewTask { title, body: Some(a.prompt.clone()), source: TaskSource::Cli, factory: None };
+            commands::create_task(store, local_user(), t).await?
         }
     };
     let spec = RunSpec {
@@ -568,12 +580,6 @@ fn data_dir() -> PathBuf {
 fn fmt_ms(ms: f64) -> String {
     let s = ms / 1000.0;
     if s < 60.0 { format!("{s:.1}s") } else { format!("{}m{:02}s", (s / 60.0) as u64, (s % 60.0) as u64) }
-}
-
-fn current_user() -> Actor {
-    Actor::Human {
-        user: std::env::var("USER").unwrap_or_else(|_| "unknown".into()),
-    }
 }
 
 fn print_event(e: &RecordedEvent) {

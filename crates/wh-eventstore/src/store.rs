@@ -143,6 +143,11 @@ impl EventStore {
         rows.iter().map(from_row).collect()
     }
 
+    /// `global_seq` of the newest committed event (0 for an empty log).
+    pub async fn head_seq(&self) -> Result<i64, StoreError> {
+        Ok(sqlx::query_scalar("SELECT COALESCE(MAX(global_seq), 0) FROM events").fetch_one(&self.pool).await?)
+    }
+
     /// Latest (version, event_type) of every stream whose id starts with `prefix`.
     pub async fn stream_heads(&self, prefix: &str) -> Result<Vec<(String, i64, String)>, StoreError> {
         let rows: Vec<(String, i64, String)> = sqlx::query_as(

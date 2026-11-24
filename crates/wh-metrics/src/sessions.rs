@@ -32,7 +32,7 @@ pub struct SessionRow {
     pub cost_usd: f64,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
 pub struct AgentStats {
     pub agent: String,
     pub runs: i64,

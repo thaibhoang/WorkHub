@@ -27,3 +27,4 @@ wh-metrics = { path = "crates/wh-metrics" }
 wh-runner = { path = "crates/wh-runner" }
 wh-factory = { path = "crates/wh-factory" }
 wh-foreman = { path = "crates/wh-foreman" }
+wh-api = { path = "crates/wh-api" }

@@ -206,6 +206,7 @@ Tập task cố định (có lời giải/đánh giá) để chạy lại với 
 ### 5.8 API & UI (`wh-api`, `web/`)
 - **axum** REST + **SSE** để stream event live (timeline, trạng thái run).
 - Màn hình (theo Warp Factories): Inbox (gate + proposal cần duyệt), Runs, Run detail (transcript + Timeline/Agents/Artifacts/Metadata), Dashboard (Productivity / Spending / Scorers), Agents, Scorers, Self-improvement, Factory definition (read-only, link về repo).
+- Phase 3 đã làm: Runs, Run detail (pipeline strip, duyệt gate / resume / cancel, Gantt session theo stage, stage outputs, transcript, raw events), Inbox (gate + blocked; proposal đợi phase 5), Dashboard, Factory. Agents/Scorers/Self-improvement để các phase sau.
 
 ---
 
@@ -298,7 +299,7 @@ MVP chạy **một binary** (`workhubd`) chứa mọi consumer dưới dạng to
 | **0. Nền** ✅ | Workspace, event store, envelope, migrations, CLI replay | Ghi/đọc event, dựng lại projection từ đầu |
 | **1. Một agent** ✅ | Runner + adapter Claude Code, `session_facts` | `wh run "task…"` → thấy cost/tokens/duration/outcome |
 | **2. Pipeline** ✅ | Foreman + factory.yaml, triage→spec→implement→review→verify, gate qua CLI | Một task đi hết vòng, có rework loop |
-| **3. Quan sát** | API + SSE + UI: Runs, Run timeline, Dashboard | Xem live, metrics cycle time/cost/fail rate |
+| **3. Quan sát** ✅ | API + SSE + UI: Runs, Run timeline, Dashboard | Xem live, metrics cycle time/cost/fail rate |
 | **4. Chất lượng** | Scorers | Pass rate theo scorer, cost scorer |
 | **5. Tự cải tiến** | Improver + Inbox duyệt + so sánh theo factory_version | Proposal → PR → đo delta |
 | **6. Mở rộng** | Benchmarks, GitHub/Slack/Linear, Docker sandbox, NATS | — |
@@ -332,3 +333,10 @@ Nên **dogfood** từ phase 2: dùng WorkHub để phát triển chính WorkHub.
 - Chính sách: thành công → gate (nếu có) hoặc stage kế / hoàn thành; REJECT → `on_reject` kèm feedback, quá `max_rework_loops` → blocked; failed (sau retry) → blocked; gate reject → chạy lại chính stage đó với comment.
 - Khôi phục: foreman khởi động sẽ block task đang dở `StageEntered` (lý do `interrupted`) và fail session mồ côi; `wh task resume` chạy lại đúng stage đó.
 - Chạy thật trên repo demo (Haiku, $0.029 cho 7 session) phát hiện vấn đề quy trình đầu tiên: agent implement thiếu quyền `chmod` (`acceptEdits`, không có `allowed_tools`) nên review reject liên tục tới khi chạm giới hạn — đúng loại dữ liệu mà improver (phase 5) sẽ dùng.
+
+### Ghi chú phase 3 (API + SSE + UI)
+- `wh serve` = binary "workhubd" của MVP: một process chạy API (axum) + projections, thêm `--foreman` để chạy luôn pipeline; phục vụ UI đã build từ `web/dist`. Mặc định chỉ bind `127.0.0.1:7070`, **không có auth** (local-only), lệnh từ UI ghi actor là `$USER` của server.
+- Lệnh của người (create / gate / resume / cancel) chuyển từ CLI vào `wh_api::commands`, CLI và API dùng chung → cùng validate, cùng `ExpectedVersion::Exact` (quyết định trên state cũ → 409 thay vì ghi đè).
+- Đọc: list/metrics lấy từ projection (`wh_metrics::queries`: tasks + cost, sessions, totals, daily, stage stats). Timeline event của task/session đọc thẳng stream (nguồn sự thật, không cần projection riêng). Chưa thêm bảng read-model mới: `task_cycle_times`/`stage_stats` trong §5.4 hiện là SQL trên `tasks_view` + `session_facts`; tách thành projection khi dữ liệu lớn.
+- SSE `/api/events/stream`: một task LISTEN `wh_events` cập nhật `watch<head_seq>`; mỗi client giữ cursor riêng và tự `read_all(cursor)` → client chậm không mất event, lỡ NOTIFY chỉ trễ tối đa 5s. Hỗ trợ `Last-Event-ID` (EventSource tự resume), `?after=`, `?task=` (lọc theo correlation id).
+- UI: React 19 + Vite + Tailwind v4 + shadcn/ui (radix-nova), TanStack Query; một EventSource cho cả app, mỗi event invalidate query liên quan (debounce 350ms để projection trong cùng process kịp cập nhật), polling 30s chỉ là lưới an toàn. Dev: `npm run dev` (proxy `/api` → 7070).

@@ -1,0 +1,268 @@
+use std::{sync::Arc, time::Duration};
+
+use axum::{
+    Router,
+    body::Body,
+    http::{Request, StatusCode},
+};
+use http_body_util::BodyExt;
+use serde_json::{Value, json};
+use sqlx::PgPool;
+use tower::ServiceExt;
+use wh_api::{AppState, Live};
+use wh_core::{
+    Actor, EventMeta, NewEvent, SessionId, TaskId,
+    session::{SessionEvent, TokenUsage},
+    task::{StageOutcome, TaskEvent},
+};
+use wh_eventstore::{EventStore, ExpectedVersion};
+use wh_factory::Factory;
+
+fn factory() -> Factory {
+    Factory::load(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../factory/factory.yaml"))).unwrap()
+}
+
+fn app(pool: &PgPool, factory: Option<Factory>) -> (Router, EventStore) {
+    let store = EventStore::new(pool.clone());
+    let state = AppState { store: store.clone(), factory: factory.map(Arc::new), live: Live::detached(0) };
+    (wh_api::app(state, None), store)
+}
+
+async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+    let req = Request::builder().method(method).uri(uri).header("content-type", "application/json");
+    let req = req.body(body.map(|b| Body::from(b.to_string())).unwrap_or_default()).unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+async fn append(store: &EventStore, stream: &str, ev: NewEvent) {
+    store.append(stream, ExpectedVersion::Any, vec![ev]).await.unwrap();
+}
+
+fn sys(task: TaskId) -> EventMeta {
+    EventMeta::new(task.0, Actor::System { component: "test".into() })
+}
+
+async fn task_ev(store: &EventStore, task: TaskId, e: TaskEvent) {
+    append(store, &task.stream_id(), NewEvent::from_domain(&e, sys(task)).unwrap()).await;
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn create_list_and_show_task(pool: PgPool) {
+    let (app, _) = app(&pool, Some(factory()));
+    let (st, created) = call(&app, "POST", "/api/tasks", Some(json!({"title": "  Add SSE ", "body": "details"}))).await;
+    assert_eq!(st, StatusCode::CREATED);
+    assert_eq!(created["factory"], "workhub-dev");
+    let id = created["task_id"].as_str().unwrap().to_owned();
+
+    let (st, list) = call(&app, "GET", "/api/tasks", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(list[0]["title"], "Add SSE");
+    assert_eq!(list[0]["status"], "open");
+    assert_eq!(list[0]["source"], "web");
+
+    let (_, open) = call(&app, "GET", "/api/tasks?status=open", None).await;
+    assert_eq!(open.as_array().unwrap().len(), 1);
+    let (_, done) = call(&app, "GET", "/api/tasks?status=done", None).await;
+    assert!(done.as_array().unwrap().is_empty());
+
+    let (st, detail) = call(&app, "GET", &format!("/api/tasks/{id}"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(detail["state"]["status"], "open");
+    assert_eq!(detail["state"]["body"], "details");
+    assert_eq!(detail["events"][0]["type"], "TaskCreated");
+    assert_eq!(detail["events"][0]["meta"]["actor"]["kind"], "human");
+
+    let (st, _) = call(&app, "POST", "/api/tasks", Some(json!({"title": "   "}))).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    let (st, _) = call(&app, "GET", &format!("/api/tasks/{}", TaskId::new()), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = call(&app, "GET", "/api/tasks/not-a-uuid", None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn pipeline_task_needs_a_factory(pool: PgPool) {
+    let (app, _) = app(&pool, None);
+    let (st, _) = call(&app, "POST", "/api/tasks", Some(json!({"title": "x", "pipeline": true}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // Default without a factory: a manual task.
+    let (st, created) = call(&app, "POST", "/api/tasks", Some(json!({"title": "x"}))).await;
+    assert_eq!(st, StatusCode::CREATED);
+    assert_eq!(created["factory"], Value::Null);
+    let (_, f) = call(&app, "GET", "/api/factory", None).await;
+    assert_eq!(f, Value::Null);
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn gate_resume_and_cancel(pool: PgPool) {
+    let (app, store) = app(&pool, Some(factory()));
+    let (_, created) = call(&app, "POST", "/api/tasks", Some(json!({"title": "t"}))).await;
+    let id = created["task_id"].as_str().unwrap().to_owned();
+    let task: TaskId = id.parse().unwrap();
+
+    // Not at a gate yet.
+    let (st, err) = call(&app, "POST", &format!("/api/tasks/{id}/gate"), Some(json!({"approved": true}))).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{err}");
+
+    task_ev(&store, task, TaskEvent::StageEntered { stage: "spec".into(), feedback: None }).await;
+    task_ev(&store, task, TaskEvent::StageExited {
+        stage: "spec".into(),
+        outcome: StageOutcome::Succeeded,
+        summary: Some("wrote docs/specs/x.md".into()),
+        session: None,
+    })
+    .await;
+    task_ev(&store, task, TaskEvent::GateRequested { gate: "spec-review".into(), stage: "spec".into() }).await;
+
+    let (_, detail) = call(&app, "GET", &format!("/api/tasks/{id}"), None).await;
+    assert_eq!(detail["state"]["status"], "awaiting_gate");
+    assert_eq!(detail["state"]["gate"], "spec-review");
+    assert_eq!(detail["state"]["results"][0]["summary"], "wrote docs/specs/x.md");
+
+    // Rejecting needs a comment.
+    let (st, _) = call(&app, "POST", &format!("/api/tasks/{id}/gate"), Some(json!({"approved": false}))).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    let (st, res) = call(&app, "POST", &format!("/api/tasks/{id}/gate"), Some(json!({"approved": true, "comment": "lgtm"}))).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(res["message"], "gate 'spec-review' approved");
+    let (_, detail) = call(&app, "GET", &format!("/api/tasks/{id}"), None).await;
+    let last = detail["events"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["type"], "GateDecided");
+    assert_eq!(last["payload"]["approved"], true);
+    assert_eq!(last["payload"]["comment"], "lgtm");
+
+    // Resume only works on blocked tasks.
+    let (st, _) = call(&app, "POST", &format!("/api/tasks/{id}/resume"), Some(json!({}))).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    task_ev(&store, task, TaskEvent::TaskBlocked { stage: Some("implement".into()), reason: "budget".into() }).await;
+    let (st, _) = call(&app, "POST", &format!("/api/tasks/{id}/resume"), Some(json!({"comment": "try smaller"}))).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = call(&app, "POST", &format!("/api/tasks/{id}/cancel"), Some(json!({"reason": "dup"}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(&app, "POST", &format!("/api/tasks/{id}/cancel"), Some(json!({}))).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    let (_, list) = call(&app, "GET", "/api/tasks", None).await;
+    assert_eq!(list[0]["status"], "cancelled");
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn sessions_stats_and_dashboard(pool: PgPool) {
+    let (app, store) = app(&pool, Some(factory()));
+    let (_, created) = call(&app, "POST", "/api/tasks", Some(json!({"title": "t"}))).await;
+    let task: TaskId = created["task_id"].as_str().unwrap().parse().unwrap();
+
+    let dir = tempfile_dir();
+    let transcript = dir.join("s.jsonl");
+    std::fs::write(&transcript, "{\"type\":\"system\"}\n\n{\"type\":\"result\",\"result\":\"done\"}\nnot json\n").unwrap();
+
+    let session = SessionId::new();
+    let s = session.stream_id();
+    let evs = [
+        SessionEvent::AgentDispatched {
+            task_id: task,
+            agent: "spec".into(),
+            stage: "spec".into(),
+            runtime: "fake".into(),
+            model: Some("claude-haiku-5-5".into()),
+            prompt: "p".into(),
+            budget_usd: Some(1.0),
+            timeout_secs: 60,
+            attempt: 1,
+            retry_of: None,
+        },
+        SessionEvent::AgentToolCalled { tool: "Read".into(), ok: true, duration_ms: 10 },
+        SessionEvent::AgentUsageReported { usage: TokenUsage { input_tokens: 10, ..Default::default() }, cost_usd: 0.25 },
+        SessionEvent::AgentSessionCompleted {
+            num_turns: 3,
+            duration_ms: 1500,
+            summary: Some("ok".into()),
+            transcript: Some(transcript.display().to_string()),
+            commit: None,
+        },
+    ];
+    for e in &evs {
+        append(&store, &s, NewEvent::from_domain(e, sys(task)).unwrap()).await;
+    }
+    wh_metrics::catch_up_all(&store).await.unwrap();
+
+    let (_, list) = call(&app, "GET", "/api/sessions", None).await;
+    assert_eq!(list[0]["agent"], "spec");
+    assert_eq!(list[0]["cost_usd"], 0.25);
+    let (_, one) = call(&app, "GET", &format!("/api/sessions/{session}"), None).await;
+    assert_eq!(one["session"]["status"], "succeeded");
+    assert_eq!(one["events"].as_array().unwrap().len(), 4);
+    let (st, t) = call(&app, "GET", &format!("/api/sessions/{session}/transcript"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(t["lines"].as_array().unwrap().len(), 2, "blank and non-JSON lines are skipped");
+    assert_eq!(t["lines"][1]["result"], "done");
+
+    let (_, tasks) = call(&app, "GET", "/api/tasks", None).await;
+    assert_eq!(tasks[0]["sessions"], 1);
+    assert_eq!(tasks[0]["cost_usd"], 0.25);
+    let (_, detail) = call(&app, "GET", &format!("/api/tasks/{task}"), None).await;
+    assert_eq!(detail["sessions"][0]["num_turns"], 3);
+
+    let (st, stats) = call(&app, "GET", "/api/stats", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(stats["agents"][0]["runs"], 1);
+    assert_eq!(stats["stages"][0]["stage"], "spec");
+
+    let (st, dash) = call(&app, "GET", "/api/dashboard?days=7", None).await;
+    assert_eq!(st, StatusCode::OK, "{dash}");
+    assert_eq!(dash["daily"].as_array().unwrap().len(), 7);
+    assert_eq!(dash["totals"]["tasks_created"], 1);
+    assert_eq!(dash["totals"]["cost_usd"], 0.25);
+    assert_eq!(dash["daily"][6]["sessions_succeeded"], 1);
+
+    let (_, f) = call(&app, "GET", "/api/factory", None).await;
+    assert_eq!(f["name"], "workhub-dev");
+    assert_eq!(f["stages"][1]["gate"], "spec-review");
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn sse_replays_after_cursor_and_filters_by_task(pool: PgPool) {
+    let (app, store) = app(&pool, None);
+    let (a, b) = (TaskId::new(), TaskId::new());
+    let created = |t: &str| TaskEvent::TaskCreated {
+        title: t.into(),
+        body: None,
+        source: wh_core::task::TaskSource::Cli,
+        factory: None,
+    };
+    task_ev(&store, a, created("a")).await;
+    task_ev(&store, b, created("b")).await;
+    task_ev(&store, a, TaskEvent::TaskCancelled { reason: "x".into() }).await;
+
+    let req = Request::builder().uri(format!("/api/events/stream?after=0&task={a}")).body(Body::empty()).unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers()["content-type"].to_str().unwrap().starts_with("text/event-stream"));
+    let mut body = res.into_body();
+    let mut text = String::new();
+    while text.matches("\n\n").count() < 2 {
+        let frame = tokio::time::timeout(Duration::from_secs(5), body.frame()).await.unwrap().unwrap().unwrap();
+        if let Some(d) = frame.data_ref() {
+            text.push_str(std::str::from_utf8(d).unwrap());
+        }
+    }
+    assert!(text.contains("id: 1\n") && text.contains("id: 3\n"), "{text}");
+    assert!(!text.contains("id: 2\n"), "other task's event leaked: {text}");
+    assert!(text.contains("\"type\":\"TaskCancelled\""));
+
+    // Last-Event-ID resumes after the given seq.
+    let req = Request::builder().uri("/api/events/stream").header("last-event-id", "2").body(Body::empty()).unwrap();
+    let mut body = app.clone().oneshot(req).await.unwrap().into_body();
+    let frame = tokio::time::timeout(Duration::from_secs(5), body.frame()).await.unwrap().unwrap().unwrap();
+    let text = std::str::from_utf8(frame.data_ref().unwrap()).unwrap().to_owned();
+    assert!(text.contains("id: 3\n") && !text.contains("id: 1\n"), "{text}");
+}
+
+fn tempfile_dir() -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("wh-api-test-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}

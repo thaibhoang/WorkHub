@@ -15,6 +15,7 @@ wh-metrics.workspace = true
 wh-runner.workspace = true
 wh-factory.workspace = true
 wh-foreman.workspace = true
+wh-api.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dotenvy.workspace = true

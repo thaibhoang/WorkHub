@@ -1,6 +1,7 @@
 //! Read models (projections) built from the event log. Every projection can be
 //! dropped and rebuilt from events at any time.
 
+pub mod queries;
 pub mod sessions;
 pub mod tasks;
 
