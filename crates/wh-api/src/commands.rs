@@ -60,7 +60,7 @@ pub async fn create_task(store: &EventStore, actor: Actor, t: NewTask) -> Result
     }
     let body = t.body.filter(|b| !b.trim().is_empty());
     let id = TaskId::new();
-    let ev = TaskEvent::TaskCreated { title, body, source: t.source, factory: t.factory };
+    let ev = TaskEvent::TaskCreated { title, body, source: t.source, factory: t.factory, benchmark: None };
     append(store, id, ExpectedVersion::NoStream, actor, ev).await?;
     Ok(id)
 }

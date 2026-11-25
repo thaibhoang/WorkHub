@@ -1,6 +1,7 @@
 //! Read models (projections) built from the event log. Every projection can be
 //! dropped and rebuilt from events at any time.
 
+pub mod benchmarks;
 pub mod proposals;
 pub mod queries;
 pub mod scores;
@@ -29,7 +30,8 @@ pub async fn catch_up_all(store: &EventStore) -> anyhow::Result<Vec<(&'static st
         (tasks::TasksProjection::NAME, sub.catch_up(&mut tasks::TasksProjection::new(pool.clone())).await?),
         (sessions::SessionFactsProjection::NAME, sub.catch_up(&mut sessions::SessionFactsProjection::new(pool.clone())).await?),
         (scores::ScoreResultsProjection::NAME, sub.catch_up(&mut scores::ScoreResultsProjection::new(pool.clone())).await?),
-        (proposals::ProposalsProjection::NAME, sub.catch_up(&mut proposals::ProposalsProjection::new(pool)).await?),
+        (proposals::ProposalsProjection::NAME, sub.catch_up(&mut proposals::ProposalsProjection::new(pool.clone())).await?),
+        (benchmarks::BenchmarksProjection::NAME, sub.catch_up(&mut benchmarks::BenchmarksProjection::new(pool)).await?),
     ])
 }
 
@@ -40,6 +42,7 @@ pub async fn rebuild_all(store: &EventStore) -> anyhow::Result<Vec<(&'static str
         (tasks::TasksProjection::NAME, rebuild(store, &mut tasks::TasksProjection::new(pool.clone())).await?),
         (sessions::SessionFactsProjection::NAME, rebuild(store, &mut sessions::SessionFactsProjection::new(pool.clone())).await?),
         (scores::ScoreResultsProjection::NAME, rebuild(store, &mut scores::ScoreResultsProjection::new(pool.clone())).await?),
-        (proposals::ProposalsProjection::NAME, rebuild(store, &mut proposals::ProposalsProjection::new(pool)).await?),
+        (proposals::ProposalsProjection::NAME, rebuild(store, &mut proposals::ProposalsProjection::new(pool.clone())).await?),
+        (benchmarks::BenchmarksProjection::NAME, rebuild(store, &mut benchmarks::BenchmarksProjection::new(pool)).await?),
     ])
 }

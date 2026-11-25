@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     event::DomainEvent,
     failure::FailureClass,
-    ids::{SessionId, TaskId},
+    ids::{BenchmarkRunId, SessionId, TaskId},
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +34,9 @@ pub enum SessionEvent {
         /// The failed session this one retries.
         #[serde(default)]
         retry_of: Option<SessionId>,
+        /// Benchmark run this session belongs to (excluded from production metrics).
+        #[serde(default)]
+        benchmark: Option<BenchmarkRunId>,
     },
     AgentSessionStarted {
         workdir: String,

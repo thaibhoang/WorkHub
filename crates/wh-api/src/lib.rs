@@ -3,6 +3,7 @@
 //! command); reads come from projections, except task/session event timelines
 //! which are read straight from their streams.
 
+mod bench;
 pub mod commands;
 pub mod dto;
 mod live;
@@ -39,6 +40,8 @@ pub struct AppState {
     /// Factory driving new tasks created from the UI (if the server was given one).
     pub factory: Option<Arc<Factory>>,
     pub live: Live,
+    /// Directory of benchmark suites runnable from the UI.
+    pub bench_dir: PathBuf,
 }
 
 impl AppState {
@@ -66,6 +69,10 @@ pub fn api(state: AppState) -> Router {
         .route("/proposals/{id}/decide", post(decide_proposal))
         .route("/proposals/{id}/apply", post(apply_proposal))
         .route("/improvement", get(improvement))
+        .route("/benchmarks", get(bench::runs).post(bench::request))
+        .route("/benchmarks/suites", get(bench::suites))
+        .route("/benchmarks/compare", get(bench::compare))
+        .route("/benchmarks/{id}", get(bench::run))
         .route("/stats", get(stats))
         .route("/dashboard", get(dashboard))
         .route("/factory", get(factory))

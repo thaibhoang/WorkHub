@@ -66,7 +66,7 @@ impl SessionFactsProjection {
         Ok(sqlx::query_as(
             "SELECT session_id, task_id, agent, model, status, failure_class, attempt, dispatched_at, duration_ms, \
              num_turns, tool_calls, tool_errors, input_tokens, output_tokens, cache_read_tokens, cost_usd \
-             FROM session_facts ORDER BY dispatched_at DESC LIMIT $1",
+             FROM session_facts WHERE benchmark_run IS NULL ORDER BY dispatched_at DESC LIMIT $1",
         )
         .bind(limit)
         .fetch_all(pool)
@@ -88,7 +88,7 @@ impl SessionFactsProjection {
                avg(num_turns)::float8 AS avg_turns, \
                COALESCE(sum(tool_calls), 0)::int8 AS tool_calls, \
                COALESCE(sum(tool_errors), 0)::int8 AS tool_errors \
-             FROM session_facts WHERE status IN ('succeeded', 'failed') \
+             FROM session_facts WHERE status IN ('succeeded', 'failed') AND benchmark_run IS NULL \
              GROUP BY agent ORDER BY agent",
         )
         .fetch_all(pool)
@@ -99,7 +99,7 @@ impl SessionFactsProjection {
     pub async fn failures_by_class(pool: &PgPool) -> anyhow::Result<Vec<(String, i64)>> {
         Ok(sqlx::query_as(
             "SELECT COALESCE(failure_class, 'unknown'), count(*) FROM session_facts \
-             WHERE status = 'failed' GROUP BY 1 ORDER BY 2 DESC",
+             WHERE status = 'failed' AND benchmark_run IS NULL GROUP BY 1 ORDER BY 2 DESC",
         )
         .fetch_all(pool)
         .await?)
@@ -135,12 +135,12 @@ impl EventHandler for SessionFactsProjection {
         let seq = ev.global_seq;
         let at = ev.meta.occurred_at;
         match ev.decode::<SessionEvent>()? {
-            SessionEvent::AgentDispatched { task_id, agent, stage, runtime, model, attempt, retry_of, .. } => {
+            SessionEvent::AgentDispatched { task_id, agent, stage, runtime, model, attempt, retry_of, benchmark, .. } => {
                 sqlx::query(
                     "INSERT INTO session_facts \
                      (session_id, task_id, agent, stage, runtime, model, status, dispatched_at, factory_version, \
-                      attempt, retry_of, last_seq) \
-                     VALUES ($1, $2, $3, $4, $5, $6, 'dispatched', $7, $8, $10, $11, $9) \
+                      attempt, retry_of, last_seq, benchmark_run) \
+                     VALUES ($1, $2, $3, $4, $5, $6, 'dispatched', $7, $8, $10, $11, $9, $12) \
                      ON CONFLICT (session_id) DO NOTHING",
                 )
                 .bind(id)
@@ -154,6 +154,7 @@ impl EventHandler for SessionFactsProjection {
                 .bind(seq)
                 .bind(attempt as i32)
                 .bind(retry_of.map(|r| r.0))
+                .bind(benchmark.map(|b| b.0))
                 .execute(&self.pool)
                 .await?;
             }

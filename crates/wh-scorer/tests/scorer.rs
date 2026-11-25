@@ -111,6 +111,7 @@ async fn create_task(store: &EventStore, factory: Option<&str>) -> TaskId {
         body: Some("Implement fn feature".into()),
         source: TaskSource::Cli,
         factory: factory.map(Into::into),
+        benchmark: None,
     };
     let meta = EventMeta::new(task.0, Actor::Human { user: "t".into() });
     store.append(&task.stream_id(), ExpectedVersion::NoStream, vec![NewEvent::from_domain(&ev, meta).unwrap()]).await.unwrap();
@@ -142,6 +143,7 @@ async fn run_stage(store: &EventStore, factory: &Factory, data: &Path, task: Tas
         task_expected_version: None,
         feedback: None,
         factory_version: Some(factory.version.clone()),
+        benchmark: None,
     };
     runner.run(spec, |_| {}).await.unwrap().last().session_id
 }

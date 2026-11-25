@@ -3,6 +3,7 @@ import { ArrowLeft, Check, GitMerge, X } from 'lucide-react'
 import { useState } from 'react'
 import { Link, useParams } from 'react-router'
 import { toast } from 'sonner'
+import { BenchComparisonTable, BenchRunsTable, RunBenchmarkDialog } from '@/components/benchmarks'
 import { PageHeader } from '@/components/PageHeader'
 import { Delta, ProposalStatusBadge, proposalTitle, VERSION_METRICS } from '@/components/proposals'
 import { SessionStatusBadge } from '@/components/status'
@@ -12,7 +13,7 @@ import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Textarea } from '@/components/ui/textarea'
-import { actorLabel, api, fmtMs, fmtTime, fmtUsd, shortId, type ProposalDetail as Detail, type ProposalRow } from '@/lib/api'
+import { actorLabel, api, benchApi, fmtMs, fmtTime, fmtUsd, shortId, type ProposalDetail as Detail, type ProposalRow } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { ApiDown } from './Runs'
 
@@ -65,6 +66,7 @@ export default function ProposalDetail() {
         {p.expected_impact ? <Section title="Expected impact">{p.expected_impact}</Section> : null}
         {p.decision_comment ? <Section title={`Reviewer (${p.decided_by})`}>{p.decision_comment}</Section> : null}
         <Impact d={data} />
+        {p.commit_sha ? <Benchmarks proposalId={p.proposal_id} /> : null}
         {data.evidence.length ? <Evidence d={data} /> : null}
         {p.diff ? <Diff p={p} /> : null}
         <Events d={data} />
@@ -186,6 +188,41 @@ function Impact({ d }: { d: Detail }) {
             ))}
           </TableBody>
         </Table>
+      </CardContent>
+    </Card>
+  )
+}
+
+/** Benchmark runs of this proposal: base (parent commit) vs proposal, side by side. */
+function Benchmarks({ proposalId }: { proposalId: string }) {
+  const { data: runs } = useQuery({
+    queryKey: ['benchmarks', 'runs', { proposal: proposalId }],
+    queryFn: () => benchApi.runs({ proposal: proposalId }),
+  })
+  // Newest completed base and proposal runs.
+  const done = runs?.filter((r) => r.status === 'completed') ?? []
+  const base = done.find((r) => r.label === 'base')
+  const cand = done.find((r) => r.label === 'proposal' && (!base || r.suite_file === base.suite_file))
+  const { data: cmp } = useQuery({
+    queryKey: ['benchmarks', 'compare', base?.run_id, cand?.run_id],
+    queryFn: () => benchApi.compare(base!.run_id, cand!.run_id),
+    enabled: !!base && !!cand,
+  })
+  return (
+    <Card className="gap-3">
+      <CardHeader className="flex flex-row flex-wrap items-start justify-between gap-2">
+        <div className="grid gap-1.5">
+          <CardTitle>Benchmark</CardTitle>
+          <CardDescription>
+            Run a fixed suite on the factory before this change (A, base) and with it (B, proposal). This is an objective check before
+            you roll it out, and it does not wait for live traffic.
+          </CardDescription>
+        </div>
+        <RunBenchmarkDialog proposal={proposalId} label="Benchmark" />
+      </CardHeader>
+      <CardContent className="grid gap-3">
+        {cmp ? <BenchComparisonTable c={cmp} /> : null}
+        {runs?.length ? <BenchRunsTable rows={runs} /> : <p className="text-sm text-muted-foreground">Not benchmarked yet.</p>}
       </CardContent>
     </Card>
   )

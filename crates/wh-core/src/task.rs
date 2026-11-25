@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{event::DomainEvent, ids::SessionId};
+use crate::{benchmark::BenchmarkContext, event::DomainEvent, ids::SessionId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskSource {
     Cli,
     Web,
+    /// A benchmark case created by the benchmark runner.
+    Benchmark,
 }
 
 impl TaskSource {
@@ -14,6 +16,7 @@ impl TaskSource {
         match self {
             Self::Cli => "cli",
             Self::Web => "web",
+            Self::Benchmark => "benchmark",
         }
     }
 }
@@ -31,6 +34,9 @@ pub enum TaskEvent {
         /// Name of the factory that should drive this task (None = manual only).
         #[serde(default)]
         factory: Option<String>,
+        /// Set when the task is a benchmark case (driven by the benchmark runner).
+        #[serde(default)]
+        benchmark: Option<BenchmarkContext>,
     },
     StageEntered {
         stage: String,
@@ -136,6 +142,7 @@ pub struct TaskState {
     pub title: String,
     pub body: Option<String>,
     pub factory: Option<String>,
+    pub benchmark: Option<BenchmarkContext>,
     pub status: TaskStatus,
     pub results: Vec<StageResult>,
     /// Stages re-run because of feedback (review reject, gate reject, resume comment).
@@ -157,10 +164,11 @@ impl TaskState {
     pub fn apply(&mut self, version: i64, ev: TaskEvent) {
         self.version = version;
         match &ev {
-            TaskEvent::TaskCreated { title, body, factory, .. } => {
+            TaskEvent::TaskCreated { title, body, factory, benchmark, .. } => {
                 self.title = title.clone();
                 self.body = body.clone();
                 self.factory = factory.clone();
+                self.benchmark = benchmark.clone();
                 self.status = TaskStatus::Open;
             }
             TaskEvent::StageEntered { stage, feedback } => {
@@ -246,7 +254,7 @@ mod tests {
     #[test]
     fn fold_tracks_status_and_rework() {
         let s = TaskState::fold([
-            (1, TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("f".into()) }),
+            (1, TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("f".into()), benchmark: None }),
             (2, TaskEvent::StageEntered { stage: "impl".into(), feedback: None }),
             (3, TaskEvent::StageExited { stage: "impl".into(), outcome: StageOutcome::Succeeded, summary: None, session: None }),
             (4, TaskEvent::StageEntered { stage: "impl".into(), feedback: Some("fix".into()) }),

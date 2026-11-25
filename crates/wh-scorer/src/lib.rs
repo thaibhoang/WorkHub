@@ -157,6 +157,8 @@ struct SessionInfo {
     commit: Option<String>,
     /// Event that finished the session (cause of the score).
     finished_event: uuid::Uuid,
+    /// Session of a benchmark case (not graded automatically).
+    benchmark: bool,
 }
 
 impl<R: AgentRuntime> Inner<R> {
@@ -169,7 +171,7 @@ impl<R: AgentRuntime> Inner<R> {
 
     async fn session_info(&self, session: SessionId) -> anyhow::Result<Option<SessionInfo>> {
         let events = self.store.read_stream(&session.stream_id()).await?;
-        let Some(SessionEvent::AgentDispatched { task_id, agent, stage, prompt, .. }) =
+        let Some(SessionEvent::AgentDispatched { task_id, agent, stage, prompt, benchmark, .. }) =
             events.first().map(|e| e.decode()).transpose()?
         else {
             return Ok(None);
@@ -196,6 +198,7 @@ impl<R: AgentRuntime> Inner<R> {
             transcript,
             commit,
             finished_event: last.event_id,
+            benchmark: benchmark.is_some(),
         }))
     }
 
@@ -354,6 +357,11 @@ impl<R: AgentRuntime + 'static> EventHandler for ScorerService<R> {
         let Some(session) = SessionId::from_stream_id(&ev.stream_id) else { return Ok(()) };
         let inner = &self.inner;
         let Some(info) = inner.session_info(session).await? else { return Ok(()) };
+        // Benchmark sessions are measured by their suite's checks; grading them would
+        // mix benchmark runs into the live scorer metrics the improver reads.
+        if info.benchmark {
+            return Ok(());
+        }
         let scorers: Vec<Scorer> = inner
             .factory
             .scorers_for(&info.agent)

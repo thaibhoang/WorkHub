@@ -131,6 +131,7 @@ async fn session(store: &EventStore, f: &Factory, stage: &str, failed: bool, rej
         body: None,
         source: TaskSource::Cli,
         factory: Some(f.name.clone()),
+        benchmark: None,
     };
     append(store, &task.stream_id(), task.0, v, created).await;
     let dispatched = SessionEvent::AgentDispatched {
@@ -144,6 +145,7 @@ async fn session(store: &EventStore, f: &Factory, stage: &str, failed: bool, rej
         timeout_secs: 60,
         attempt: 1,
         retry_of: None,
+        benchmark: None,
     };
     append(store, &s.stream_id(), task.0, v, dispatched).await;
     let end = if failed {

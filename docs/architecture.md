@@ -66,6 +66,7 @@ Map với "The Factories Stack" của Warp Factories (sản phẩm tham khảo):
 | **AgentSession** | Một lần chạy một agent cụ thể (triage, spec, code, review…) | `session-{id}` |
 | **Gate** | Điểm duyệt của người (spec/code/product) | thuộc stream Task |
 | **ScoreResult** | Kết quả chấm một session/run bởi scorer | `score-{id}` |
+| **BenchmarkRun** | Một lần chạy suite benchmark trên một biến thể factory | `bench-{id}` |
 | **Proposal** | Đề xuất cải tiến từ improver + trạng thái duyệt | `proposal-{id}` |
 
 Quan hệ: `Factory 1─n Task 1─n Run 1─n AgentSession`; `AgentSession 1─n ScoreResult`; `Proposal n─n (Session làm bằng chứng)`.
@@ -136,7 +137,9 @@ pub struct EventMeta {
 - `AgentSessionCompleted{outcome, num_turns, duration_ms, cost_usd, artifacts[]}`
 - `AgentSessionFailed{failure_class, message, retryable}`
 
-**Quality / Improvement** (stream `score-{id}`): `ScoreStarted{scorer, target_session, task_id, agent, stage, model, pass_threshold, manual}`, `ScoreRecorded{score, pass, classification, rationale, cost_usd, usage}`, `ScoreFailed{message, cost_usd}`, `BenchmarkRunCompleted{suite, variant, results}`.
+**Quality / Improvement** (stream `score-{id}`): `ScoreStarted{scorer, target_session, task_id, agent, stage, model, pass_threshold, manual}`, `ScoreRecorded{score, pass, classification, rationale, cost_usd, usage}`, `ScoreFailed{message, cost_usd}`.
+
+**Benchmark** (stream `bench-{id}`): `BenchmarkRequested{suite, suite_file, git_ref, proposal, label, repeat, cases}`, `BenchmarkStarted{factory, factory_version, factory_commit, suite_version, planned, pid}`, `BenchmarkCaseStarted{case, repeat, task_id}`, `BenchmarkCaseFinished{case, repeat, task_id, task_status, passed, check, cost_usd, duration_ms, sessions, rework_loops, message}`, `BenchmarkCompleted{cases, passed, cost_usd, duration_ms, aborted}` | `BenchmarkFailed{message}`.
 
 **Proposal** (stream `proposal-{id}`): `ImprovementRequested{factory, trigger, focus}`, `ImprovementStarted{base_factory_version, window_days, sessions_observed}`, `ProposalCreated{title, rationale, expected_impact, evidence[], files[], diff, branch, commit, proposed_factory_version, cost_usd}` | `ImprovementSkipped{reason}` | `ImprovementFailed{message}`, `ProposalDecided{approved, reviewer, comment}`, `ProposalRolledOut{factory_version, commit}`.
 
@@ -203,12 +206,13 @@ Measure  → so sánh metrics trước/sau theo factory_version; benchmark suite
 - Improver tự đo hiệu quả bản thân: approval rate, cost, và delta metrics sau rollout.
 - Đã triển khai ở phase 5, xem "Ghi chú phase 5" bên dưới.
 
-### 5.7 Benchmarks (giai đoạn sau)
-Tập task cố định (có lời giải/đánh giá) để chạy lại với các biến thể (model, skill, prompt) → so sánh khách quan trước khi rollout.
+### 5.7 Benchmarks (`wh-bench`)
+Tập task cố định (có check chấm tự động) để chạy lại với các biến thể của factory (model, skill, prompt) → so sánh khách quan trước khi rollout, không phải chờ dữ liệu thật. Đã triển khai ở phase 6, xem "Ghi chú phase 6" bên dưới.
 
 ### 5.8 API & UI (`wh-api`, `web/`)
 - **axum** REST + **SSE** để stream event live (timeline, trạng thái run).
 - Màn hình (theo Warp Factories): Inbox (gate + proposal cần duyệt), Runs, Run detail (transcript + Timeline/Agents/Artifacts/Metadata), Dashboard (Productivity / Spending / Scorers), Agents, Scorers, Self-improvement, Factory definition (read-only, link về repo).
+- Phase 6 thêm Benchmarks (suite, danh sách run, chạy run, so sánh hai run), trang chi tiết run benchmark (từng case kèm output của check), thẻ Benchmark trên trang proposal (base vs proposal) và banner "benchmark case" trên trang task.
 - Phase 3 đã làm: Runs, Run detail (pipeline strip, duyệt gate / resume / cancel, Gantt session theo stage, stage outputs, transcript, raw events), Inbox (gate + blocked; proposal đợi phase 5), Dashboard, Factory. Phase 4 thêm Scorers (pass rate / cost theo scorer, kết quả gần đây), điểm trên từng session, ô pass rate + judge cost trên Dashboard. Phase 5 thêm Self-improvement (track record của improver, proposal, metrics theo factory_version kèm delta), trang proposal (diff, evidence, duyệt/áp dụng, before → after) và proposal trong Inbox. Agents để phase sau.
 
 ---
@@ -289,6 +293,7 @@ WorkHub/
 │   ├── wh-metrics/           # projections / read models
 │   ├── wh-scorer/
 │   ├── wh-improver/
+│   ├── wh-bench/             # benchmark suites, runs, comparison
 │   ├── wh-artifacts/         # transcript / diff / report storage
 │   ├── wh-api/               # axum, SSE
 │   └── wh-cli/               # `wh` binary: task create, run, replay projection…
@@ -314,7 +319,8 @@ MVP chạy **một binary** (`workhubd`) chứa mọi consumer dưới dạng to
 | **3. Quan sát** ✅ | API + SSE + UI: Runs, Run timeline, Dashboard | Xem live, metrics cycle time/cost/fail rate |
 | **4. Chất lượng** ✅ | Scorers | Pass rate theo scorer, cost scorer |
 | **5. Tự cải tiến** ✅ | Improver + Inbox duyệt + so sánh theo factory_version | Proposal → PR → đo delta |
-| **6. Mở rộng** | Benchmarks, GitHub/Slack/Linear, Docker sandbox, NATS | — |
+| **6. Benchmarks** ✅ | Suite task cố định + check ẩn, chạy trên factory tại một git ref, so sánh run (proposal vs base) | Proposal → benchmark base/proposal → so sánh pass rate/cost trước khi duyệt |
+| **7. Mở rộng** | GitHub/Slack/Linear, Docker sandbox, NATS | — |
 
 Nên **dogfood** từ phase 2: dùng WorkHub để phát triển chính WorkHub.
 
@@ -373,3 +379,14 @@ Nên **dogfood** từ phase 2: dùng WorkHub để phát triển chính WorkHub.
 - **Measure**: `wh_metrics::proposals::version_stats` (fail%, reject%, retries, avg cost, p50, tool err%, scorer pass% theo `factory_version`), `wh versions`, bảng version trên UI kèm delta so với version trước, trang proposal hiện before (base version) → after (version đã rollout).
 - Pool kết nối của CLI tăng lên 20, vì mỗi consumer chạy liên tục (4 projection, SSE, foreman, scorer, improver) giữ một connection LISTEN. Với 5 connection như trước, khi thêm projection thứ tư API đã bị treo khoảng 30s.
 - Kiểm chứng thật: chạy improver bằng Haiku ($0.008, 27s) trên dữ liệu thật của task demo ở phase 2. Nó chẩn đoán đúng nguyên nhân (3 lần review REJECT vì `greet.sh` thiếu quyền thực thi, rồi task bị block ở rework limit), thêm đúng một dòng vào `agents/implementation.md`, trích 3 session làm evidence, và tự nói rõ là không nới quyền tool.
+
+### Ghi chú phase 6 (Benchmarks)
+- Lộ trình gốc gộp nhiều thứ vào phase 6 (benchmarks, GitHub/Slack/Linear, Docker sandbox, NATS). Phase này chỉ làm **benchmarks**, vì nó khép vòng tự cải tiến: đánh giá proposal trước khi rollout. Tích hợp ngoài, Docker và NATS chuyển sang phase 7 (GitHub/Slack trái với quyết định local-only; NATS chưa cần khi chạy một máy).
+- Crate `wh-bench`. **Suite** (`benchmarks/*.yaml`) gồm: `factory` (đường dẫn tương đối tới factory.yaml), `max_cost_usd` (hết tiền thì không bắt đầu case mới), và danh sách `cases`. Mỗi case có `title/body`, nơi agent làm việc và `check`. Nơi làm việc là một trong ba: repo của factory (có thể kèm `base_ref`), một `repo` khác, hoặc một `fixture` (thư mục được copy thành git repo một commit mới cho mỗi lần chạy case). Suite nằm **ngoài** `factory/` vì improver chỉ được sửa factory, không được sửa thước đo.
+- **Check**: lệnh `sh -c` chạy trên checkout của branch task sau khi task `done`, exit 0 = pass, có timeout. Có biến môi trường `WH_BENCH_SUITE_DIR` và `WH_BENCH_CASE`, nên test có thể nằm trong `benchmarks/checks/`, chỗ agent không thấy và không sửa được. `suite_version` = sha256 của file suite + fixture + `checks/`. Hai run chỉ "comparable" khi cùng file suite và cùng version.
+- **Biến thể**: factory của suite tại một git ref, được checkout vào worktree detached (`<data>/bench/<run>/factory`) rồi `Factory::load`. Với proposal, `--proposal <id>` (hoặc nút trên UI) chạy hai run: `commit^` (label `base`) và `commit` (label `proposal`).
+- **Chạy**: mỗi case là một task thật (`TaskCreated.benchmark = {run, case, repo, base_ref}`, `source = benchmark`), được một `Foreman::for_benchmark(run)` lái inline bằng `drive()`. Gate được duyệt tự động (vẫn ghi `GateRequested` + `GateDecided` với reviewer `benchmark`), vì benchmark đo agent chứ không đo độ trễ của người. Foreman live bỏ qua task benchmark và ngược lại (`Scope`). Cost/số session của case đọc thẳng từ log theo `correlation_id`.
+- **Cách ly metrics**: `AgentDispatched.benchmark` → cột `benchmark_run` trên `session_facts` và `tasks_view`. Dashboard, stats, `version_stats`, observation và trigger của improver đều lọc `benchmark_run IS NULL`. Scorer không chấm session benchmark. Danh sách task cũng ẩn chúng, nhưng trang task/session vẫn mở được.
+- **At most once / khôi phục**: giống improver. `BenchmarkRequested` (CLI/API) được claim bằng `BenchmarkStarted` ở `Exact(1)`. `wh bench run` ghi cả hai event trong một lần append rồi chạy luôn, nên daemon không giành được run đó. `BenchmarkStarted.pid` cho phép phần khôi phục lúc khởi động bỏ qua run của một process vẫn còn sống (`kill -0`). Run mồ côi bị đánh `BenchmarkFailed`, task đang dở bị block. Worker chạy tuần tự từng run một (semaphore 1), vì run dài, tốn tiền, và chạy song song sẽ làm sai lệch thời gian đo.
+- Read model `benchmark_runs` + `benchmark_cases` (`wh_metrics::benchmarks`: `runs`, `run`, `cases`, `case_stats`, `compare`). CLI: `wh bench suites|run|runs|show|compare|worker`. Worker chạy trong `wh foreman` / `wh serve --foreman` (tắt bằng `--no-bench`). API: `GET/POST /api/benchmarks`, `/api/benchmarks/suites`, `/api/benchmarks/{id}`, `/api/benchmarks/compare?a&b`. Từ API chỉ chạy được suite nằm trong `--bench-dir`.
+- Kiểm chứng thật (factory demo dùng Haiku, suite `smoke` có 2 case shell với check ẩn): bản factory tốt pass 2/2 với $0.014–0.016 mỗi run. Bản có prompt implement bị làm tệ đi (chỉ mô tả, không sửa file) được chạy qua `--ref HEAD`, rồi `wh bench compare` đặt hai bản cạnh nhau theo từng case.

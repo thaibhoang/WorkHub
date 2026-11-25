@@ -263,7 +263,7 @@ impl<R: AgentRuntime + 'static> ImproverService<R> {
         if let Some(hours) = im.interval_hours.filter(|_| room(queued)) {
             let new_sessions: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM session_facts s JOIN tasks_view t ON t.task_id = s.task_id \
-                 WHERE t.factory = $1 AND s.status IN ('succeeded', 'failed') AND s.ended_at > COALESCE( \
+                 WHERE t.factory = $1 AND t.benchmark_run IS NULL AND s.status IN ('succeeded', 'failed') AND s.ended_at > COALESCE( \
                    (SELECT max(requested_at) FROM proposals_view WHERE factory = $1), '-infinity')",
             )
             .bind(&f.name)

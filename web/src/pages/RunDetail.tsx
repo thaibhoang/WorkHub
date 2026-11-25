@@ -74,6 +74,15 @@ export default function RunDetail() {
         actions={<CancelButton id={id} status={state.status} />}
       />
 
+      {task?.benchmark_run ? (
+        <p className="mb-4 rounded-lg border border-dashed p-3 text-sm text-muted-foreground">
+          Benchmark case <span className="font-mono">{task.benchmark_case}</span> of{' '}
+          <Link to={`/benchmarks/${task.benchmark_run}`} className="font-medium text-foreground hover:underline">
+            run {shortId(task.benchmark_run)}
+          </Link>
+          . Gates are approved automatically, and this task is left out of the live metrics and the improver.
+        </p>
+      ) : null}
       {pipeline ? <PipelineStrip factory={pipeline} detail={data} /> : null}
       <ActionPanel id={id} detail={data} factory={pipeline} />
 

@@ -4,7 +4,7 @@ use anyhow::Context;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 use wh_core::{
-    Actor, EventMeta, FailureClass, NewEvent, SessionId, TaskId,
+    Actor, BenchmarkRunId, EventMeta, FailureClass, NewEvent, SessionId, TaskId,
     session::SessionEvent,
     task::{StageOutcome, TaskEvent, Verdict, parse_verdict},
 };
@@ -54,6 +54,8 @@ pub struct RunSpec {
     pub feedback: Option<String>,
     /// Stamped on every event's metadata.
     pub factory_version: Option<String>,
+    /// Benchmark run the session belongs to (recorded on `AgentDispatched`).
+    pub benchmark: Option<BenchmarkRunId>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +152,7 @@ impl<R: AgentRuntime> Runner<R> {
             timeout_secs: spec.timeout.as_secs(),
             attempt,
             retry_of,
+            benchmark: spec.benchmark,
         })
         .await?;
 

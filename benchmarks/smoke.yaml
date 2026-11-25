@@ -1,0 +1,29 @@
+# Smoke benchmark for WorkHub's own factory. Each case runs through the whole
+# pipeline as a real task (gates approved automatically) and is graded by a
+# hidden check in checks/ that the agents never see. Compare runs with
+# `wh bench compare A B`, or benchmark a proposal with `wh bench run smoke --proposal <id>`.
+#
+# Suites live outside factory/ on purpose: the improver may change the factory,
+# never the yardstick.
+name: smoke
+description: Two small shell tasks (a feature and a bug fix) graded by hidden checks
+factory: ../factory/factory.yaml
+max_cost_usd: 10
+check_timeout_min: 2
+cases:
+  - id: greet-name
+    title: greet.sh should greet a name passed as an argument
+    body: |
+      `./greet.sh` prints `Hello, world!`. Make it accept an optional name:
+      `./greet.sh Ada` prints `Hello, Ada!` and the whole argument is used
+      (`./greet.sh "Grace Hopper"` prints `Hello, Grace Hopper!`). Without an
+      argument it keeps printing `Hello, world!`. Keep it POSIX sh and executable.
+    fixture: fixtures/greet
+    check: sh "$WH_BENCH_SUITE_DIR/checks/greet-name.sh"
+  - id: fizzbuzz-fix
+    title: fizzbuzz.sh prints Fizz instead of FizzBuzz for multiples of 15
+    body: |
+      `sh fizzbuzz.sh 15` prints `Fizz` on the last line, but multiples of 15
+      must print `FizzBuzz`. Fix the bug without changing the rest of the output.
+    fixture: fixtures/fizzbuzz
+    check: sh "$WH_BENCH_SUITE_DIR/checks/fizzbuzz-fix.sh"

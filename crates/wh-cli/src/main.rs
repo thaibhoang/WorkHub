@@ -1,3 +1,5 @@
+mod bench;
+
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
@@ -11,14 +13,16 @@ use wh_core::{
 use wh_eventstore::{EventStore, Subscription};
 use wh_factory::Factory;
 use wh_foreman::{Dispatch, Foreman};
-use wh_core::{ProposalId, SessionId};
+use wh_core::{BenchmarkRunId, ProposalId, SessionId};
 use wh_improver::{ImproverConfig, ImproverService, RunResult};
 use wh_metrics::{
+    benchmarks::BenchmarksProjection,
     proposals::{self, ProposalsProjection},
     scores::{self, ScoreFilter, ScoreResultsProjection},
     sessions::SessionFactsProjection,
     tasks::TasksProjection,
 };
+use bench::{bench_cmd, run_bench_worker};
 use wh_scorer::{Graded, ScorerConfig, ScorerService};
 use wh_runner::{OutcomeStatus, RunSpec, Runner, RunnerConfig, Signal, claude_code::ClaudeCode};
 
@@ -60,6 +64,9 @@ enum Cmd {
         /// Do not run the self-improvement agent (requests, triggers, schedule)
         #[arg(long)]
         no_improver: bool,
+        /// Do not run queued benchmark runs
+        #[arg(long)]
+        no_bench: bool,
     },
     /// Grade finished agent sessions with the factory's scorers (LLM-as-judge) until Ctrl+C
     Scorer {
@@ -107,6 +114,12 @@ enum Cmd {
         /// With --foreman: do not run the self-improvement agent
         #[arg(long)]
         no_improver: bool,
+        /// With --foreman: do not run queued benchmark runs
+        #[arg(long)]
+        no_bench: bool,
+        /// Directory of benchmark suites offered in the UI
+        #[arg(long, env = "WH_BENCH_DIR", default_value = "benchmarks")]
+        bench_dir: PathBuf,
         /// Built UI to serve at / (skipped if missing)
         #[arg(long, env = "WH_WEB_DIR", default_value = "web/dist")]
         web_dir: PathBuf,
@@ -131,6 +144,11 @@ enum Cmd {
         factory: PathBuf,
         #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
         claude_bin: PathBuf,
+    },
+    /// Benchmarks: run a fixed suite of tasks against a factory variant and compare runs
+    Bench {
+        #[command(subcommand)]
+        cmd: BenchCmd,
     },
     /// List improvement proposals, newest first
     Proposals {
@@ -253,6 +271,54 @@ enum ProposalCmd {
 }
 
 #[derive(Subcommand)]
+enum BenchCmd {
+    /// List (and validate) the suites in a directory
+    Suites {
+        #[arg(long, env = "WH_BENCH_DIR", default_value = "benchmarks")]
+        dir: PathBuf,
+    },
+    /// Run a suite now, in this process
+    Run {
+        /// Suite file, or a suite name in --dir
+        suite: String,
+        #[arg(long, env = "WH_BENCH_DIR", default_value = "benchmarks")]
+        dir: PathBuf,
+        /// Benchmark the suite's factory as of this git ref (default: the working tree)
+        #[arg(long = "ref", conflicts_with = "proposal")]
+        git_ref: Option<String>,
+        /// Benchmark a proposal: runs its base (parent commit) and its commit, then compares
+        #[arg(long)]
+        proposal: Option<ProposalId>,
+        /// Run every case this many times
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+        /// Only this case (repeatable)
+        #[arg(long = "case")]
+        cases: Vec<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
+        claude_bin: PathBuf,
+    },
+    /// Benchmark runs, newest first
+    Runs {
+        #[arg(long)]
+        suite: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+    },
+    /// One run and its case results
+    Show { run: BenchmarkRunId },
+    /// Compare two runs case by case (A = baseline, B = candidate)
+    Compare { a: BenchmarkRunId, b: BenchmarkRunId },
+    /// Run queued benchmark runs (from the UI / API) until Ctrl+C
+    Worker {
+        #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
+        claude_bin: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum GateCmd {
     Approve {
         task: TaskId,
@@ -354,7 +420,7 @@ async fn main() -> Result<()> {
         .database_url
         .or_else(|| std::env::var("DATABASE_URL").ok())
         .ok_or_else(|| anyhow::anyhow!("DATABASE_URL is not set (see .env.example)"))?;
-    // Every following consumer (4 projections, SSE, foreman, scorer, improver) holds a
+    // Every following consumer (5 projections, SSE, foreman, scorer, improver, bench) holds a
     // LISTEN connection for its lifetime, so leave plenty of room for queries.
     let pool = PgPoolOptions::new().max_connections(20).connect(&url).await?;
     let store = EventStore::new(pool.clone());
@@ -449,22 +515,22 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Foreman { factory, max_parallel, claude_bin, no_scorers, no_improver } => {
+        Cmd::Foreman { factory, max_parallel, claude_bin, no_scorers, no_improver, no_bench } => {
             let f = Factory::load(&factory)?;
             println!("foreman for factory '{}' (version {}), Ctrl+C to stop", f.name, f.version);
             let scorer = run_scorer(&store, f.clone(), max_parallel, claude_bin.clone(), !no_scorers);
             let improver = run_improver(&store, f.clone(), claude_bin.clone(), !no_improver);
-            let (a, b, c, d) = tokio::join!(
+            let bench = run_bench_worker(&store, claude_bin.clone(), !no_bench);
+            let (a, b, c, d, e) = tokio::join!(
                 run_foreman(&store, f, max_parallel, claude_bin),
                 run_projections(&store),
                 scorer,
-                improver
+                improver,
+                bench
             );
-            a?;
-            b?;
-            c?;
-            d?;
+            a.and(b).and(c).and(d).and(e)?;
         }
+        Cmd::Bench { cmd } => bench_cmd(&store, cmd).await?,
         Cmd::Improver { factory, claude_bin } => {
             let f = Factory::load(&factory)?;
             anyhow::ensure!(f.improvement.is_some(), "factory '{}' has no `improvement:` section", f.name);
@@ -605,7 +671,7 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Serve { addr, factory, foreman, max_parallel, claude_bin, no_scorers, no_improver, web_dir } => {
+        Cmd::Serve { addr, factory, foreman, max_parallel, claude_bin, no_scorers, no_improver, no_bench, bench_dir, web_dir } => {
             let f = match Factory::load(&factory) {
                 Ok(f) => Some(f),
                 Err(e) if !foreman => {
@@ -623,6 +689,7 @@ async fn main() -> Result<()> {
                 store: store.clone(),
                 factory: f.clone().map(std::sync::Arc::new),
                 live: wh_api::Live::start(store.clone()).await?,
+                bench_dir: std::fs::canonicalize(&bench_dir).unwrap_or(bench_dir),
             };
             println!("WorkHub on http://{addr}  (Ctrl+C to stop)");
             let api = wh_api::serve(addr, state, web_dir, ctrl_c());
@@ -632,8 +699,10 @@ async fn main() -> Result<()> {
                         println!("foreman for factory '{}' (version {})", f.name, f.version);
                         let scorer = run_scorer(&store, f.clone(), max_parallel, claude_bin.clone(), !no_scorers);
                         let improver = run_improver(&store, f.clone(), claude_bin.clone(), !no_improver);
-                        let (a, b, c) = tokio::join!(run_foreman(&store, f, max_parallel, claude_bin), scorer, improver);
-                        a.and(b).and(c)
+                        let bench = run_bench_worker(&store, claude_bin.clone(), !no_bench);
+                        let (a, b, c, d) =
+                            tokio::join!(run_foreman(&store, f, max_parallel, claude_bin), scorer, improver, bench);
+                        a.and(b).and(c).and(d)
                     }
                     _ => Ok(()),
                 }
@@ -892,18 +961,20 @@ fn truncate(s: &str, max: usize) -> String {
 async fn run_projections(store: &EventStore) -> Result<()> {
     let pool = store.pool().clone();
     let sub = || Subscription::new(store.clone());
-    let (sa, sb, sc, sd) = (sub(), sub(), sub(), sub());
+    let (sa, sb, sc, sd, se) = (sub(), sub(), sub(), sub(), sub());
     let mut tasks = TasksProjection::new(pool.clone());
     let mut sessions = SessionFactsProjection::new(pool.clone());
     let mut scores = ScoreResultsProjection::new(pool.clone());
-    let mut proposals = ProposalsProjection::new(pool);
-    let (a, b, c, d) = tokio::join!(
+    let mut proposals = ProposalsProjection::new(pool.clone());
+    let mut benchmarks = BenchmarksProjection::new(pool);
+    let (a, b, c, d, e) = tokio::join!(
         sa.run(&mut tasks, ctrl_c()),
         sb.run(&mut sessions, ctrl_c()),
         sc.run(&mut scores, ctrl_c()),
-        sd.run(&mut proposals, ctrl_c())
+        sd.run(&mut proposals, ctrl_c()),
+        se.run(&mut benchmarks, ctrl_c())
     );
-    a.and(b).and(c).and(d)
+    a.and(b).and(c).and(d).and(e)
 }
 
 async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {
@@ -988,6 +1059,7 @@ async fn run_agent(store: &EventStore, a: RunArgs) -> Result<()> {
         task_expected_version: None,
         feedback: None,
         factory_version: None,
+        benchmark: None,
     };
     println!("task {task_id}");
     let runner = Runner::new(store.clone(), ClaudeCode::new(a.claude_bin), RunnerConfig { data_dir: data_dir() });

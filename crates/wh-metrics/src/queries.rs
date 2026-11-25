@@ -23,19 +23,24 @@ pub struct TaskSummary {
     pub completed_at: Option<DateTime<Utc>>,
     pub sessions: i64,
     pub cost_usd: f64,
+    /// Set for benchmark cases (hidden from the task list).
+    pub benchmark_run: Option<Uuid>,
+    pub benchmark_case: Option<String>,
 }
 
 const TASK_SUMMARY_SQL: &str = "SELECT t.task_id, t.title, t.source, t.factory, t.status, t.current_stage, \
      t.rework_loops, t.gate_rejections, t.blocked_reason, t.created_at, t.updated_at, t.completed_at, \
-     COALESCE(s.sessions, 0) AS sessions, COALESCE(s.cost_usd, 0) AS cost_usd \
+     COALESCE(s.sessions, 0) AS sessions, COALESCE(s.cost_usd, 0) AS cost_usd, \
+     t.benchmark_run, t.benchmark_case \
      FROM tasks_view t LEFT JOIN ( \
        SELECT task_id, count(*) AS sessions, sum(cost_usd) AS cost_usd FROM session_facts GROUP BY task_id \
      ) s ON s.task_id = t.task_id";
 
-/// Tasks, newest first, optionally filtered by status (`open`, `running`, `awaiting_gate`, ...).
+/// Tasks (not benchmark cases), newest first, optionally filtered by status
+/// (`open`, `running`, `awaiting_gate`, ...).
 pub async fn tasks(pool: &PgPool, status: Option<&str>, limit: i64) -> anyhow::Result<Vec<TaskSummary>> {
     Ok(sqlx::query_as(&format!(
-        "{TASK_SUMMARY_SQL} WHERE ($1::text IS NULL OR t.status = $1) ORDER BY t.created_at DESC LIMIT $2"
+        "{TASK_SUMMARY_SQL} WHERE t.benchmark_run IS NULL AND ($1::text IS NULL OR t.status = $1) ORDER BY t.created_at DESC LIMIT $2"
     ))
     .bind(status)
     .bind(limit)
@@ -99,7 +104,9 @@ pub async fn task_sessions(pool: &PgPool, task: Uuid) -> anyhow::Result<Vec<Sess
 }
 
 pub async fn sessions(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<SessionDetail>> {
-    Ok(sqlx::query_as(&format!("SELECT {SESSION_COLS} FROM session_facts ORDER BY dispatched_at DESC LIMIT $1"))
+    Ok(sqlx::query_as(&format!(
+        "SELECT {SESSION_COLS} FROM session_facts WHERE benchmark_run IS NULL ORDER BY dispatched_at DESC LIMIT $1"
+    ))
         .bind(limit)
         .fetch_all(pool)
         .await?)
@@ -140,15 +147,16 @@ pub struct Totals {
 pub async fn totals(pool: &PgPool, days: i32) -> anyhow::Result<Totals> {
     Ok(sqlx::query_as(
         "WITH win AS (SELECT now() - make_interval(days => $1) AS since), \
-         t AS (SELECT * FROM tasks_view, win WHERE created_at >= win.since OR updated_at >= win.since), \
-         s AS (SELECT * FROM session_facts, win WHERE dispatched_at >= win.since), \
+         tv AS (SELECT * FROM tasks_view WHERE benchmark_run IS NULL), \
+         t AS (SELECT * FROM tv, win WHERE created_at >= win.since OR updated_at >= win.since), \
+         s AS (SELECT * FROM session_facts, win WHERE dispatched_at >= win.since AND benchmark_run IS NULL), \
          r AS (SELECT * FROM score_results, win WHERE started_at >= win.since) \
          SELECT \
-           (SELECT count(*) FROM tasks_view, win WHERE created_at >= win.since) AS tasks_created, \
+           (SELECT count(*) FROM tv, win WHERE created_at >= win.since) AS tasks_created, \
            (SELECT count(*) FROM t WHERE status = 'done' AND completed_at >= (SELECT since FROM win)) AS tasks_done, \
-           (SELECT count(*) FROM tasks_view WHERE status = 'blocked') AS tasks_blocked, \
-           (SELECT count(*) FROM tasks_view WHERE status IN ('open', 'running')) AS tasks_in_flight, \
-           (SELECT count(*) FROM tasks_view WHERE status = 'awaiting_gate') AS awaiting_gate, \
+           (SELECT count(*) FROM tv WHERE status = 'blocked') AS tasks_blocked, \
+           (SELECT count(*) FROM tv WHERE status IN ('open', 'running')) AS tasks_in_flight, \
+           (SELECT count(*) FROM tv WHERE status = 'awaiting_gate') AS awaiting_gate, \
            (SELECT count(*) FROM s) AS sessions, \
            (SELECT count(*) FROM s WHERE status = 'failed') AS sessions_failed, \
            (SELECT COALESCE(sum(cost_usd), 0) FROM s) AS cost_usd, \
@@ -186,10 +194,11 @@ pub async fn daily(pool: &PgPool, days: i32) -> anyhow::Result<Vec<DailyPoint>> 
          s AS ( \
            SELECT (dispatched_at AT TIME ZONE 'UTC')::date AS day, sum(cost_usd) AS cost, \
                   count(*) FILTER (WHERE status = 'succeeded') AS ok, count(*) FILTER (WHERE status = 'failed') AS failed \
-           FROM session_facts GROUP BY 1), \
-         c AS (SELECT (created_at AT TIME ZONE 'UTC')::date AS day, count(*) AS n FROM tasks_view GROUP BY 1), \
+           FROM session_facts WHERE benchmark_run IS NULL GROUP BY 1), \
+         c AS (SELECT (created_at AT TIME ZONE 'UTC')::date AS day, count(*) AS n FROM tasks_view \
+               WHERE benchmark_run IS NULL GROUP BY 1), \
          f AS (SELECT (completed_at AT TIME ZONE 'UTC')::date AS day, count(*) AS n FROM tasks_view \
-               WHERE completed_at IS NOT NULL GROUP BY 1) \
+               WHERE completed_at IS NOT NULL AND benchmark_run IS NULL GROUP BY 1) \
          SELECT d.day, COALESCE(s.cost, 0) AS cost_usd, COALESCE(s.ok, 0) AS sessions_succeeded, \
                 COALESCE(s.failed, 0) AS sessions_failed, COALESCE(c.n, 0) AS tasks_created, \
                 COALESCE(f.n, 0) AS tasks_done \
@@ -223,7 +232,8 @@ pub async fn stats_by_stage(pool: &PgPool) -> anyhow::Result<Vec<StageStats>> {
            COALESCE(sum(cost_usd), 0) AS total_cost_usd, COALESCE(avg(cost_usd), 0) AS avg_cost_usd, \
            percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms) AS p50_duration_ms, \
            percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95_duration_ms \
-         FROM session_facts WHERE status IN ('succeeded', 'failed') GROUP BY stage ORDER BY stage",
+         FROM session_facts WHERE status IN ('succeeded', 'failed') AND benchmark_run IS NULL \
+         GROUP BY stage ORDER BY stage",
     )
     .fetch_all(pool)
     .await?)

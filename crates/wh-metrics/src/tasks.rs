@@ -38,7 +38,8 @@ impl TasksProjection {
     pub async fn list(pool: &PgPool) -> anyhow::Result<Vec<TaskRow>> {
         Ok(sqlx::query_as(
             "SELECT task_id, title, source, factory, status, current_stage, rework_loops, gate_rejections, \
-             blocked_reason, created_at, updated_at, completed_at FROM tasks_view ORDER BY created_at DESC",
+             blocked_reason, created_at, updated_at, completed_at FROM tasks_view WHERE benchmark_run IS NULL \
+             ORDER BY created_at DESC",
         )
         .fetch_all(pool)
         .await?)
@@ -67,11 +68,12 @@ impl EventHandler for TasksProjection {
             return Ok(());
         };
         match ev.decode::<TaskEvent>()? {
-            TaskEvent::TaskCreated { title, source, factory, .. } => {
+            TaskEvent::TaskCreated { title, source, factory, benchmark, .. } => {
                 sqlx::query(
                     "INSERT INTO tasks_view \
-                     (task_id, title, source, factory, status, current_stage, created_at, updated_at, last_seq) \
-                     VALUES ($1, $2, $3, $4, 'open', NULL, $5, $5, $6) ON CONFLICT (task_id) DO NOTHING",
+                     (task_id, title, source, factory, status, current_stage, created_at, updated_at, last_seq, \
+                      benchmark_run, benchmark_case) \
+                     VALUES ($1, $2, $3, $4, 'open', NULL, $5, $5, $6, $7, $8) ON CONFLICT (task_id) DO NOTHING",
                 )
                 .bind(id)
                 .bind(title)
@@ -79,6 +81,8 @@ impl EventHandler for TasksProjection {
                 .bind(factory)
                 .bind(ev.meta.occurred_at)
                 .bind(ev.global_seq)
+                .bind(benchmark.as_ref().map(|b| b.run.0))
+                .bind(benchmark.map(|b| b.case))
                 .execute(&self.pool)
                 .await?;
             }

@@ -1,11 +1,13 @@
 import { useQuery } from '@tanstack/react-query'
-import { ClipboardCheck, Factory as FactoryIcon, Inbox as InboxIcon, LayoutDashboard, ListTodo, Moon, Sparkles, Sun } from 'lucide-react'
+import { ClipboardCheck, Factory as FactoryIcon, Gauge, Inbox as InboxIcon, LayoutDashboard, ListTodo, Moon, Sparkles, Sun } from 'lucide-react'
 import { lazy, Suspense, useState } from 'react'
 import { NavLink, Route, Routes } from 'react-router'
 import { Button } from '@/components/ui/button'
 import { api } from '@/lib/api'
 import { useLive } from '@/lib/live'
 import { cn } from '@/lib/utils'
+import BenchmarkRun from '@/pages/BenchmarkRun'
+import Benchmarks, { BenchmarkCompare } from '@/pages/Benchmarks'
 import FactoryPage from '@/pages/Factory'
 import Improvement from '@/pages/Improvement'
 import Inbox from '@/pages/Inbox'
@@ -30,6 +32,9 @@ export default function App() {
           <Route path="/scorers" element={<Scorers />} />
           <Route path="/improvement" element={<Improvement />} />
           <Route path="/proposals/:id" element={<ProposalDetail />} />
+          <Route path="/benchmarks" element={<Benchmarks />} />
+          <Route path="/benchmarks/compare" element={<BenchmarkCompare />} />
+          <Route path="/benchmarks/:id" element={<BenchmarkRun />} />
           <Route path="/factory" element={<FactoryPage />} />
           <Route path="*" element={<p className="text-muted-foreground">Not found.</p>} />
         </Routes>
@@ -49,6 +54,7 @@ function Sidebar() {
     { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { to: '/scorers', label: 'Scorers', icon: ClipboardCheck },
     { to: '/improvement', label: 'Improvement', icon: Sparkles },
+    { to: '/benchmarks', label: 'Benchmarks', icon: Gauge },
     { to: '/factory', label: 'Factory', icon: FactoryIcon },
   ]
   return (

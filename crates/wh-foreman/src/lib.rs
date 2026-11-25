@@ -11,9 +11,11 @@ mod prompt;
 
 use std::sync::Arc;
 
+use anyhow::Context;
+
 use tokio::sync::Semaphore;
 use wh_core::{
-    Actor, EventMeta, FailureClass, NewEvent, RecordedEvent, SessionId, TaskId,
+    Actor, BenchmarkRunId, EventMeta, FailureClass, NewEvent, RecordedEvent, SessionId, TaskId,
     session::SessionEvent,
     task::{TaskEvent, TaskState},
 };
@@ -33,18 +35,72 @@ pub enum Dispatch {
     Spawn(Arc<Semaphore>),
 }
 
+/// Which tasks a foreman drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Regular tasks of the factory (never benchmark cases).
+    Live,
+    /// Only the cases of one benchmark run. Human gates are approved automatically.
+    Benchmark(BenchmarkRunId),
+}
+
 pub struct Foreman<R> {
     store: EventStore,
     factory: Arc<Factory>,
     runner: Arc<Runner<R>>,
     dispatch: Dispatch,
+    scope: Scope,
     name: String,
 }
+
+/// Reviewer recorded on gates a benchmark foreman approves.
+pub const BENCHMARK_REVIEWER: &str = "benchmark";
 
 impl<R: AgentRuntime + 'static> Foreman<R> {
     pub fn new(store: EventStore, factory: Factory, runner: Runner<R>, dispatch: Dispatch) -> Self {
         let name = format!("foreman:{}", factory.name);
-        Self { store, factory: Arc::new(factory), runner: Arc::new(runner), dispatch, name }
+        Self { store, factory: Arc::new(factory), runner: Arc::new(runner), dispatch, scope: Scope::Live, name }
+    }
+
+    /// A foreman for the cases of one benchmark run, driven with [`Self::drive`].
+    pub fn for_benchmark(store: EventStore, factory: Factory, runner: Runner<R>, run: BenchmarkRunId) -> Self {
+        let name = format!("foreman:{}:bench-{run}", factory.name);
+        Self {
+            store,
+            factory: Arc::new(factory),
+            runner: Arc::new(runner),
+            dispatch: Dispatch::Inline,
+            scope: Scope::Benchmark(run),
+            name,
+        }
+    }
+
+    /// Whether this foreman drives `state`'s task.
+    fn owns(&self, state: &TaskState) -> bool {
+        if state.factory.as_deref() != Some(self.factory.name.as_str()) {
+            return false;
+        }
+        match self.scope {
+            Scope::Live => state.benchmark.is_none(),
+            Scope::Benchmark(run) => state.benchmark.as_ref().is_some_and(|b| b.run == run),
+        }
+    }
+
+    /// Drive one task inline until it needs nothing more from the foreman
+    /// (done, blocked, cancelled, or waiting on a human gate in live scope).
+    /// Requires `Dispatch::Inline`.
+    pub async fn drive(&mut self, task: TaskId) -> anyhow::Result<TaskState> {
+        anyhow::ensure!(matches!(self.dispatch, Dispatch::Inline), "drive requires Dispatch::Inline");
+        loop {
+            let events = self.store.read_stream(&task.stream_id()).await?;
+            let head = events.last().with_context(|| format!("task {task} has no events"))?;
+            let before = head.stream_version;
+            self.handle(head).await?;
+            let state = self.load(task).await?;
+            if state.version == before {
+                return Ok(state);
+            }
+        }
     }
 
     pub fn task_branch(task: TaskId) -> String {
@@ -57,53 +113,8 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
     /// Returns the tasks that were blocked.
     pub async fn recover_interrupted(&self) -> anyhow::Result<Vec<TaskId>> {
         const REASON: &str = "interrupted: the foreman stopped while this stage was running";
-        let mut blocked = Vec::new();
-        for (stream, _, head) in self.store.stream_heads(&format!("{}-", TaskId::STREAM_PREFIX)).await? {
-            let Some(task) = TaskId::from_stream_id(&stream) else { continue };
-            if head != "StageEntered" {
-                continue;
-            }
-            let state = self.load(task).await?;
-            if state.factory.as_deref() != Some(self.factory.name.as_str()) {
-                continue;
-            }
-            let ev = TaskEvent::TaskBlocked { stage: state.last_stage_entered(), reason: REASON.into() };
-            let meta = self.meta(task, None);
-            let rec = self
-                .store
-                .append(&stream, ExpectedVersion::Exact(state.version), vec![NewEvent::from_domain(&ev, meta)?])
-                .await;
-            if rec.is_ok() {
-                blocked.push(task);
-            }
-        }
-        if blocked.is_empty() {
-            return Ok(blocked);
-        }
-        for (stream, version, head) in self.store.stream_heads(&format!("{}-", SessionId::STREAM_PREFIX)).await? {
-            if matches!(head.as_str(), "AgentSessionCompleted" | "AgentSessionFailed") {
-                continue;
-            }
-            let events = self.store.read_stream(&stream).await?;
-            let Some(SessionEvent::AgentDispatched { task_id, .. }) = events.first().and_then(|e| e.decode().ok())
-            else {
-                continue;
-            };
-            if !blocked.contains(&task_id) {
-                continue;
-            }
-            let ev = SessionEvent::AgentSessionFailed {
-                failure_class: FailureClass::Infra,
-                message: REASON.into(),
-                retryable: true,
-                num_turns: 0,
-                duration_ms: 0,
-                transcript: None,
-            };
-            let meta = self.meta(task_id, None);
-            let _ = self.store.append(&stream, ExpectedVersion::Exact(version), vec![NewEvent::from_domain(&ev, meta)?]).await;
-        }
-        Ok(blocked)
+        let version = Some(self.factory.version.clone());
+        recover_interrupted(&self.store, REASON, version, |s| self.owns(s)).await
     }
 
     fn meta(&self, task: TaskId, cause: Option<&RecordedEvent>) -> EventMeta {
@@ -139,13 +150,14 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
         let f = &self.factory;
         let stage = f.stage(stage_id).expect("decide only returns known stages");
         let agent = f.agent(stage);
+        let bench = state.benchmark.as_ref();
         RunSpec {
             task_id: task,
             agent: agent.name.clone(),
             stage: stage.id.clone(),
             prompt: build_prompt(agent, stage, state, feedback.as_deref()),
-            repo: f.repo.clone(),
-            base_ref: f.base_ref.clone(),
+            repo: bench.and_then(|b| b.repo.clone()).map_or_else(|| f.repo.clone(), Into::into),
+            base_ref: bench.and_then(|b| b.base_ref.clone()).unwrap_or_else(|| f.base_ref.clone()),
             model: agent.model.clone(),
             budget_usd: Some(agent.budget_usd),
             permission_mode: Some(agent.permission_mode.clone()),
@@ -161,6 +173,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             task_expected_version: Some(state.version),
             feedback,
             factory_version: Some(f.version.clone()),
+            benchmark: bench.map(|b| b.run),
         }
     }
 
@@ -194,6 +207,67 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
     }
 }
 
+/// Block every task matching `owned` whose stream ends at `StageEntered` (its runner
+/// is gone) and fail its unfinished sessions with `reason`. Returns the blocked tasks.
+pub async fn recover_interrupted(
+    store: &EventStore,
+    reason: &str,
+    factory_version: Option<String>,
+    owned: impl Fn(&TaskState) -> bool,
+) -> anyhow::Result<Vec<TaskId>> {
+    let meta = |task: TaskId| {
+        let mut meta = EventMeta::new(task.0, Actor::System { component: "foreman".into() });
+        meta.factory_version = factory_version.clone();
+        meta
+    };
+    let mut blocked = Vec::new();
+    for (stream, _, head) in store.stream_heads(&format!("{}-", TaskId::STREAM_PREFIX)).await? {
+        let Some(task) = TaskId::from_stream_id(&stream) else { continue };
+        if head != "StageEntered" {
+            continue;
+        }
+        let mut state = TaskState::default();
+        for e in store.read_stream(&stream).await? {
+            state.apply(e.stream_version, e.decode::<TaskEvent>()?);
+        }
+        if !owned(&state) {
+            continue;
+        }
+        let ev = TaskEvent::TaskBlocked { stage: state.last_stage_entered(), reason: reason.into() };
+        let rec = store
+            .append(&stream, ExpectedVersion::Exact(state.version), vec![NewEvent::from_domain(&ev, meta(task))?])
+            .await;
+        if rec.is_ok() {
+            blocked.push(task);
+        }
+    }
+    if blocked.is_empty() {
+        return Ok(blocked);
+    }
+    for (stream, version, head) in store.stream_heads(&format!("{}-", SessionId::STREAM_PREFIX)).await? {
+        if matches!(head.as_str(), "AgentSessionCompleted" | "AgentSessionFailed") {
+            continue;
+        }
+        let events = store.read_stream(&stream).await?;
+        let Some(SessionEvent::AgentDispatched { task_id, .. }) = events.first().and_then(|e| e.decode().ok()) else {
+            continue;
+        };
+        if !blocked.contains(&task_id) {
+            continue;
+        }
+        let ev = SessionEvent::AgentSessionFailed {
+            failure_class: FailureClass::Infra,
+            message: reason.into(),
+            retryable: true,
+            num_turns: 0,
+            duration_ms: 0,
+            transcript: None,
+        };
+        let _ = store.append(&stream, ExpectedVersion::Exact(version), vec![NewEvent::from_domain(&ev, meta(task_id))?]).await;
+    }
+    Ok(blocked)
+}
+
 fn is_conflict(e: &anyhow::Error) -> bool {
     matches!(e.downcast_ref::<StoreError>(), Some(StoreError::Conflict { .. }))
 }
@@ -210,7 +284,7 @@ impl<R: AgentRuntime + 'static> EventHandler for Foreman<R> {
         let state = self.load(task).await?;
         // Only the newest event of a task triggers a decision; older (redelivered)
         // events are superseded.
-        if ev.stream_version != state.version || state.factory.as_deref() != Some(self.factory.name.as_str()) {
+        if ev.stream_version != state.version || !self.owns(&state) {
             return Ok(());
         }
         let Some(action) = decide(&state, &self.factory) else {
@@ -218,6 +292,26 @@ impl<R: AgentRuntime + 'static> EventHandler for Foreman<R> {
         };
         match action {
             Action::RunStage { stage, feedback } => self.run_stage(self.run_spec(task, &state, &stage, feedback)).await,
+            Action::RequestGate { gate, stage } if matches!(self.scope, Scope::Benchmark(_)) => {
+                // Benchmarks measure the agents, not human latency: approve the gate
+                // right away (still recorded, so the pipeline shape is unchanged).
+                let requested = TaskEvent::GateRequested { gate: gate.clone(), stage: stage.clone() };
+                let decided = TaskEvent::GateDecided {
+                    gate,
+                    stage,
+                    approved: true,
+                    reviewer: BENCHMARK_REVIEWER.into(),
+                    comment: None,
+                };
+                let events = vec![
+                    NewEvent::from_domain(&requested, self.meta(task, Some(ev)))?,
+                    NewEvent::from_domain(&decided, self.meta(task, Some(ev)))?,
+                ];
+                match self.store.append(&task.stream_id(), ExpectedVersion::Exact(state.version), events).await {
+                    Ok(_) | Err(StoreError::Conflict { .. }) => Ok(()),
+                    Err(e) => Err(e.into()),
+                }
+            }
             Action::RequestGate { gate, stage } => {
                 self.append(task, &state, ev, TaskEvent::GateRequested { gate, stage }).await
             }

@@ -30,3 +30,4 @@ wh-foreman = { path = "crates/wh-foreman" }
 wh-api = { path = "crates/wh-api" }
 wh-scorer = { path = "crates/wh-scorer" }
 wh-improver = { path = "crates/wh-improver" }
+wh-bench = { path = "crates/wh-bench" }

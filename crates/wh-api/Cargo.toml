@@ -10,6 +10,7 @@ wh-eventstore.workspace = true
 wh-metrics.workspace = true
 wh-factory.workspace = true
 wh-improver.workspace = true
+wh-bench.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -26,3 +27,4 @@ futures-util = "0.3"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tempfile = "3"

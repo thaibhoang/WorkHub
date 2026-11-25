@@ -18,6 +18,7 @@ wh-foreman.workspace = true
 wh-api.workspace = true
 wh-scorer.workspace = true
 wh-improver.workspace = true
+wh-bench.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dotenvy.workspace = true

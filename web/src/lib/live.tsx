@@ -35,7 +35,7 @@ export function LiveProvider({ children }: { children: ReactNode }) {
         qc.invalidateQueries({ queryKey: ['proposal', id] })
       }
       if (p.global) {
-        for (const key of ['tasks', 'sessions', 'stats', 'dashboard', 'scorers', 'scores', 'proposals', 'improvement'])
+        for (const key of ['tasks', 'sessions', 'stats', 'dashboard', 'scorers', 'scores', 'proposals', 'improvement', 'benchmarks'])
           qc.invalidateQueries({ queryKey: [key] })
       }
       p.tasks.clear()

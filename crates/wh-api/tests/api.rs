@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -26,7 +26,7 @@ fn factory() -> Factory {
 
 fn app(pool: &PgPool, factory: Option<Factory>) -> (Router, EventStore) {
     let store = EventStore::new(pool.clone());
-    let state = AppState { store: store.clone(), factory: factory.map(Arc::new), live: Live::detached(0) };
+    let state = AppState { store: store.clone(), factory: factory.map(Arc::new), live: Live::detached(0), bench_dir: PathBuf::from("benchmarks") };
     (wh_api::app(state, None), store)
 }
 
@@ -175,6 +175,7 @@ async fn sessions_stats_and_dashboard(pool: PgPool) {
             timeout_secs: 60,
             attempt: 1,
             retry_of: None,
+            benchmark: None,
         },
         SessionEvent::AgentToolCalled { tool: "Read".into(), ok: true, duration_ms: 10 },
         SessionEvent::AgentUsageReported { usage: TokenUsage { input_tokens: 10, ..Default::default() }, cost_usd: 0.25 },
@@ -374,6 +375,7 @@ async fn sse_replays_after_cursor_and_filters_by_task(pool: PgPool) {
         body: None,
         source: wh_core::task::TaskSource::Cli,
         factory: None,
+        benchmark: None,
     };
     task_ev(&store, a, created("a")).await;
     task_ev(&store, b, created("b")).await;
@@ -407,4 +409,48 @@ fn tempfile_dir() -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("wh-api-test-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn benchmark_suites_queue_and_runs(pool: PgPool) {
+    let dir = tempfile::tempdir().unwrap();
+    let factory = concat!(env!("CARGO_MANIFEST_DIR"), "/../../factory/factory.yaml");
+    std::fs::write(
+        dir.path().join("smoke.yaml"),
+        format!("name: smoke\nfactory: {factory}\ncases:\n  - {{ id: one, title: One, check: \"true\" }}\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("broken.yaml"), "name: broken\n").unwrap();
+    let store = EventStore::new(pool.clone());
+    let state = AppState { store: store.clone(), factory: None, live: Live::detached(0), bench_dir: dir.path().to_owned() };
+    let app = wh_api::app(state, None);
+
+    let (st, suites) = call(&app, "GET", "/api/benchmarks/suites", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(suites[0]["key"], "broken");
+    assert!(suites[0]["error"].is_string());
+    assert_eq!(suites[1]["name"], "smoke");
+    assert_eq!(suites[1]["cases"][0]["repo"], "factory");
+
+    let (st, _) = call(&app, "POST", "/api/benchmarks", Some(json!({"suite": "../etc/passwd"}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(&app, "POST", "/api/benchmarks", Some(json!({"suite": "nope"}))).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, err) = call(&app, "POST", "/api/benchmarks", Some(json!({"suite": "smoke", "cases": ["zz"]}))).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{err}");
+
+    let (st, queued) = call(&app, "POST", "/api/benchmarks", Some(json!({"suite": "smoke", "repeat": 2, "git_ref": "HEAD"}))).await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    let id = queued["run_ids"][0].as_str().unwrap().to_owned();
+    wh_metrics::catch_up_all(&store).await.unwrap();
+    let (_, runs) = call(&app, "GET", "/api/benchmarks", None).await;
+    assert_eq!((runs[0]["status"].as_str(), runs[0]["repeat"].as_i64()), (Some("requested"), Some(2)));
+    let (st, detail) = call(&app, "GET", &format!("/api/benchmarks/{id}"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(detail["events"][0]["type"], "BenchmarkRequested");
+    assert_eq!(detail["run"]["git_ref"], "HEAD");
+    let (st, cmp) = call(&app, "GET", &format!("/api/benchmarks/compare?a={id}&b={id}"), None).await;
+    assert_eq!((st, cmp["comparable"].as_bool()), (StatusCode::OK, Some(true)));
+    let (st, _) = call(&app, "GET", &format!("/api/benchmarks/{}", uuid::Uuid::now_v7()), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
 }

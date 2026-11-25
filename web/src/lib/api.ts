@@ -17,6 +17,9 @@ export interface TaskSummary {
   completed_at: string | null
   sessions: number
   cost_usd: number
+  /** Set for benchmark cases (they never appear in the task list). */
+  benchmark_run: string | null
+  benchmark_case: string | null
 }
 
 export interface EventMeta {
@@ -413,6 +416,116 @@ export const api = {
   applyProposal: (id: string) => request<{ message: string }>('POST', `/proposals/${id}/apply`),
   improvement: () => request<ImprovementResponse>('GET', '/improvement'),
   events: (after = 0, limit = 100) => request<WhEvent[]>('GET', `/events?after=${after}&limit=${limit}`),
+}
+
+// ---------- benchmarks (crates/wh-api/src/bench.rs, wh_metrics::benchmarks) ----------
+
+export type BenchRunStatus = 'requested' | 'running' | 'completed' | 'failed'
+
+export interface BenchRun {
+  run_id: string
+  suite: string
+  suite_file: string
+  git_ref: string | null
+  proposal_id: string | null
+  label: string | null
+  repeat: number
+  status: BenchRunStatus
+  requested_by: string
+  requested_at: string
+  started_at: string | null
+  finished_at: string | null
+  factory: string | null
+  factory_version: string | null
+  factory_commit: string | null
+  suite_version: string | null
+  planned: number | null
+  cases_done: number
+  passed: number
+  cost_usd: number
+  duration_ms: number | null
+  message: string | null
+  pass_rate: number | null
+  avg_case_cost_usd: number | null
+  p50_case_duration_ms: number | null
+  avg_rework: number | null
+}
+
+export interface BenchCase {
+  run_id: string
+  case_id: string
+  repeat: number
+  task_id: string
+  status: 'running' | 'done' | 'blocked' | 'cancelled' | 'error'
+  passed: boolean | null
+  check_passed: boolean | null
+  check_exit_code: number | null
+  check_output: string | null
+  cost_usd: number
+  duration_ms: number | null
+  sessions: number | null
+  rework_loops: number | null
+  message: string | null
+  started_at: string
+  finished_at: string | null
+}
+
+export interface CaseStats {
+  case_id: string
+  runs: number
+  passed: number
+  avg_cost_usd: number | null
+  avg_duration_ms: number | null
+  avg_rework: number | null
+}
+
+export interface BenchRunDetail {
+  run: BenchRun | null
+  cases: BenchCase[]
+  case_stats: CaseStats[]
+  events: WhEvent[]
+}
+
+export interface BenchComparison {
+  a: BenchRun
+  b: BenchRun
+  comparable: boolean
+  cases: { case_id: string; a: CaseStats | null; b: CaseStats | null }[]
+}
+
+export interface BenchSuite {
+  key: string
+  file: string
+  name: string | null
+  description: string | null
+  version: string | null
+  factory_file: string | null
+  max_cost_usd: number | null
+  cases: { id: string; title: string; repo: 'factory' | 'repo' | 'fixture'; check: string | null }[]
+  error: string | null
+}
+
+export interface BenchRequest {
+  suite: string
+  git_ref?: string
+  proposal?: string
+  label?: string
+  repeat?: number
+  cases?: string[]
+}
+
+export const benchApi = {
+  suites: () => request<BenchSuite[]>('GET', '/benchmarks/suites'),
+  runs: (q: { suite?: string; proposal?: string; limit?: number } = {}) => {
+    const p = new URLSearchParams()
+    if (q.suite) p.set('suite', q.suite)
+    if (q.proposal) p.set('proposal', q.proposal)
+    p.set('limit', String(q.limit ?? 100))
+    return request<BenchRun[]>('GET', `/benchmarks?${p}`)
+  },
+  run: (id: string) => request<BenchRunDetail>('GET', `/benchmarks/${id}`),
+  request: (b: BenchRequest) => request<{ run_ids: string[]; message: string }>('POST', '/benchmarks', b),
+  compare: (a: string, b: string) => request<BenchComparison>('GET', `/benchmarks/compare?a=${a}&b=${b}`),
 }
 
 // ---------- formatting ----------

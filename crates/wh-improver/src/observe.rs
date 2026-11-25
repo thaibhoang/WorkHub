@@ -141,7 +141,7 @@ pub async fn gather(pool: &PgPool, factory: &str, version: &str, window_days: u3
     let since = Utc::now() - chrono::Duration::days(window_days as i64);
     // Finished sessions of this factory's tasks within the window.
     const S: &str = "SELECT f.* FROM session_facts f JOIN tasks_view t ON t.task_id = f.task_id \
-                     WHERE t.factory = $1 AND f.dispatched_at >= $2 AND f.status IN ('succeeded', 'failed')";
+                     WHERE t.factory = $1 AND t.benchmark_run IS NULL AND f.dispatched_at >= $2 AND f.status IN ('succeeded', 'failed')";
 
     let stages: Vec<StageRow> = sqlx::query_as(&format!(
         "WITH s AS ({S}) SELECT COALESCE(factory_version, '-') AS factory_version, stage, min(agent) AS agent, \
@@ -196,7 +196,7 @@ pub async fn gather(pool: &PgPool, factory: &str, version: &str, window_days: u3
            COALESCE(e.payload->>'summary', e.payload->>'comment', e.payload->>'reason') AS text, \
            t.title AS task_title, e.payload->>'session' AS session, e.recorded_at AS at \
          FROM events e JOIN tasks_view t ON e.stream_id = 'task-' || t.task_id::text \
-         WHERE t.factory = $1 AND e.recorded_at >= $2 \
+         WHERE t.factory = $1 AND t.benchmark_run IS NULL AND e.recorded_at >= $2 \
            AND ((e.event_type = 'StageExited' AND e.payload->>'outcome' = 'rejected') \
              OR (e.event_type = 'GateDecided' AND e.payload->>'approved' = 'false') \
              OR e.event_type = 'TaskBlocked' \
@@ -271,7 +271,7 @@ pub async fn current_metrics(
         "SELECT f.stage, count(*), count(*) FILTER (WHERE f.status = 'failed'), \
            count(*) FILTER (WHERE f.stage_outcome = 'rejected'), COALESCE(avg(f.cost_usd), 0) \
          FROM session_facts f JOIN tasks_view t ON t.task_id = f.task_id \
-         WHERE t.factory = $1 AND f.factory_version = $2 AND f.dispatched_at >= $3 \
+         WHERE t.factory = $1 AND t.benchmark_run IS NULL AND f.factory_version = $2 AND f.dispatched_at >= $3 \
            AND f.status IN ('succeeded', 'failed') GROUP BY 1",
     )
     .bind(factory)
@@ -283,7 +283,7 @@ pub async fn current_metrics(
         "SELECT r.scorer, count(*), count(*) FILTER (WHERE NOT r.pass) \
          FROM score_results r JOIN session_facts f ON f.session_id = r.target_session \
          JOIN tasks_view t ON t.task_id = f.task_id \
-         WHERE t.factory = $1 AND f.factory_version = $2 AND f.dispatched_at >= $3 AND r.status = 'scored' \
+         WHERE t.factory = $1 AND t.benchmark_run IS NULL AND f.factory_version = $2 AND f.dispatched_at >= $3 AND r.status = 'scored' \
          GROUP BY 1",
     )
     .bind(factory)
