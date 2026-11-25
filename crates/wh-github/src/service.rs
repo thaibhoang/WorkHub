@@ -259,7 +259,8 @@ impl GithubService {
 
     /// Tail of a failed Actions run's log (best effort).
     async fn failed_log(&self, repo: &str, run: u64) -> Option<String> {
-        let out = self.gh.run(None, &["run", "view", &run.to_string(), "--repo", repo, "--log-failed"]).await.ok()?;
+        let raw = self.gh.run(None, &["run", "view", &run.to_string(), "--repo", repo, "--log-failed"]).await.ok()?;
+        let out = poll::clean_actions_log(&raw);
         let chars: Vec<char> = out.chars().collect();
         let tail: String = chars[chars.len().saturating_sub(MAX_LOG)..].iter().collect();
         Some(tail).filter(|t| !t.trim().is_empty())

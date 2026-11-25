@@ -196,6 +196,52 @@ pub fn actions_run_id(url: &str) -> Option<u64> {
     rest.split('/').next()?.parse().ok()
 }
 
+/// Make `gh run view --log-failed` output readable for an agent: drop the
+/// `job<TAB>step<TAB>` prefix, the timestamp, ANSI colour codes and `##[group]`
+/// markers, keeping only what the step printed.
+pub fn clean_actions_log(raw: &str) -> String {
+    let mut out = String::new();
+    for line in raw.lines() {
+        // job \t step \t <rest>
+        let rest = line.splitn(3, '\t').nth(2).unwrap_or(line);
+        let rest = rest.trim_start_matches('\u{feff}');
+        // 2026-11-25T14:50:25.5139386Z <text>
+        let rest = match rest.split_once(' ') {
+            Some((ts, text)) if ts.len() >= 20 && ts.ends_with('Z') && ts.as_bytes()[4] == b'-' => text,
+            _ => rest,
+        };
+        let text = strip_ansi(rest);
+        let text = text.trim_end();
+        if text.starts_with("##[group]") || text == "##[endgroup]" || text.is_empty() {
+            continue;
+        }
+        out.push_str(text.strip_prefix("##[error]").map_or(text, |e| e));
+        out.push('\n');
+    }
+    out
+}
+
+/// Remove ANSI CSI sequences, both raw (`ESC[`) and as `gh` prints them (`^[[`).
+fn strip_ansi(s: &str) -> String {
+    let s = s.replace("^[[", "\u{1b}[");
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            // CSI: parameters until a final byte in @..~
+            for d in chars.by_ref() {
+                if ('@'..='~').contains(&d) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +280,21 @@ mod tests {
         assert!(matches!(observe(&seen, &merged)[..], [Observed::Merged { by: Some(ref b), .. }] if b == "bob"));
         assert!(observe(&Seen { closed: true, ..seen }, &merged).is_empty());
         assert_eq!(actions_run_id("https://github.com/a/b/actions/runs/123/job/456"), Some(123));
+    }
+
+    #[test]
+    fn cleans_actions_logs() {
+        let raw = "test\thelp\t\u{feff}2026-11-25T14:50:25.5139386Z ##[group]Run out=$(./greet.sh --help)\n\
+                   test\thelp\t2026-11-25T14:50:25.5140614Z \u{1b}[36;1mout=$(./greet.sh --help)\u{1b}[0m\n\
+                   test\thelp\t2026-11-25T14:50:25.5150000Z ^[[36;1mecho done^[[0m\n\
+                   test\thelp\t2026-11-25T14:50:25.5200224Z ##[endgroup]\n\
+                   test\thelp\t2026-11-25T14:50:25.5332347Z FAIL: --help must print 'Usage'\n\
+                   test\thelp\t2026-11-25T14:50:25.5350345Z ##[error]Process completed with exit code 1.\n";
+        assert_eq!(
+            clean_actions_log(raw),
+            "out=$(./greet.sh --help)\necho done\nFAIL: --help must print 'Usage'\nProcess completed with exit code 1.\n"
+        );
+        assert_eq!(clean_actions_log("plain line"), "plain line\n");
     }
 
     #[test]
