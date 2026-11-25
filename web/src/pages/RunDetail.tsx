@@ -4,6 +4,7 @@ import { useState } from 'react'
 import { Link, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { PageHeader } from '@/components/PageHeader'
+import { ScoreChip } from '@/components/scores'
 import { SessionSheet } from '@/components/SessionSheet'
 import { OUTCOME_TEXT, SessionStatusBadge, TaskStatusBadge } from '@/components/status'
 import { Timeline } from '@/components/Timeline'
@@ -23,6 +24,7 @@ import {
   fmtUsd,
   shortId,
   type FactoryDef,
+  type ScoreRow,
   type SessionDetail,
   type TaskDetail,
   type WhEvent,
@@ -39,7 +41,9 @@ export default function RunDetail() {
   if (error) return <ApiDown error={error} />
   if (isLoading || !data) return <Skeleton className="h-64" />
 
-  const { task, state, events, sessions } = data
+  const { task, state, events, sessions, scores } = data
+  const graded = scores.filter((r) => r.status === 'scored')
+  const passed = graded.filter((r) => r.pass).length
   const title = task?.title ?? events[0]?.payload.title ?? 'Task'
   const pipeline = factory && task?.factory === factory.name ? factory : null
   const cost = sessions.reduce((a, s) => a + s.cost_usd, 0)
@@ -60,6 +64,11 @@ export default function RunDetail() {
             <span>{task?.factory ?? 'manual task'}</span>
             <span className="tabular-nums">{fmtUsd(cost)} · {sessions.length} sessions</span>
             {state.rework_loops ? <span className="text-warn">{state.rework_loops} rework loops</span> : null}
+            {graded.length ? (
+              <span className={cn('tabular-nums', passed < graded.length && 'text-fail')}>
+                {passed}/{graded.length} scores passed
+              </span>
+            ) : null}
           </span>
         }
         actions={<CancelButton id={id} status={state.status} />}
@@ -83,13 +92,13 @@ export default function RunDetail() {
           <StageOutputs detail={data} />
         </TabsContent>
         <TabsContent value="sessions" className="pt-3">
-          <SessionsTable sessions={sessions} onSelect={setSelected} />
+          <SessionsTable sessions={sessions} scores={scores} onSelect={setSelected} />
         </TabsContent>
         <TabsContent value="events" className="pt-3">
           <RawEvents events={events} />
         </TabsContent>
       </Tabs>
-      <SessionSheet session={current} onClose={() => setSelected(null)} />
+      <SessionSheet session={current} scores={scores} onClose={() => setSelected(null)} />
     </>
   )
 }
@@ -279,7 +288,15 @@ function StageOutputs({ detail }: { detail: TaskDetail }) {
   )
 }
 
-function SessionsTable({ sessions, onSelect }: { sessions: SessionDetail[]; onSelect: (s: SessionDetail) => void }) {
+function SessionsTable({
+  sessions,
+  scores,
+  onSelect,
+}: {
+  sessions: SessionDetail[]
+  scores: ScoreRow[]
+  onSelect: (s: SessionDetail) => void
+}) {
   if (sessions.length === 0) return <p className="text-sm text-muted-foreground">No agent sessions yet.</p>
   return (
     <div className="overflow-hidden rounded-lg border">
@@ -293,6 +310,7 @@ function SessionsTable({ sessions, onSelect }: { sessions: SessionDetail[]; onSe
             <TableHead className="hidden text-right md:table-cell">Turns</TableHead>
             <TableHead className="hidden text-right md:table-cell">Tools</TableHead>
             <TableHead className="text-right">Duration</TableHead>
+            <TableHead className="hidden lg:table-cell">Scores</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -316,6 +334,15 @@ function SessionsTable({ sessions, onSelect }: { sessions: SessionDetail[]; onSe
                 {s.tool_errors ? <span className="text-fail"> ({s.tool_errors}✗)</span> : null}
               </TableCell>
               <TableCell className="text-right tabular-nums">{fmtMs(s.duration_ms)}</TableCell>
+              <TableCell className="hidden lg:table-cell">
+                <div className="flex flex-wrap gap-1">
+                  {scores
+                    .filter((r) => r.target_session === s.session_id)
+                    .map((r) => (
+                      <ScoreChip key={r.score_id} r={r} />
+                    ))}
+                </div>
+              </TableCell>
             </TableRow>
           ))}
         </TableBody>

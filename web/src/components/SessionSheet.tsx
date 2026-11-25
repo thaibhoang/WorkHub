@@ -1,22 +1,31 @@
 import { useQuery } from '@tanstack/react-query'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { ScoreCard } from '@/components/scores'
 import { SessionStatusBadge } from '@/components/status'
 import { Skeleton } from '@/components/ui/skeleton'
-import { api, fmtMs, fmtTokens, fmtUsd, shortId, type SessionDetail } from '@/lib/api'
+import { api, fmtMs, fmtTokens, fmtUsd, shortId, type ScoreRow, type SessionDetail } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
-/** Side panel with a session's facts and its Claude Code transcript. */
-export function SessionSheet({ session, onClose }: { session: SessionDetail | null; onClose: () => void }) {
+/** Side panel with a session's facts, scorer results and its Claude Code transcript. */
+export function SessionSheet({
+  session,
+  scores = [],
+  onClose,
+}: {
+  session: SessionDetail | null
+  scores?: ScoreRow[]
+  onClose: () => void
+}) {
   return (
     <Sheet open={!!session} onOpenChange={(o) => !o && onClose()}>
       <SheetContent className="w-full gap-0 sm:max-w-2xl">
-        {session ? <Body s={session} /> : null}
+        {session ? <Body s={session} scores={scores.filter((r) => r.target_session === session.session_id)} /> : null}
       </SheetContent>
     </Sheet>
   )
 }
 
-function Body({ s }: { s: SessionDetail }) {
+function Body({ s, scores }: { s: SessionDetail; scores: ScoreRow[] }) {
   const live = !s.ended_at
   const { data, isLoading, error } = useQuery({
     queryKey: ['transcript', s.session_id, s.status],
@@ -64,6 +73,14 @@ function Body({ s }: { s: SessionDetail }) {
           <div className="border-b bg-fail/5 p-4 text-sm">
             <span className="font-medium text-fail">{s.failure_class}</span>
             {s.failure_message ? <pre className="mt-1 text-xs whitespace-pre-wrap">{s.failure_message}</pre> : null}
+          </div>
+        ) : null}
+        {scores.length ? (
+          <div className="grid gap-2 border-b p-4">
+            <h3 className="text-sm font-medium">Scores</h3>
+            {scores.map((r) => (
+              <ScoreCard key={r.score_id} r={r} />
+            ))}
           </div>
         ) : null}
         <div className="p-4">

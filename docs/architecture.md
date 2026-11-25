@@ -136,7 +136,7 @@ pub struct EventMeta {
 - `AgentSessionCompleted{outcome, num_turns, duration_ms, cost_usd, artifacts[]}`
 - `AgentSessionFailed{failure_class, message, retryable}`
 
-**Quality / Improvement**: `ScoreRecorded{scorer, target_session, pass, score, classification, cost_usd}`, `BenchmarkRunCompleted{suite, variant, results}`, `ProposalCreated{title, rationale, evidence[], diff_ref}`, `ProposalDecided{approved|rejected, by}`, `ProposalRolledOut{factory_version}`.
+**Quality / Improvement** (stream `score-{id}`): `ScoreStarted{scorer, target_session, task_id, agent, stage, model, pass_threshold, manual}`, `ScoreRecorded{score, pass, classification, rationale, cost_usd, usage}`, `ScoreFailed{message, cost_usd}`, `BenchmarkRunCompleted{suite, variant, results}`, `ProposalCreated{title, rationale, evidence[], diff_ref}`, `ProposalDecided{approved|rejected, by}`, `ProposalRolledOut{factory_version}`.
 
 ### 4.3 Phân loại lỗi (`failure_class`)
 
@@ -179,9 +179,9 @@ Read model trong Postgres (bảng riêng, dựng lại được từ event):
 `session_facts` là bảng "fact" phẳng — cũng là input chính cho improver. Khi dữ liệu lớn, đẩy sang DuckDB/ClickHouse.
 
 ### 5.5 Scorers (`wh-scorer`)
-- Scorer = định nghĩa trong factory repo: `target` (agent nào), `prompt` chấm, `pass_threshold`, `sampling_rate`.
-- Nghe `AgentSessionCompleted` → chạy LLM-as-judge (model rẻ) trên transcript/diff → `ScoreRecorded`. Tự ghi cost của chính scorer (như "All-time scorer cost" của Warp).
-- Ví dụ scorer của Warp: *Redundant Tests*, *Status Update Nudge*, *Computer-Use Ask*.
+- Scorer = định nghĩa trong factory repo: `target` (agent nào), `prompt` chấm (rubric), `model`, `pass_threshold`, `sampling_rate`, `budget_usd`, `include_failed`.
+- Nghe `AgentSessionCompleted` (và `AgentSessionFailed` nếu `include_failed`) → chạy LLM-as-judge (model rẻ, không tool) trên task + prompt agent + câu trả lời cuối + diff commit + transcript rút gọn → `ScoreRecorded{score 0..1, pass, classification, rationale, cost}` hoặc `ScoreFailed`. Tự ghi cost của chính scorer (như "All-time scorer cost" của Warp).
+- Ví dụ scorer của Warp: *Redundant Tests*, *Status Update Nudge*, *Computer-Use Ask*. WorkHub dogfood: `scope-discipline`, `test-evidence` (implementation), `review-evidence` (code-review).
 
 ### 5.6 Self-improvement (`wh-improver`)
 
@@ -206,7 +206,7 @@ Tập task cố định (có lời giải/đánh giá) để chạy lại với 
 ### 5.8 API & UI (`wh-api`, `web/`)
 - **axum** REST + **SSE** để stream event live (timeline, trạng thái run).
 - Màn hình (theo Warp Factories): Inbox (gate + proposal cần duyệt), Runs, Run detail (transcript + Timeline/Agents/Artifacts/Metadata), Dashboard (Productivity / Spending / Scorers), Agents, Scorers, Self-improvement, Factory definition (read-only, link về repo).
-- Phase 3 đã làm: Runs, Run detail (pipeline strip, duyệt gate / resume / cancel, Gantt session theo stage, stage outputs, transcript, raw events), Inbox (gate + blocked; proposal đợi phase 5), Dashboard, Factory. Agents/Scorers/Self-improvement để các phase sau.
+- Phase 3 đã làm: Runs, Run detail (pipeline strip, duyệt gate / resume / cancel, Gantt session theo stage, stage outputs, transcript, raw events), Inbox (gate + blocked; proposal đợi phase 5), Dashboard, Factory. Phase 4 thêm Scorers (pass rate / cost theo scorer, kết quả gần đây), điểm trên từng session, ô pass rate + judge cost trên Dashboard. Agents/Self-improvement để các phase sau.
 
 ---
 
@@ -249,9 +249,12 @@ agents:
 
 scorers:
   - id: redundant-tests
-    target: implementation
-    file: scorers/redundant-tests.md
-    sampling_rate: 0.5
+    target: implementation          # agent có session được chấm
+    prompt: scorers/redundant-tests.md
+    model: claude-haiku-5-5         # mặc định
+    pass_threshold: 0.7             # score >= ngưỡng là pass
+    sampling_rate: 0.5              # xác định theo (session, scorer)
+    budget_usd: 0.25
 
 improvement:
   schedule: "0 2 * * *"
@@ -300,7 +303,7 @@ MVP chạy **một binary** (`workhubd`) chứa mọi consumer dưới dạng to
 | **1. Một agent** ✅ | Runner + adapter Claude Code, `session_facts` | `wh run "task…"` → thấy cost/tokens/duration/outcome |
 | **2. Pipeline** ✅ | Foreman + factory.yaml, triage→spec→implement→review→verify, gate qua CLI | Một task đi hết vòng, có rework loop |
 | **3. Quan sát** ✅ | API + SSE + UI: Runs, Run timeline, Dashboard | Xem live, metrics cycle time/cost/fail rate |
-| **4. Chất lượng** | Scorers | Pass rate theo scorer, cost scorer |
+| **4. Chất lượng** ✅ | Scorers | Pass rate theo scorer, cost scorer |
 | **5. Tự cải tiến** | Improver + Inbox duyệt + so sánh theo factory_version | Proposal → PR → đo delta |
 | **6. Mở rộng** | Benchmarks, GitHub/Slack/Linear, Docker sandbox, NATS | — |
 
@@ -340,3 +343,13 @@ Nên **dogfood** từ phase 2: dùng WorkHub để phát triển chính WorkHub.
 - Đọc: list/metrics lấy từ projection (`wh_metrics::queries`: tasks + cost, sessions, totals, daily, stage stats). Timeline event của task/session đọc thẳng stream (nguồn sự thật, không cần projection riêng). Chưa thêm bảng read-model mới: `task_cycle_times`/`stage_stats` trong §5.4 hiện là SQL trên `tasks_view` + `session_facts`; tách thành projection khi dữ liệu lớn.
 - SSE `/api/events/stream`: một task LISTEN `wh_events` cập nhật `watch<head_seq>`; mỗi client giữ cursor riêng và tự `read_all(cursor)` → client chậm không mất event, lỡ NOTIFY chỉ trễ tối đa 5s. Hỗ trợ `Last-Event-ID` (EventSource tự resume), `?after=`, `?task=` (lọc theo correlation id).
 - UI: React 19 + Vite + Tailwind v4 + shadcn/ui (radix-nova), TanStack Query; một EventSource cho cả app, mỗi event invalidate query liên quan (debounce 350ms để projection trong cùng process kịp cập nhật), polling 30s chỉ là lưới an toàn. Dev: `npm run dev` (proxy `/api` → 7070).
+
+### Ghi chú phase 4 (Scorers)
+- Crate `wh-scorer`: `ScorerService` là consumer (`scorer:<factory>`) chạy cùng foreman (`wh foreman`, `wh serve --foreman`; tắt bằng `--no-scorers`) hoặc riêng (`wh scorer`). Chỉ chấm session của task thuộc đúng factory (tên agent chỉ có nghĩa trong factory).
+- **Judge**: dùng lại adapter Claude Code (`AgentRuntime`) với `--tools ""` (không tool, chạy trong thư mục tạm), model mặc định Haiku, `--max-budget-usd` theo scorer. Input: rubric + task + prompt agent + câu trả lời cuối + `git show` commit của session + transcript rút gọn (text, tool call, lỗi tool). Judge phải kết thúc bằng JSON `{"score", "classification", "rationale"}`; `pass = score >= pass_threshold` do WorkHub tính (không để model quyết). Không parse được → `ScoreFailed`, cost vẫn tính vào scorer cost. Transcript judge ở `transcripts/score-<id>.jsonl`.
+- **Exactly-once**: score id tự động = UUIDv5(session, scorer); `ScoreStarted` append với `NoStream` → redelivery/hai process cùng chạy chỉ chấm một lần. Sampling cũng xác định theo id đó nên ổn định khi replay.
+- **Không chấm lại lịch sử**: lần đầu consumer chạy, checkpoint được đặt ở head của log (bật scorer không tốn tiền cho mọi session cũ). Chấm session cũ / sau khi sửa rubric: `wh score session <id> [--scorer X]` (score mới, `manual = true`, bỏ qua sampling).
+- **Khôi phục**: khởi động sẽ đánh `ScoreFailed` cho score còn ở `ScoreStarted` (process trước chết giữa chừng).
+- Read model `score_results` (projection mới, rebuild được). Query: `scorer_stats` (pass rate all-time + 7 ngày, lỗi, cost), `scorer_stats_by_version` (pass rate theo `factory_version` của **session được chấm**, tín hiệu trước/sau cho improver phase 5), totals dashboard có `scorer_cost_usd` (tách khỏi spend của agent).
+- API: `/api/scorers`, `/api/scores?scorer&task&session&failing`, scores trong task/session detail, `scorers` trong `/api/factory`. CLI: `wh scores [--scorer] [--failing]`, `wh stats` có bảng scorer.
+- Kiểm chứng thật: chấm một session cũ bằng Haiku, $0.0013/lần, judge chạy với `tools: []`.

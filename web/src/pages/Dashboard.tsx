@@ -130,7 +130,11 @@ function Kpis({ d }: { d: DashboardData }) {
   const tiles: { label: string; value: string; hint?: string; tone?: string }[] = [
     { label: 'Tasks completed', value: String(t.tasks_done), hint: `${t.tasks_created} created` },
     { label: 'Cycle time p50', value: fmtMs(t.cycle_p50_ms), hint: `p90 ${fmtMs(t.cycle_p90_ms)} · kickoff → done` },
-    { label: 'Spend', value: fmtUsd(t.cost_usd), hint: t.tasks_done ? `${fmtUsd(t.cost_usd / t.tasks_done)} per completed task` : undefined },
+    {
+      label: 'Spend',
+      value: fmtUsd(t.cost_usd),
+      hint: t.tasks_done ? `${fmtUsd(t.cost_usd / t.tasks_done)} per completed task` : 'agent sessions (scorers excluded)',
+    },
     {
       label: 'Session failure rate',
       value: failRate == null ? '–' : `${(failRate * 100).toFixed(1)}%`,
@@ -139,6 +143,12 @@ function Kpis({ d }: { d: DashboardData }) {
     },
     { label: 'Rework loops / task', value: t.avg_rework == null ? '–' : t.avg_rework.toFixed(2), hint: `${t.gate_rejections} gate rejections` },
     {
+      label: 'Scorer pass rate',
+      value: t.scores ? `${((t.scores_passed / t.scores) * 100).toFixed(0)}%` : '–',
+      hint: `${t.scores_passed}/${t.scores} graded · ${fmtUsd(t.scorer_cost_usd, 3)} judge cost`,
+      tone: t.scores && t.scores_passed / t.scores < 0.7 ? 'text-warn' : undefined,
+    },
+    {
       label: 'Needs a human',
       value: String(t.awaiting_gate + t.tasks_blocked),
       hint: `${t.awaiting_gate} at a gate · ${t.tasks_blocked} blocked`,
@@ -146,7 +156,7 @@ function Kpis({ d }: { d: DashboardData }) {
     },
   ]
   return (
-    <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+    <div className="grid grid-cols-2 gap-3 md:grid-cols-4 2xl:grid-cols-7">
       {tiles.map((k) => (
         <Card key={k.label} className="gap-1 py-4">
           <CardContent className="px-4">

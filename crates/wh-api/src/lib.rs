@@ -26,7 +26,7 @@ use uuid::Uuid;
 use wh_core::{SessionId, TaskId, task::TaskSource};
 use wh_eventstore::EventStore;
 use wh_factory::Factory;
-use wh_metrics::{queries, sessions::SessionFactsProjection};
+use wh_metrics::{queries, scores, sessions::SessionFactsProjection};
 
 pub use live::Live;
 
@@ -59,6 +59,8 @@ pub fn api(state: AppState) -> Router {
         .route("/sessions", get(list_sessions))
         .route("/sessions/{id}", get(get_session))
         .route("/sessions/{id}/transcript", get(get_transcript))
+        .route("/scorers", get(list_scorers))
+        .route("/scores", get(list_scores))
         .route("/stats", get(stats))
         .route("/dashboard", get(dashboard))
         .route("/factory", get(factory))
@@ -191,6 +193,7 @@ async fn get_task(State(s): State<AppState>, Path(id): Path<String>) -> ApiResul
         state: TaskStateDto::from(&state),
         events: events.iter().map(EventDto::from).collect(),
         sessions: queries::task_sessions(s.pool(), task.0).await?,
+        scores: scores::scores(s.pool(), &scores::ScoreFilter { task: Some(task.0), ..Default::default() }, 500).await?,
     }))
 }
 
@@ -235,7 +238,12 @@ async fn get_session(State(s): State<AppState>, Path(id): Path<String>) -> ApiRe
     let sid: SessionId = parse_id(&id, "session")?;
     let session = queries::session(s.pool(), sid.0).await?.ok_or_else(|| ApiError::not_found("session"))?;
     let events = s.store.read_stream(&sid.stream_id()).await?;
-    Ok(Json(SessionDetailResponse { session, events: events.iter().map(EventDto::from).collect() }))
+    let filter = scores::ScoreFilter { session: Some(sid.0), ..Default::default() };
+    Ok(Json(SessionDetailResponse {
+        session,
+        events: events.iter().map(EventDto::from).collect(),
+        scores: scores::scores(s.pool(), &filter, 100).await?,
+    }))
 }
 
 /// Max transcript bytes returned; longer transcripts keep their tail.
@@ -266,6 +274,58 @@ async fn get_transcript(State(s): State<AppState>, Path(id): Path<String>) -> Ap
     }
     let lines = lines.filter(|l| !l.trim().is_empty()).filter_map(|l| serde_json::from_str(l).ok()).collect();
     Ok(Json(Transcript { path, truncated, lines }))
+}
+
+// ---------- scorers ----------
+
+/// A scorer: its definition (if the loaded factory has it) and its stats (if it has run).
+#[derive(Serialize)]
+struct ScorerSummary {
+    id: String,
+    definition: Option<ScorerDto>,
+    stats: Option<scores::ScorerStats>,
+}
+
+#[derive(Serialize)]
+struct Scorers {
+    scorers: Vec<ScorerSummary>,
+    by_version: Vec<scores::ScorerVersionStats>,
+}
+
+async fn list_scorers(State(s): State<AppState>) -> ApiResult<Scorers> {
+    let mut stats = scores::scorer_stats(s.pool()).await?;
+    let mut out: Vec<ScorerSummary> = s
+        .factory
+        .iter()
+        .flat_map(|f| f.scorers.iter())
+        .map(|d| {
+            let st = stats.iter().position(|x| x.scorer == d.id).map(|i| stats.remove(i));
+            ScorerSummary { id: d.id.clone(), definition: Some(ScorerDto::from(d)), stats: st }
+        })
+        .collect();
+    // Scorers that ran in the past but are no longer defined.
+    out.extend(stats.into_iter().map(|st| ScorerSummary { id: st.scorer.clone(), definition: None, stats: Some(st) }));
+    Ok(Json(Scorers { scorers: out, by_version: scores::scorer_stats_by_version(s.pool()).await? }))
+}
+
+#[derive(Deserialize)]
+struct ScoresQuery {
+    scorer: Option<String>,
+    task: Option<Uuid>,
+    session: Option<Uuid>,
+    #[serde(default)]
+    failing: bool,
+    limit: Option<i64>,
+}
+
+async fn list_scores(State(s): State<AppState>, Query(q): Query<ScoresQuery>) -> ApiResult<Vec<scores::ScoreRow>> {
+    let filter = scores::ScoreFilter {
+        scorer: q.scorer.filter(|x| !x.is_empty()),
+        task: q.task,
+        session: q.session,
+        failing: q.failing,
+    };
+    Ok(Json(scores::scores(s.pool(), &filter, q.limit.unwrap_or(100).clamp(1, 1000)).await?))
 }
 
 // ---------- metrics ----------

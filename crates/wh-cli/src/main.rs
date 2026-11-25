@@ -11,7 +11,13 @@ use wh_core::{
 use wh_eventstore::{EventStore, Subscription};
 use wh_factory::Factory;
 use wh_foreman::{Dispatch, Foreman};
-use wh_metrics::{sessions::SessionFactsProjection, tasks::TasksProjection};
+use wh_core::SessionId;
+use wh_metrics::{
+    scores::{self, ScoreFilter, ScoreResultsProjection},
+    sessions::SessionFactsProjection,
+    tasks::TasksProjection,
+};
+use wh_scorer::{Graded, ScorerConfig, ScorerService};
 use wh_runner::{OutcomeStatus, RunSpec, Runner, RunnerConfig, Signal, claude_code::ClaudeCode};
 
 #[derive(Parser)]
@@ -46,6 +52,34 @@ enum Cmd {
         max_parallel: usize,
         #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
         claude_bin: PathBuf,
+        /// Do not run the factory's scorers alongside the pipeline
+        #[arg(long)]
+        no_scorers: bool,
+    },
+    /// Grade finished agent sessions with the factory's scorers (LLM-as-judge) until Ctrl+C
+    Scorer {
+        #[arg(long, env = "WH_FACTORY", default_value = "factory/factory.yaml")]
+        factory: PathBuf,
+        /// Max gradings running at the same time
+        #[arg(long, default_value_t = 2)]
+        max_parallel: usize,
+        #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
+        claude_bin: PathBuf,
+    },
+    /// Grade one session now (ignores sampling), e.g. an old session or after a rubric change
+    Score {
+        #[command(subcommand)]
+        cmd: ScoreCmd,
+    },
+    /// List scorer results, newest first
+    Scores {
+        #[arg(long)]
+        scorer: Option<String>,
+        /// Only results that did not pass
+        #[arg(long)]
+        failing: bool,
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
     },
     /// Serve the HTTP API + live event stream (and the built UI); runs projections,
     /// and with --foreman also drives the pipeline (everything in one process)
@@ -62,6 +96,9 @@ enum Cmd {
         max_parallel: usize,
         #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
         claude_bin: PathBuf,
+        /// With --foreman: do not run the factory's scorers
+        #[arg(long)]
+        no_scorers: bool,
         /// Built UI to serve at / (skipped if missing)
         #[arg(long, env = "WH_WEB_DIR", default_value = "web/dist")]
         web_dir: PathBuf,
@@ -129,6 +166,20 @@ enum TaskCmd {
         task: TaskId,
         #[arg(long)]
         reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScoreCmd {
+    Session {
+        session: SessionId,
+        /// Only this scorer (default: every scorer targeting the session's agent)
+        #[arg(long)]
+        scorer: Option<String>,
+        #[arg(long, env = "WH_FACTORY", default_value = "factory/factory.yaml")]
+        factory: PathBuf,
+        #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
+        claude_bin: PathBuf,
     },
 }
 
@@ -298,15 +349,83 @@ async fn main() -> Result<()> {
                     st.on_reject.as_ref().map(|t| format!("  on_reject → {t}")).unwrap_or_default(),
                 );
             }
+            if !f.scorers.is_empty() {
+                println!("\nscorers:");
+                for sc in &f.scorers {
+                    println!(
+                        "  {:<18} target {:<15} model {:<18} pass ≥ {:<4} sample {:>3.0}%  budget ${}",
+                        sc.id,
+                        sc.target,
+                        sc.model,
+                        sc.pass_threshold,
+                        sc.sampling_rate * 100.0,
+                        sc.budget_usd
+                    );
+                }
+            }
         }
-        Cmd::Foreman { factory, max_parallel, claude_bin } => {
+        Cmd::Foreman { factory, max_parallel, claude_bin, no_scorers } => {
             let f = Factory::load(&factory)?;
             println!("foreman for factory '{}' (version {}), Ctrl+C to stop", f.name, f.version);
-            let (a, b) = tokio::join!(run_foreman(&store, f, max_parallel, claude_bin), run_projections(&store));
+            let scorer = run_scorer(&store, f.clone(), max_parallel, claude_bin.clone(), !no_scorers);
+            let (a, b, c) =
+                tokio::join!(run_foreman(&store, f, max_parallel, claude_bin), run_projections(&store), scorer);
+            a?;
+            b?;
+            c?;
+        }
+        Cmd::Scorer { factory, max_parallel, claude_bin } => {
+            let f = Factory::load(&factory)?;
+            anyhow::ensure!(!f.scorers.is_empty(), "factory '{}' defines no scorers", f.name);
+            println!("scorers for factory '{}' (version {}), Ctrl+C to stop", f.name, f.version);
+            let (a, b) = tokio::join!(run_scorer(&store, f, max_parallel, claude_bin, true), run_projections(&store));
             a?;
             b?;
         }
-        Cmd::Serve { addr, factory, foreman, max_parallel, claude_bin, web_dir } => {
+        Cmd::Score { cmd: ScoreCmd::Session { session, scorer, factory, claude_bin } } => {
+            let f = Factory::load(&factory)?;
+            let cfg = ScorerConfig { data_dir: data_dir() };
+            let svc = ScorerService::new(store.clone(), f, ClaudeCode::new(claude_bin), cfg, wh_scorer::Dispatch::Inline);
+            for (id, g) in svc.grade_session(session, scorer.as_deref()).await? {
+                match g {
+                    Graded::Scored { score, pass, classification, rationale, cost_usd } => println!(
+                        "{id}: {} score {score:.2}{}  (${cost_usd:.4})\n  {rationale}",
+                        if pass { "PASS" } else { "FAIL" },
+                        classification.map(|c| format!(" [{c}]")).unwrap_or_default()
+                    ),
+                    Graded::Failed { message, cost_usd } => println!("{id}: ERROR {message}  (${cost_usd:.4})"),
+                    Graded::Duplicate => println!("{id}: already graded"),
+                }
+            }
+            wh_metrics::catch_up_all(&store).await?;
+        }
+        Cmd::Scores { scorer, failing, limit } => {
+            wh_metrics::catch_up_all(&store).await?;
+            println!(
+                "{:<36}  {:<18}  {:<15}  {:<7}  {:>5}  {:<22}  {:>8}  rationale",
+                "session", "scorer", "agent", "result", "score", "classification", "cost$"
+            );
+            for r in scores::scores(&pool, &ScoreFilter { scorer, failing, ..Default::default() }, limit).await? {
+                let result = match (r.status.as_str(), r.pass) {
+                    ("scored", Some(true)) => "pass",
+                    ("scored", _) => "FAIL",
+                    ("failed", _) => "error",
+                    _ => "running",
+                };
+                println!(
+                    "{}  {:<18}  {:<15}  {:<7}  {:>5}  {:<22}  {:>8.4}  {}",
+                    r.target_session,
+                    r.scorer,
+                    r.agent,
+                    result,
+                    r.score.map(|s| format!("{s:.2}")).unwrap_or_else(|| "-".into()),
+                    r.classification.as_deref().unwrap_or("-"),
+                    r.cost_usd,
+                    first_line(r.rationale.as_deref().or(r.error.as_deref()).unwrap_or("")),
+                );
+            }
+        }
+        Cmd::Serve { addr, factory, foreman, max_parallel, claude_bin, no_scorers, web_dir } => {
             let f = match Factory::load(&factory) {
                 Ok(f) => Some(f),
                 Err(e) if !foreman => {
@@ -331,7 +450,9 @@ async fn main() -> Result<()> {
                 match (foreman, f) {
                     (true, Some(f)) => {
                         println!("foreman for factory '{}' (version {})", f.name, f.version);
-                        run_foreman(&store, f, max_parallel, claude_bin).await
+                        let scorer = run_scorer(&store, f.clone(), max_parallel, claude_bin.clone(), !no_scorers);
+                        let (a, b) = tokio::join!(run_foreman(&store, f, max_parallel, claude_bin), scorer);
+                        a.and(b)
                     }
                     _ => Ok(()),
                 }
@@ -383,6 +504,26 @@ async fn main() -> Result<()> {
                     tool_err * 100.0,
                 );
             }
+            let scorer_stats = scores::scorer_stats(&pool).await?;
+            if !scorer_stats.is_empty() {
+                println!(
+                    "\n{:<18}  {:<15}  {:>6}  {:>6}  {:>7}  {:>6}  {:>9}",
+                    "scorer", "target", "scored", "pass%", "pass%7d", "errors", "cost$"
+                );
+                let pct = |x: Option<f64>| x.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "-".into());
+                for s in scorer_stats {
+                    println!(
+                        "{:<18}  {:<15}  {:>6}  {:>6}  {:>7}  {:>6}  {:>9.4}",
+                        s.scorer,
+                        s.agent,
+                        s.scored,
+                        pct(s.pass_rate),
+                        pct(s.pass_rate_7d),
+                        s.errors,
+                        s.cost_usd
+                    );
+                }
+            }
             let failures = SessionFactsProjection::failures_by_class(&pool).await?;
             if !failures.is_empty() {
                 println!("\nfailures by class:");
@@ -430,14 +571,38 @@ async fn run_foreman(store: &EventStore, f: Factory, max_parallel: usize, claude
     Subscription::new(store.clone()).run(&mut foreman, ctrl_c()).await
 }
 
+/// Scorer consumer until Ctrl+C. New consumers start at the head of the log, so
+/// enabling scorers does not grade every past session.
+async fn run_scorer(store: &EventStore, f: Factory, max_parallel: usize, claude_bin: PathBuf, enabled: bool) -> Result<()> {
+    if !enabled || f.scorers.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<_> = f.scorers.iter().map(|s| format!("{} → {}", s.id, s.target)).collect();
+    println!("scorers: {}", ids.join(", "));
+    let dispatch = wh_scorer::Dispatch::Spawn(std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel)));
+    let cfg = ScorerConfig { data_dir: data_dir() };
+    let mut svc = ScorerService::new(store.clone(), f, ClaudeCode::new(claude_bin), cfg, dispatch);
+    let n = svc.recover_interrupted().await?;
+    if n > 0 {
+        println!("{n} interrupted grading(s) marked failed");
+    }
+    if svc.start_from_head_if_new().await? {
+        println!("scorers start from now; grade older sessions with `wh score session <id>`");
+    }
+    Subscription::new(store.clone()).run(&mut svc, ctrl_c()).await
+}
+
 /// Keep every projection following the log until Ctrl+C.
 async fn run_projections(store: &EventStore) -> Result<()> {
     let pool = store.pool().clone();
-    let (sa, sb) = (Subscription::new(store.clone()), Subscription::new(store.clone()));
-    let (mut tasks, mut sessions) = (TasksProjection::new(pool.clone()), SessionFactsProjection::new(pool));
-    let (a, b) = tokio::join!(sa.run(&mut tasks, ctrl_c()), sb.run(&mut sessions, ctrl_c()));
-    a?;
-    b
+    let sub = || Subscription::new(store.clone());
+    let (sa, sb, sc) = (sub(), sub(), sub());
+    let mut tasks = TasksProjection::new(pool.clone());
+    let mut sessions = SessionFactsProjection::new(pool.clone());
+    let mut scores = ScoreResultsProjection::new(pool);
+    let (a, b, c) =
+        tokio::join!(sa.run(&mut tasks, ctrl_c()), sb.run(&mut sessions, ctrl_c()), sc.run(&mut scores, ctrl_c()));
+    a.and(b).and(c)
 }
 
 async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {

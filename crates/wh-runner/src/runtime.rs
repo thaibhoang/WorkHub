@@ -16,6 +16,9 @@ pub struct AgentRequest {
     /// Load the user's MCP servers too (off by default: they cost context tokens).
     pub with_user_mcp: bool,
     pub timeout: Duration,
+    /// Restrict the built-in tool set (`Some(vec![])` = no tools, e.g. for a judge).
+    /// `None` keeps the runtime's default tools.
+    pub tools: Option<Vec<String>>,
 }
 
 /// Live progress reported while the session runs.

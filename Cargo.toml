@@ -12,7 +12,7 @@ anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-uuid = { version = "1", features = ["v7", "serde"] }
+uuid = { version = "1", features = ["v5", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
@@ -28,3 +28,4 @@ wh-runner = { path = "crates/wh-runner" }
 wh-factory = { path = "crates/wh-factory" }
 wh-foreman = { path = "crates/wh-foreman" }
 wh-api = { path = "crates/wh-api" }
+wh-scorer = { path = "crates/wh-scorer" }

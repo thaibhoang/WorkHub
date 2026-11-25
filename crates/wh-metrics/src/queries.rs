@@ -129,13 +129,18 @@ pub struct Totals {
     /// Gate rejections / gate decisions are not tracked separately yet; this is
     /// rejections per task that reached a gate.
     pub gate_rejections: i64,
+    /// LLM-as-judge spend in the window (not included in `cost_usd`).
+    pub scorer_cost_usd: f64,
+    pub scores: i64,
+    pub scores_passed: i64,
 }
 
 pub async fn totals(pool: &PgPool, days: i32) -> anyhow::Result<Totals> {
     Ok(sqlx::query_as(
         "WITH win AS (SELECT now() - make_interval(days => $1) AS since), \
          t AS (SELECT * FROM tasks_view, win WHERE created_at >= win.since OR updated_at >= win.since), \
-         s AS (SELECT * FROM session_facts, win WHERE dispatched_at >= win.since) \
+         s AS (SELECT * FROM session_facts, win WHERE dispatched_at >= win.since), \
+         r AS (SELECT * FROM score_results, win WHERE started_at >= win.since) \
          SELECT \
            (SELECT count(*) FROM tasks_view, win WHERE created_at >= win.since) AS tasks_created, \
            (SELECT count(*) FROM t WHERE status = 'done' AND completed_at >= (SELECT since FROM win)) AS tasks_done, \
@@ -150,7 +155,10 @@ pub async fn totals(pool: &PgPool, days: i32) -> anyhow::Result<Totals> {
            (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY extract(epoch FROM completed_at - created_at) * 1000) \
               FROM t WHERE status = 'done' AND completed_at IS NOT NULL) AS cycle_p90_ms, \
            (SELECT avg(rework_loops)::float8 FROM t WHERE status = 'done') AS avg_rework, \
-           (SELECT COALESCE(sum(gate_rejections), 0)::int8 FROM t) AS gate_rejections",
+           (SELECT COALESCE(sum(gate_rejections), 0)::int8 FROM t) AS gate_rejections, \
+           (SELECT COALESCE(sum(cost_usd), 0) FROM r) AS scorer_cost_usd, \
+           (SELECT count(*) FROM r WHERE status = 'scored') AS scores, \
+           (SELECT count(*) FROM r WHERE pass) AS scores_passed",
     )
     .bind(days)
     .fetch_one(pool)

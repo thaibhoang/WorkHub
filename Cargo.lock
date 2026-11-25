@@ -1416,6 +1416,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2082,6 +2088,7 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 
@@ -2202,6 +2209,7 @@ dependencies = [
  "wh-foreman",
  "wh-metrics",
  "wh-runner",
+ "wh-scorer",
 ]
 
 [[package]]
@@ -2284,6 +2292,24 @@ dependencies = [
  "wh-core",
  "wh-eventstore",
  "wh-metrics",
+]
+
+[[package]]
+name = "wh-scorer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wh-core",
+ "wh-eventstore",
+ "wh-factory",
+ "wh-metrics",
+ "wh-runner",
 ]
 
 [[package]]

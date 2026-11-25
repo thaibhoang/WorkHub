@@ -9,7 +9,10 @@ use wh_core::{
     task::{TaskState, TaskStatus},
 };
 use wh_factory::Factory;
-use wh_metrics::queries::{SessionDetail, TaskSummary};
+use wh_metrics::{
+    queries::{SessionDetail, TaskSummary},
+    scores::ScoreRow,
+};
 
 /// One event of the log, as sent over REST and SSE.
 #[derive(Debug, Clone, Serialize)]
@@ -94,12 +97,14 @@ pub struct TaskDetail {
     pub state: TaskStateDto,
     pub events: Vec<EventDto>,
     pub sessions: Vec<SessionDetail>,
+    pub scores: Vec<ScoreRow>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SessionDetailResponse {
     pub session: SessionDetail,
     pub events: Vec<EventDto>,
+    pub scores: Vec<ScoreRow>,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,6 +115,37 @@ pub struct FactoryDto {
     pub base_ref: String,
     pub max_rework_loops: u32,
     pub stages: Vec<StageDto>,
+    pub scorers: Vec<ScorerDto>,
+}
+
+/// A scorer definition from factory.yaml.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScorerDto {
+    pub id: String,
+    pub target: String,
+    pub description: Option<String>,
+    pub model: String,
+    pub pass_threshold: f64,
+    pub sampling_rate: f64,
+    pub budget_usd: f64,
+    pub include_failed: bool,
+    pub prompt: String,
+}
+
+impl From<&wh_factory::Scorer> for ScorerDto {
+    fn from(s: &wh_factory::Scorer) -> Self {
+        Self {
+            id: s.id.clone(),
+            target: s.target.clone(),
+            description: s.description.clone(),
+            model: s.model.clone(),
+            pass_threshold: s.pass_threshold,
+            sampling_rate: s.sampling_rate,
+            budget_usd: s.budget_usd,
+            include_failed: s.include_failed,
+            prompt: s.prompt.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -164,6 +200,7 @@ impl From<&Factory> for FactoryDto {
                     }
                 })
                 .collect(),
+            scorers: f.scorers.iter().map(ScorerDto::from).collect(),
         }
     }
 }

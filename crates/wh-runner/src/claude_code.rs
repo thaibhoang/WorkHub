@@ -46,6 +46,15 @@ impl ClaudeCode {
         if !req.allowed_tools.is_empty() {
             cmd.arg("--allowed-tools").args(&req.allowed_tools);
         }
+        match req.tools.as_deref() {
+            Some([]) => {
+                cmd.args(["--tools", ""]);
+            }
+            Some(tools) => {
+                cmd.arg("--tools").arg(tools.join(","));
+            }
+            None => {}
+        }
         if !req.with_user_mcp {
             cmd.arg("--strict-mcp-config");
         }

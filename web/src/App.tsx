@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { Factory as FactoryIcon, Inbox as InboxIcon, LayoutDashboard, ListTodo, Moon, Sun } from 'lucide-react'
+import { ClipboardCheck, Factory as FactoryIcon, Inbox as InboxIcon, LayoutDashboard, ListTodo, Moon, Sun } from 'lucide-react'
 import { lazy, Suspense, useState } from 'react'
 import { NavLink, Route, Routes } from 'react-router'
 import { Button } from '@/components/ui/button'
@@ -10,6 +10,7 @@ import FactoryPage from '@/pages/Factory'
 import Inbox from '@/pages/Inbox'
 import RunDetail from '@/pages/RunDetail'
 import Runs from '@/pages/Runs'
+import Scorers from '@/pages/Scorers'
 
 // Charts (recharts) are the bulk of the bundle; load them only on the dashboard.
 const Dashboard = lazy(() => import('@/pages/Dashboard'))
@@ -24,6 +25,7 @@ export default function App() {
           <Route path="/runs/:id" element={<RunDetail />} />
           <Route path="/inbox" element={<Inbox />} />
           <Route path="/dashboard" element={<Suspense><Dashboard /></Suspense>} />
+          <Route path="/scorers" element={<Scorers />} />
           <Route path="/factory" element={<FactoryPage />} />
           <Route path="*" element={<p className="text-muted-foreground">Not found.</p>} />
         </Routes>
@@ -39,6 +41,7 @@ function Sidebar() {
     { to: '/', label: 'Runs', icon: ListTodo, end: true },
     { to: '/inbox', label: 'Inbox', icon: InboxIcon, count: inbox },
     { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
+    { to: '/scorers', label: 'Scorers', icon: ClipboardCheck },
     { to: '/factory', label: 'Factory', icon: FactoryIcon },
   ]
   return (

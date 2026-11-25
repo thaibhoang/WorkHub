@@ -2,6 +2,7 @@
 //! dropped and rebuilt from events at any time.
 
 pub mod queries;
+pub mod scores;
 pub mod sessions;
 pub mod tasks;
 
@@ -25,7 +26,8 @@ pub async fn catch_up_all(store: &EventStore) -> anyhow::Result<Vec<(&'static st
     let pool = store.pool().clone();
     Ok(vec![
         (tasks::TasksProjection::NAME, sub.catch_up(&mut tasks::TasksProjection::new(pool.clone())).await?),
-        (sessions::SessionFactsProjection::NAME, sub.catch_up(&mut sessions::SessionFactsProjection::new(pool)).await?),
+        (sessions::SessionFactsProjection::NAME, sub.catch_up(&mut sessions::SessionFactsProjection::new(pool.clone())).await?),
+        (scores::ScoreResultsProjection::NAME, sub.catch_up(&mut scores::ScoreResultsProjection::new(pool)).await?),
     ])
 }
 
@@ -34,6 +36,7 @@ pub async fn rebuild_all(store: &EventStore) -> anyhow::Result<Vec<(&'static str
     let pool = store.pool().clone();
     Ok(vec![
         (tasks::TasksProjection::NAME, rebuild(store, &mut tasks::TasksProjection::new(pool.clone())).await?),
-        (sessions::SessionFactsProjection::NAME, rebuild(store, &mut sessions::SessionFactsProjection::new(pool)).await?),
+        (sessions::SessionFactsProjection::NAME, rebuild(store, &mut sessions::SessionFactsProjection::new(pool.clone())).await?),
+        (scores::ScoreResultsProjection::NAME, rebuild(store, &mut scores::ScoreResultsProjection::new(pool)).await?),
     ])
 }

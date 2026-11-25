@@ -55,6 +55,7 @@ id_type!(TaskId, "task");
 id_type!(RunId, "run");
 id_type!(SessionId, "session");
 id_type!(ProposalId, "proposal");
+id_type!(ScoreId, "score");
 
 #[cfg(test)]
 mod tests {

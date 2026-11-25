@@ -47,3 +47,21 @@ agents:
     prompt: agents/verify.md
     budget_usd: 0.5
     timeout_min: 15
+
+# LLM-as-judge quality checks (phase 4). Each grades finished sessions of its
+# target agent with a cheap model and no tools; results feed /scorers and the
+# improver. Scorer prompts are part of factory_version.
+scorers:
+  - id: scope-discipline
+    target: implementation
+    prompt: scorers/scope-discipline.md
+    description: Changes stay within the task and spec; checks are not gamed
+  - id: test-evidence
+    target: implementation
+    prompt: scorers/test-evidence.md
+    description: Behaviour changes come with relevant tests that were run and reported honestly
+  - id: review-evidence
+    target: code-review
+    prompt: scorers/review-evidence.md
+    description: Review verdicts are consistent, evidenced with file:line, and actionable
+    pass_threshold: 0.6

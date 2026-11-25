@@ -16,6 +16,10 @@ const DEFAULT_TIMEOUT_MIN: u64 = 30;
 const DEFAULT_MAX_RETRIES: u32 = 2;
 const DEFAULT_PERMISSION_MODE: &str = "acceptEdits";
 const DEFAULT_MAX_REWORK_LOOPS: u32 = 3;
+const DEFAULT_SCORER_MODEL: &str = "claude-haiku-5-5";
+const DEFAULT_SCORER_BUDGET_USD: f64 = 0.25;
+const DEFAULT_SCORER_TIMEOUT_MIN: u64 = 5;
+const DEFAULT_PASS_THRESHOLD: f64 = 0.7;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +34,25 @@ struct FactoryFile {
     max_rework_loops: Option<u32>,
     stages: Vec<StageFile>,
     agents: BTreeMap<String, AgentFile>,
+    #[serde(default)]
+    scorers: Vec<ScorerFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScorerFile {
+    id: String,
+    /// Agent whose sessions this scorer grades.
+    target: String,
+    prompt: PathBuf,
+    description: Option<String>,
+    model: Option<String>,
+    pass_threshold: Option<f64>,
+    sampling_rate: Option<f64>,
+    budget_usd: Option<f64>,
+    timeout_min: Option<u64>,
+    #[serde(default)]
+    include_failed: bool,
 }
 
 fn dot() -> PathBuf {
@@ -100,6 +123,25 @@ pub struct Agent {
     pub allowed_tools: Vec<String>,
 }
 
+/// LLM-as-judge definition: grades sessions of `target` agent with `prompt`.
+#[derive(Debug, Clone)]
+pub struct Scorer {
+    pub id: String,
+    pub target: String,
+    pub description: Option<String>,
+    /// Prompt file contents (the grading rubric).
+    pub prompt: String,
+    pub model: String,
+    /// `score >= pass_threshold` passes.
+    pub pass_threshold: f64,
+    /// Fraction of matching sessions graded (deterministic per session).
+    pub sampling_rate: f64,
+    pub budget_usd: f64,
+    pub timeout: Duration,
+    /// Also grade sessions that failed (default: only completed ones).
+    pub include_failed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Factory {
     pub name: String,
@@ -110,6 +152,7 @@ pub struct Factory {
     pub max_rework_loops: u32,
     pub stages: Vec<Stage>,
     pub agents: BTreeMap<String, Agent>,
+    pub scorers: Vec<Scorer>,
 }
 
 impl Factory {
@@ -165,6 +208,38 @@ impl Factory {
             }
         }
 
+        let mut scorers = Vec::new();
+        let mut scorer_ids = HashSet::new();
+        for sc in &file.scorers {
+            let id = &sc.id;
+            ensure!(scorer_ids.insert(id.as_str()), "duplicate scorer id '{id}'");
+            ensure!(agents.contains_key(&sc.target), "scorer '{id}': unknown target agent '{}'", sc.target);
+            let prompt_path = base.join(&sc.prompt);
+            let prompt = std::fs::read_to_string(&prompt_path)
+                .with_context(|| format!("scorer '{id}': read prompt {}", prompt_path.display()))?;
+            hasher.update(b"scorer:");
+            hasher.update(id.as_bytes());
+            hasher.update(prompt.as_bytes());
+            let pass_threshold = sc.pass_threshold.unwrap_or(DEFAULT_PASS_THRESHOLD);
+            let sampling_rate = sc.sampling_rate.unwrap_or(1.0);
+            let budget_usd = sc.budget_usd.unwrap_or(DEFAULT_SCORER_BUDGET_USD);
+            ensure!((0.0..=1.0).contains(&pass_threshold), "scorer '{id}': pass_threshold must be within 0..=1");
+            ensure!((0.0..=1.0).contains(&sampling_rate), "scorer '{id}': sampling_rate must be within 0..=1");
+            ensure!(budget_usd > 0.0, "scorer '{id}': budget_usd must be > 0");
+            scorers.push(Scorer {
+                id: id.clone(),
+                target: sc.target.clone(),
+                description: sc.description.clone(),
+                prompt,
+                model: sc.model.clone().unwrap_or_else(|| DEFAULT_SCORER_MODEL.into()),
+                pass_threshold,
+                sampling_rate,
+                budget_usd,
+                timeout: Duration::from_secs(60 * sc.timeout_min.unwrap_or(DEFAULT_SCORER_TIMEOUT_MIN)),
+                include_failed: sc.include_failed,
+            });
+        }
+
         let repo_path = base.join(&file.repo);
         let repo = std::fs::canonicalize(&repo_path)
             .with_context(|| format!("repo {} not found", repo_path.display()))?;
@@ -182,7 +257,17 @@ impl Factory {
                 .map(|s| Stage { id: s.id, agent: s.agent, gate: s.gate, on_reject: s.on_reject })
                 .collect(),
             agents,
+            scorers,
         })
+    }
+
+    pub fn scorer(&self, id: &str) -> Option<&Scorer> {
+        self.scorers.iter().find(|s| s.id == id)
+    }
+
+    /// Scorers that grade sessions of `agent`.
+    pub fn scorers_for<'a>(&'a self, agent: &'a str) -> impl Iterator<Item = &'a Scorer> + 'a {
+        self.scorers.iter().filter(move |s| s.target == agent)
     }
 
     pub fn stage(&self, id: &str) -> Option<&Stage> {
@@ -210,6 +295,8 @@ mod tests {
 
     fn write(dir: &Path, yaml: &str) -> PathBuf {
         std::fs::create_dir_all(dir.join("agents")).unwrap();
+        std::fs::create_dir_all(dir.join("scorers")).unwrap();
+        std::fs::write(dir.join("scorers/s.md"), "rubric").unwrap();
         for a in ["a", "b"] {
             std::fs::write(dir.join(format!("agents/{a}.md")), format!("prompt {a}")).unwrap();
         }
@@ -229,6 +316,8 @@ stages:
 agents:
   a: { prompt: agents/a.md }
   b: { prompt: agents/b.md, budget_usd: 0.5, model: claude-haiku-5-5 }
+scorers:
+  - { id: s1, target: a, prompt: scorers/s.md, sampling_rate: 0.5 }
 "#;
 
     #[test]
@@ -245,6 +334,11 @@ agents:
         assert_eq!((a.budget_usd, a.max_retries, a.prompt.as_str()), (1.5, 1, "prompt a"));
         assert_eq!(a.timeout, Duration::from_secs(30 * 60));
         assert_eq!(f.agents["b"].budget_usd, 0.5);
+        let sc = f.scorer("s1").unwrap();
+        assert_eq!((sc.prompt.as_str(), sc.sampling_rate, sc.pass_threshold), ("rubric", 0.5, 0.7));
+        assert_eq!(sc.model, "claude-haiku-5-5");
+        assert_eq!(f.scorers_for("a").count(), 1);
+        assert_eq!(f.scorers_for("b").count(), 0);
     }
 
     #[test]
@@ -254,7 +348,10 @@ agents:
         let v1 = Factory::load(&p).unwrap().version;
         assert_eq!(Factory::load(&p).unwrap().version, v1);
         std::fs::write(dir.path().join("agents/b.md"), "changed").unwrap();
-        assert_ne!(Factory::load(&p).unwrap().version, v1);
+        let v2 = Factory::load(&p).unwrap().version;
+        assert_ne!(v2, v1);
+        std::fs::write(dir.path().join("scorers/s.md"), "new rubric").unwrap();
+        assert_ne!(Factory::load(&p).unwrap().version, v2);
     }
 
     #[test]
@@ -264,6 +361,8 @@ agents:
             ("not a stage", OK.replace("on_reject: impl", "on_reject: nope")),
             ("duplicate", OK.replace("id: impl", "id: spec")),
             ("unknown field", OK.replace("gate: spec-review", "gaet: x")),
+            ("unknown target agent", OK.replace("target: a", "target: zz")),
+            ("sampling_rate", OK.replace("sampling_rate: 0.5", "sampling_rate: 2")),
         ];
         for (needle, yaml) in cases {
             let dir = tempfile::tempdir().unwrap();

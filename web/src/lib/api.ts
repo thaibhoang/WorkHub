@@ -91,6 +91,73 @@ export interface TaskDetail {
   state: TaskState
   events: WhEvent[]
   sessions: SessionDetail[]
+  scores: ScoreRow[]
+}
+
+/** One scorer run (LLM-as-judge grading one session); `score_results` row. */
+export interface ScoreRow {
+  score_id: string
+  scorer: string
+  target_session: string
+  task_id: string
+  task_title: string | null
+  agent: string
+  stage: string
+  model: string | null
+  pass_threshold: number
+  manual: boolean
+  status: 'running' | 'scored' | 'failed'
+  score: number | null
+  pass: boolean | null
+  classification: string | null
+  rationale: string | null
+  error: string | null
+  cost_usd: number
+  duration_ms: number | null
+  transcript: string | null
+  started_at: string
+  ended_at: string | null
+  factory_version: string | null
+}
+
+export interface ScorerDef {
+  id: string
+  target: string
+  description: string | null
+  model: string
+  pass_threshold: number
+  sampling_rate: number
+  budget_usd: number
+  include_failed: boolean
+  prompt: string
+}
+
+export interface ScorerStats {
+  scorer: string
+  agent: string
+  runs: number
+  scored: number
+  passed: number
+  errors: number
+  pass_rate: number | null
+  avg_score: number | null
+  pass_rate_7d: number | null
+  scored_7d: number
+  cost_usd: number
+  avg_cost_usd: number | null
+  last_run_at: string | null
+}
+
+export interface ScorersResponse {
+  scorers: { id: string; definition: ScorerDef | null; stats: ScorerStats | null }[]
+  by_version: {
+    scorer: string
+    factory_version: string | null
+    scored: number
+    passed: number
+    avg_score: number | null
+    first_at: string
+  }[]
 }
 
 export interface AgentStats {
@@ -141,6 +208,9 @@ export interface Dashboard {
     cycle_p90_ms: number | null
     avg_rework: number | null
     gate_rejections: number
+    scorer_cost_usd: number
+    scores: number
+    scores_passed: number
   }
   daily: {
     day: string
@@ -174,6 +244,7 @@ export interface FactoryDef {
       prompt: string
     }
   }[]
+  scorers: ScorerDef[]
 }
 
 export interface Transcript {
@@ -218,6 +289,14 @@ export const api = {
   stats: () => request<Stats>('GET', '/stats'),
   dashboard: (days: number) => request<Dashboard>('GET', `/dashboard?days=${days}`),
   factory: () => request<FactoryDef | null>('GET', '/factory'),
+  scorers: () => request<ScorersResponse>('GET', '/scorers'),
+  scores: (q: { scorer?: string; failing?: boolean; limit?: number } = {}) => {
+    const p = new URLSearchParams()
+    if (q.scorer) p.set('scorer', q.scorer)
+    if (q.failing) p.set('failing', 'true')
+    p.set('limit', String(q.limit ?? 100))
+    return request<ScoreRow[]>('GET', `/scores?${p}`)
+  },
   events: (after = 0, limit = 100) => request<WhEvent[]>('GET', `/events?after=${after}&limit=${limit}`),
 }
 
@@ -280,6 +359,10 @@ export function actorLabel(a: EventMeta['actor']): string {
     case 'system':
       return a.component
   }
+}
+
+export function fmtPct(v: number | null | undefined, digits = 0): string {
+  return v == null ? '–' : `${(v * 100).toFixed(digits)}%`
 }
 
 export function firstLine(s: string): string {

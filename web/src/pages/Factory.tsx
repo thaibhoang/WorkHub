@@ -77,6 +77,36 @@ export default function FactoryPage() {
           </li>
         ))}
       </ol>
+      {data.scorers.length ? (
+        <>
+          <h2 className="mt-8 mb-3 text-base font-semibold">Scorers</h2>
+          <div className="grid gap-3">
+            {data.scorers.map((sc) => (
+              <Card key={sc.id} className="gap-3">
+                <CardHeader>
+                  <CardTitle className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono">{sc.id}</span>
+                    <span className="text-sm font-normal text-muted-foreground">grades {sc.target}</span>
+                  </CardTitle>
+                  <CardDescription className="tabular-nums">
+                    {sc.description ? `${sc.description} · ` : ''}
+                    {sc.model} · pass ≥ {sc.pass_threshold} · samples {Math.round(sc.sampling_rate * 100)}% · budget{' '}
+                    {fmtUsd(sc.budget_usd)}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <details className="text-sm">
+                    <summary className="cursor-pointer text-muted-foreground">Rubric</summary>
+                    <pre className="mt-2 max-h-96 overflow-auto rounded-md bg-muted/60 p-3 text-xs whitespace-pre-wrap">
+                      {sc.prompt}
+                    </pre>
+                  </details>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        </>
+      ) : null}
     </>
   )
 }

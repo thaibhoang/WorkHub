@@ -11,7 +11,8 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use wh_api::{AppState, Live};
 use wh_core::{
-    Actor, EventMeta, NewEvent, SessionId, TaskId,
+    Actor, EventMeta, NewEvent, ScoreId, SessionId, TaskId,
+    score::ScoreEvent,
     session::{SessionEvent, TokenUsage},
     task::{StageOutcome, TaskEvent},
 };
@@ -221,6 +222,58 @@ async fn sessions_stats_and_dashboard(pool: PgPool) {
     let (_, f) = call(&app, "GET", "/api/factory", None).await;
     assert_eq!(f["name"], "workhub-dev");
     assert_eq!(f["stages"][1]["gate"], "spec-review");
+    assert_eq!(f["scorers"][0]["target"], "implementation");
+
+    // A scorer graded the session: it shows up on the session, the task, /scores and /scorers.
+    let score = ScoreId::for_session(session, "review-evidence");
+    let evs = [
+        ScoreEvent::ScoreStarted {
+            scorer: "review-evidence".into(),
+            target_session: session,
+            task_id: task,
+            agent: "spec".into(),
+            stage: "spec".into(),
+            model: Some("claude-haiku-5-5".into()),
+            pass_threshold: 0.6,
+            manual: false,
+        },
+        ScoreEvent::ScoreRecorded {
+            score: 0.4,
+            pass: false,
+            classification: Some("vague_evidence".into()),
+            rationale: "no file:line".into(),
+            cost_usd: 0.003,
+            usage: TokenUsage::default(),
+            duration_ms: 900,
+            transcript: None,
+        },
+    ];
+    for e in &evs {
+        append(&store, &score.stream_id(), NewEvent::from_domain(e, sys(task)).unwrap()).await;
+    }
+    wh_metrics::catch_up_all(&store).await.unwrap();
+
+    let (_, one) = call(&app, "GET", &format!("/api/sessions/{session}"), None).await;
+    assert_eq!(one["scores"][0]["classification"], "vague_evidence");
+    let (_, detail) = call(&app, "GET", &format!("/api/tasks/{task}"), None).await;
+    assert_eq!(detail["scores"][0]["pass"], false);
+    let (_, failing) = call(&app, "GET", "/api/scores?failing=true&scorer=review-evidence", None).await;
+    assert_eq!(failing[0]["task_title"], "t");
+    let (_, none) = call(&app, "GET", "/api/scores?scorer=test-evidence", None).await;
+    assert!(none.as_array().unwrap().is_empty());
+
+    let (st, sc) = call(&app, "GET", "/api/scorers", None).await;
+    assert_eq!(st, StatusCode::OK, "{sc}");
+    let list = sc["scorers"].as_array().unwrap();
+    assert_eq!(list.len(), 3, "every defined scorer is listed, run or not");
+    let re = list.iter().find(|x| x["id"] == "review-evidence").unwrap();
+    assert_eq!(re["definition"]["pass_threshold"], 0.6);
+    assert_eq!((re["stats"]["scored"].as_i64(), re["stats"]["pass_rate"].as_f64()), (Some(1), Some(0.0)));
+    assert!(list.iter().find(|x| x["id"] == "scope-discipline").unwrap()["stats"].is_null());
+    assert_eq!(sc["by_version"][0]["scored"], 1);
+
+    let (_, dash) = call(&app, "GET", "/api/dashboard?days=7", None).await;
+    assert_eq!((dash["totals"]["scores"].as_i64(), dash["totals"]["scorer_cost_usd"].as_f64()), (Some(1), Some(0.003)));
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]

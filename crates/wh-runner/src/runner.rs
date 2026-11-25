@@ -186,6 +186,7 @@ impl<R: AgentRuntime> Runner<R> {
             allowed_tools: spec.allowed_tools.clone(),
             with_user_mcp: spec.with_user_mcp,
             timeout: spec.timeout,
+            tools: None,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();

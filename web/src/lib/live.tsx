@@ -32,7 +32,7 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       p.timer = undefined
       for (const id of p.tasks) qc.invalidateQueries({ queryKey: ['task', id] })
       if (p.global) {
-        for (const key of ['tasks', 'sessions', 'stats', 'dashboard']) qc.invalidateQueries({ queryKey: [key] })
+        for (const key of ['tasks', 'sessions', 'stats', 'dashboard', 'scorers', 'scores']) qc.invalidateQueries({ queryKey: [key] })
       }
       p.tasks.clear()
       p.global = false
