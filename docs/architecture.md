@@ -321,7 +321,23 @@ MVP chạy **một binary** (`workhubd`) chứa mọi consumer dưới dạng to
 | **5. Tự cải tiến** ✅ | Improver + Inbox duyệt + so sánh theo factory_version | Proposal → PR → đo delta |
 | **6. Benchmarks** ✅ | Suite task cố định + check ẩn, chạy trên factory tại một git ref, so sánh run (proposal vs base) | Proposal → benchmark base/proposal → so sánh pass rate/cost trước khi duyệt |
 | **7. Docker sandbox** ✅ | Agent chạy trong container (image riêng, giới hạn tài nguyên, git chỉ đọc), cấu hình theo agent trong factory | Pipeline + benchmark chạy trong container, metrics ghi rõ sandbox |
-| **8. Mở rộng** | GitHub/Slack/Linear, NATS | — |
+| **8. GitHub (local)** | Ship stage push branch + mở PR bằng `gh`, theo dõi PR bằng polling (review, CI, merge), task từ issue có label, cycle time kickoff→PR→merge | Task đi tới PR merged, CI fail/yêu cầu sửa quay lại implement, dashboard có cycle time |
+| **9. Mở rộng** | Slack/Linear, NATS (khi chạy nhiều máy) | — |
+
+### Kế hoạch phase 8 (GitHub, giữ local-only) — chốt 2026-11-25
+
+Mục tiêu: khép vòng task → PR → merge để đo được phần quan trọng nhất (thời gian tới merge, số lần người yêu cầu sửa) và feed cho improver. Không dùng webhook: mọi thứ đi qua `gh` CLI + polling, nên vẫn chạy local, không cần mở port.
+
+1. **Cấu hình opt-in theo factory** (`github:` trong factory.yaml): `repo` (owner/name, mặc định lấy từ remote), `remote` (mặc định `origin`), `base` (branch đích của PR), `draft`, `labels`, `poll_interval_sec`, và tuỳ chọn `ship_gate` (gate của người trước khi push, vì push/mở PR là hành động ra bên ngoài). Không có block `github:` thì mọi thứ như phase 7 (task dừng ở branch local). Benchmark không bao giờ push.
+2. **Ship**: sau stage cuối (và gate nếu có), WorkHub (không phải agent) `git push <remote> wh/task/<id>` rồi `gh pr create` với title/body từ task + tóm tắt các stage → `TaskShipped{pr_url, pr_number, branch, commit}`. Idempotent: id PR ghi trong event, chạy lại thì tìm PR đã có cho branch (`gh pr list --head`) thay vì tạo mới. Lỗi push/gh → task blocked với lý do rõ ràng (`infra`/`env_setup`), resume được.
+3. **Theo dõi PR** (consumer/worker mới, chạy trong `wh foreman` / `wh serve --foreman`, tắt bằng `--no-github`): poll các task đã ship chưa đóng bằng `gh pr view --json state,reviews,statusCheckRollup,mergedAt,comments`, chỉ ghi event khi trạng thái đổi: `PrReviewed{reviewer, state, body}`, `PrChecksCompleted{conclusion, failed[]}`, `PrMerged{merged_at, merged_by}`, `PrClosed`. Event là nguồn sự thật, poller giữ trạng thái đã thấy bằng cách fold stream task (không cần bảng riêng).
+4. **Vòng làm lại từ PR**: CI fail hoặc review `CHANGES_REQUESTED` → Foreman đưa task về stage `implement` với feedback (log check fail / nội dung review), giới hạn bằng `max_rework_loops` như review agent; commit mới được push lên cùng branch (PR tự cập nhật). Ghi `HumanInterventionRecorded` cho mỗi review của người để đếm human load. `PrMerged` → task `done` (trạng thái `shipped` trước đó là "chờ merge").
+5. **Task từ GitHub issue**: poll `gh issue list --label <label>` (label cấu hình, mặc định `workhub`) → `TaskCreated{source: github, external_ref}`; id task xác định từ (repo, issue number) qua UUIDv5 + `NoStream` để không tạo trùng. Khi ship, PR body có `Closes #N`; comment link task lên issue (tuỳ chọn).
+6. **Metrics**: `tasks_view` thêm `pr_url`, `pr_state`, `shipped_at`, `first_review_at`, `merged_at`, `pr_rework_loops`; query cycle time (kickoff→PR, PR→first review, review→merge, kickoff→merge, p50/p95) trên Dashboard; improver observation thêm review comment của người và CI failure làm bằng chứng; trigger mới `pr_changes_requested_rate`.
+7. **UI/CLI/API**: link PR + trạng thái trên Runs/Run detail, ô cycle time trên Dashboard, `wh github check` (gh đã auth, repo/remote đúng), `wh github sync` (poll một lần), `wh task ship <task>` (ship tay/thử lại).
+8. **Kiểm chứng**: test dùng fake `gh` (script trong PATH trả JSON cố định) + bare git repo làm remote, không gọi GitHub thật trong test; chạy thật trên một repo GitHub thử nghiệm riêng (không phải repo WorkHub) với factory Haiku: task → PR → review yêu cầu sửa → rework → merge.
+
+Gộp thêm nếu còn thời gian: trang Agents trên UI, hot reload factory sau rollout (foreman nạp lại khi `ProposalRolledOut`).
 
 Nên **dogfood** từ phase 2: dùng WorkHub để phát triển chính WorkHub.
 
