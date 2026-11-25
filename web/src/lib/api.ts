@@ -416,6 +416,14 @@ export interface Transcript {
   lines: any[]
 }
 
+export interface Me {
+  auth_enabled: boolean
+  user: string | null
+}
+
+/** Fired when the server answers 401 (session expired or logged out elsewhere). */
+export const UNAUTHORIZED_EVENT = 'wh:unauthorized'
+
 export class ApiError extends Error {
   status: number
   constructor(status: number, message: string) {
@@ -432,11 +440,15 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   })
   const text = await res.text()
   const data = text ? JSON.parse(text) : null
+  if (res.status === 401 && !path.startsWith('/auth/')) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
   if (!res.ok) throw new ApiError(res.status, data?.error ?? `${res.status} ${res.statusText}`)
   return data as T
 }
 
 export const api = {
+  me: () => request<Me>('GET', '/auth/me'),
+  login: (username: string, password: string) => request<Me>('POST', '/auth/login', { username, password }),
+  logout: () => request<null>('POST', '/auth/logout'),
   tasks: (status?: string) => request<TaskSummary[]>('GET', `/tasks${status ? `?status=${status}` : ''}`),
   task: (id: string) => request<TaskDetail>('GET', `/tasks/${id}`),
   createTask: (b: { title: string; body?: string; pipeline?: boolean }) =>

@@ -26,7 +26,7 @@ fn factory() -> Factory {
 
 fn app(pool: &PgPool, factory: Option<Factory>) -> (Router, EventStore) {
     let store = EventStore::new(pool.clone());
-    let state = AppState { store: store.clone(), factory: factory.map(Arc::new), live: Live::detached(0), bench_dir: PathBuf::from("benchmarks") };
+    let state = AppState { store: store.clone(), factory: factory.map(Arc::new), live: Live::detached(0), bench_dir: PathBuf::from("benchmarks"), auth: Default::default() };
     (wh_api::app(state, None), store)
 }
 
@@ -423,7 +423,7 @@ async fn benchmark_suites_queue_and_runs(pool: PgPool) {
     .unwrap();
     std::fs::write(dir.path().join("broken.yaml"), "name: broken\n").unwrap();
     let store = EventStore::new(pool.clone());
-    let state = AppState { store: store.clone(), factory: None, live: Live::detached(0), bench_dir: dir.path().to_owned() };
+    let state = AppState { store: store.clone(), factory: None, live: Live::detached(0), bench_dir: dir.path().to_owned(), auth: Default::default() };
     let app = wh_api::app(state, None);
 
     let (st, suites) = call(&app, "GET", "/api/benchmarks/suites", None).await;
@@ -454,4 +454,221 @@ async fn benchmark_suites_queue_and_runs(pool: PgPool) {
     assert_eq!((st, cmp["comparable"].as_bool()), (StatusCode::OK, Some(true)));
     let (st, _) = call(&app, "GET", &format!("/api/benchmarks/{}", uuid::Uuid::now_v7()), None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+// ---------- auth (wh serve --auth) ----------
+
+fn auth_app(pool: &PgPool) -> (Router, EventStore) {
+    let store = EventStore::new(pool.clone());
+    let state = AppState {
+        store: store.clone(),
+        factory: None,
+        live: Live::detached(0),
+        bench_dir: PathBuf::from("benchmarks"),
+        auth: wh_api::auth::AuthConfig::new(true, Some("https://wh.example.com".into()), true),
+    };
+    (wh_api::app(state, None), store)
+}
+
+async fn raw(app: &Router, req: Request<Body>) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let res = app.clone().oneshot(req).await.unwrap();
+    let (status, headers) = (res.status(), res.headers().clone());
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        headers,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn login_req(user: &str, pw: &str, ip: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header("content-type", "application/json")
+        .header("x-real-ip", ip)
+        .body(Body::from(
+            json!({"username": user, "password": pw}).to_string(),
+        ))
+        .unwrap()
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn auth_login_actor_and_logout(pool: PgPool) {
+    wh_api::auth::add_user(&pool, "thai", "correct horse battery")
+        .await
+        .unwrap();
+    let (app, store) = auth_app(&pool);
+
+    // Public routes stay open; everything else needs a session.
+    assert_eq!(
+        call(&app, "GET", "/api/health", None).await.0,
+        StatusCode::OK
+    );
+    let (st, me) = call(&app, "GET", "/api/auth/me", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(me, json!({"auth_enabled": true, "user": null}));
+    assert_eq!(
+        call(&app, "GET", "/api/tasks", None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&app, "GET", "/api/events/stream", None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let (st, _, _) = raw(&app, login_req("thai", "wrong password!!", "1.1.1.1")).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    let (st, _, _) = raw(
+        &app,
+        login_req("nobody", "correct horse battery", "1.1.1.1"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    let (st, headers, body) =
+        raw(&app, login_req("thai", "correct horse battery", "1.1.1.1")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["user"], "thai");
+    let set_cookie = headers["set-cookie"].to_str().unwrap().to_owned();
+    assert!(
+        set_cookie.contains("HttpOnly")
+            && set_cookie.contains("SameSite=Strict")
+            && set_cookie.contains("Secure")
+    );
+    let cookie = set_cookie.split(';').next().unwrap().to_owned();
+
+    let authed = |method: &str, uri: &str, body: Option<Value>, origin: Option<&str>| {
+        let mut b = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("cookie", &cookie);
+        if let Some(o) = origin {
+            b = b.header("origin", o);
+        }
+        b.body(body.map(|v| Body::from(v.to_string())).unwrap_or_default())
+            .unwrap()
+    };
+
+    let (st, _, me) = raw(&app, authed("GET", "/api/auth/me", None, None)).await;
+    assert_eq!((st, me["user"].as_str()), (StatusCode::OK, Some("thai")));
+
+    // Writes from another origin are refused even with the cookie.
+    let (st, _, _) = raw(
+        &app,
+        authed(
+            "POST",
+            "/api/tasks",
+            Some(json!({"title": "x"})),
+            Some("https://evil.example.com"),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // Commands record the logged-in user as the actor.
+    let (st, _, created) = raw(
+        &app,
+        authed(
+            "POST",
+            "/api/tasks",
+            Some(json!({"title": "from the web"})),
+            Some("https://wh.example.com"),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let task: TaskId = created["task_id"].as_str().unwrap().parse().unwrap();
+    let events = store.read_stream(&task.stream_id()).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&events[0].meta.actor).unwrap(),
+        json!({"kind": "human", "user": "thai"})
+    );
+
+    let (st, headers, _) = raw(
+        &app,
+        authed(
+            "POST",
+            "/api/auth/logout",
+            None,
+            Some("https://wh.example.com"),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert!(
+        headers["set-cookie"]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0")
+    );
+    let (st, _, _) = raw(&app, authed("GET", "/api/tasks", None, None)).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "session is gone after logout");
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn auth_locks_out_after_repeated_failures(pool: PgPool) {
+    wh_api::auth::add_user(&pool, "thai", "correct horse battery")
+        .await
+        .unwrap();
+    let (app, _) = auth_app(&pool);
+    for _ in 0..5 {
+        assert_eq!(
+            raw(&app, login_req("thai", "nope nope nope", "2.2.2.2"))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    // Even the right password is refused from that client until the window passes...
+    assert_eq!(
+        raw(&app, login_req("thai", "correct horse battery", "2.2.2.2"))
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // ...but other clients are unaffected.
+    assert_eq!(
+        raw(&app, login_req("thai", "correct horse battery", "3.3.3.3"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn password_change_logs_out_everywhere(pool: PgPool) {
+    wh_api::auth::add_user(&pool, "thai", "correct horse battery")
+        .await
+        .unwrap();
+    assert!(
+        wh_api::auth::add_user(&pool, "thai", "another long password")
+            .await
+            .is_err()
+    );
+    let (app, _) = auth_app(&pool);
+    let (_, headers, _) = raw(&app, login_req("thai", "correct horse battery", "4.4.4.4")).await;
+    let cookie = headers["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    wh_api::auth::set_password(&pool, "thai", "a brand new password")
+        .await
+        .unwrap();
+    let req = Request::builder()
+        .uri("/api/tasks")
+        .header("cookie", cookie)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(raw(&app, req).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        raw(&app, login_req("thai", "a brand new password", "4.4.4.4"))
+            .await
+            .0,
+        StatusCode::OK
+    );
 }

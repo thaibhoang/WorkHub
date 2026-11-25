@@ -23,6 +23,10 @@ tracing.workspace = true
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 futures-util = "0.3"
+argon2 = "0.5"
+rand = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

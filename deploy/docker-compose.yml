@@ -1,0 +1,58 @@
+# WorkHub on the server: ~/workhub/docker-compose.yml (copied by deploy/deploy.sh).
+# Secrets and settings come from ~/workhub/.env (see deploy/env.example).
+# The app joins the nginx network of the `projects` stack as host `workhub`;
+# nothing is published on the host.
+name: workhub
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: workhub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: workhub
+    # Small box: keep Postgres lean.
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=50"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workhub"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 256m
+
+  app:
+    image: ${WH_IMAGE:-workhub:latest}
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://workhub:${POSTGRES_PASSWORD}@db:5432/workhub
+      WH_PUBLIC_URL: ${WH_PUBLIC_URL:-https://workhub.buihoangthai.com}
+    volumes:
+      - data:/data            # worktrees, transcripts, bench runs
+      - repos:/repos          # repos the factories work on
+      - home:/home/node       # claude / gh / git / ssh config of the agents
+    networks:
+      default:
+      web:
+        aliases: [workhub]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+volumes:
+  pgdata:
+  data:
+  repos:
+  home:
+
+networks:
+  web:
+    external: true
+    name: projects_app_network
