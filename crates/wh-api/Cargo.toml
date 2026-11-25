@@ -9,6 +9,7 @@ wh-core.workspace = true
 wh-eventstore.workspace = true
 wh-metrics.workspace = true
 wh-factory.workspace = true
+wh-improver.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

@@ -23,10 +23,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
-use wh_core::{SessionId, TaskId, task::TaskSource};
+use wh_core::{ProposalId, SessionId, TaskId, task::TaskSource};
 use wh_eventstore::EventStore;
 use wh_factory::Factory;
-use wh_metrics::{queries, scores, sessions::SessionFactsProjection};
+use wh_metrics::{proposals, queries, scores, sessions::SessionFactsProjection};
 
 pub use live::Live;
 
@@ -61,6 +61,11 @@ pub fn api(state: AppState) -> Router {
         .route("/sessions/{id}/transcript", get(get_transcript))
         .route("/scorers", get(list_scorers))
         .route("/scores", get(list_scores))
+        .route("/proposals", get(list_proposals).post(request_improvement))
+        .route("/proposals/{id}", get(get_proposal))
+        .route("/proposals/{id}/decide", post(decide_proposal))
+        .route("/proposals/{id}/apply", post(apply_proposal))
+        .route("/improvement", get(improvement))
         .route("/stats", get(stats))
         .route("/dashboard", get(dashboard))
         .route("/factory", get(factory))
@@ -138,6 +143,19 @@ impl From<CommandError> for ApiError {
             CommandError::InvalidState(_) => StatusCode::UNPROCESSABLE_ENTITY,
             CommandError::Conflict => StatusCode::CONFLICT,
             CommandError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self(code, format!("{e:#}"))
+    }
+}
+
+impl From<wh_improver::commands::CommandError> for ApiError {
+    fn from(e: wh_improver::commands::CommandError) -> Self {
+        use wh_improver::commands::CommandError as E;
+        let code = match &e {
+            E::NotFound(_) => StatusCode::NOT_FOUND,
+            E::InvalidState(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            E::Conflict => StatusCode::CONFLICT,
+            E::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self(code, format!("{e:#}"))
     }
@@ -326,6 +344,100 @@ async fn list_scores(State(s): State<AppState>, Query(q): Query<ScoresQuery>) ->
         failing: q.failing,
     };
     Ok(Json(scores::scores(s.pool(), &filter, q.limit.unwrap_or(100).clamp(1, 1000)).await?))
+}
+
+// ---------- self-improvement ----------
+
+#[derive(Deserialize)]
+struct ProposalsQuery {
+    /// A status, or `inbox` (open + approved-not-rolled-out).
+    status: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn list_proposals(State(s): State<AppState>, Query(q): Query<ProposalsQuery>) -> ApiResult<Vec<proposals::ProposalRow>> {
+    let status = q.status.as_deref().filter(|s| !s.is_empty() && *s != "all");
+    Ok(Json(proposals::proposals(s.pool(), None, status, q.limit.unwrap_or(100).clamp(1, 1000)).await?))
+}
+
+#[derive(Serialize)]
+struct Requested {
+    proposal_id: ProposalId,
+    message: String,
+}
+
+async fn request_improvement(
+    State(s): State<AppState>,
+    Json(b): Json<ImproveBody>,
+) -> Result<(StatusCode, Json<Requested>), ApiError> {
+    let f = s.factory.as_deref().ok_or_else(|| ApiError::bad_request("the server was started without a factory"))?;
+    if f.improvement.is_none() {
+        return Err(ApiError::bad_request(format!("factory '{}' has no `improvement:` section", f.name)));
+    }
+    let proposal_id = wh_improver::commands::request(&s.store, local_user(), &f.name, b.focus).await?;
+    let message = "improver run requested; it runs in `wh serve --foreman` or `wh improver`".to_owned();
+    Ok((StatusCode::ACCEPTED, Json(Requested { proposal_id, message })))
+}
+
+async fn get_proposal(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<ProposalDetail> {
+    let pid: ProposalId = parse_id(&id, "proposal")?;
+    let events = s.store.read_stream(&pid.stream_id()).await?;
+    if events.is_empty() {
+        return Err(ApiError::not_found("proposal"));
+    }
+    let proposal = proposals::proposal(s.pool(), pid.0).await?;
+    let mut evidence = Vec::new();
+    if let Some(p) = &proposal {
+        for sid in p.evidence.as_array().into_iter().flatten().filter_map(|v| v.as_str()?.parse::<Uuid>().ok()) {
+            if let Some(row) = queries::session(s.pool(), sid).await? {
+                evidence.push(row);
+            }
+        }
+    }
+    let (mut before, mut after) = (None, None);
+    if let Some(p) = &proposal {
+        let after_version = p.rolled_out_version.as_ref();
+        for v in proposals::version_stats(s.pool(), Some(&p.factory)).await? {
+            if Some(&v.factory_version) == p.base_factory_version.as_ref() {
+                before = Some(v);
+            } else if Some(&v.factory_version) == after_version {
+                after = Some(v);
+            }
+        }
+    }
+    Ok(Json(ProposalDetail { proposal, events: events.iter().map(EventDto::from).collect(), evidence, before, after }))
+}
+
+async fn decide_proposal(State(s): State<AppState>, Path(id): Path<String>, Json(b): Json<GateBody>) -> ApiResult<Ok_> {
+    let pid = parse_id(&id, "proposal")?;
+    wh_improver::commands::decide(&s.store, local_user(), pid, b.approved, b.comment).await?;
+    Ok(ok(if b.approved { "proposal approved" } else { "proposal rejected" }))
+}
+
+async fn apply_proposal(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Ok_> {
+    let version = wh_improver::commands::apply(&s.store, local_user(), parse_id(&id, "proposal")?).await?;
+    Ok(ok(format!("rolled out as factory version {version}; restart the foreman to use it")))
+}
+
+#[derive(Serialize)]
+struct Improvement {
+    factory: Option<String>,
+    current_version: Option<String>,
+    config: Option<ImprovementDto>,
+    stats: proposals::ImproverStats,
+    versions: Vec<proposals::VersionStats>,
+}
+
+async fn improvement(State(s): State<AppState>) -> ApiResult<Improvement> {
+    let f = s.factory.as_deref();
+    Ok(Json(Improvement {
+        factory: f.map(|f| f.name.clone()),
+        current_version: f.map(|f| f.version.clone()),
+        config: f.and_then(|f| f.improvement.as_ref()).map(ImprovementDto::from),
+        // All factories, like the proposals list (version hashes are unique per factory).
+        stats: proposals::improver_stats(s.pool(), None).await?,
+        versions: proposals::version_stats(s.pool(), None).await?,
+    }))
 }
 
 // ---------- metrics ----------

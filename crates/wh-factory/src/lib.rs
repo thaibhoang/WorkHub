@@ -20,6 +20,12 @@ const DEFAULT_SCORER_MODEL: &str = "claude-haiku-5-5";
 const DEFAULT_SCORER_BUDGET_USD: f64 = 0.25;
 const DEFAULT_SCORER_TIMEOUT_MIN: u64 = 5;
 const DEFAULT_PASS_THRESHOLD: f64 = 0.7;
+const DEFAULT_IMPROVER_MODEL: &str = "claude-sonnet-5-5";
+const DEFAULT_IMPROVER_BUDGET_USD: f64 = 2.0;
+const DEFAULT_IMPROVER_TIMEOUT_MIN: u64 = 20;
+const DEFAULT_WINDOW_DAYS: u32 = 14;
+const DEFAULT_MIN_SESSIONS: u64 = 5;
+const DEFAULT_MAX_OPEN_PROPOSALS: u32 = 3;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +42,32 @@ struct FactoryFile {
     agents: BTreeMap<String, AgentFile>,
     #[serde(default)]
     scorers: Vec<ScorerFile>,
+    improvement: Option<ImprovementFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImprovementFile {
+    prompt: PathBuf,
+    model: Option<String>,
+    budget_usd: Option<f64>,
+    timeout_min: Option<u64>,
+    window_days: Option<u32>,
+    min_sessions: Option<u64>,
+    interval_hours: Option<u64>,
+    max_open_proposals: Option<u32>,
+    allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    triggers: Vec<TriggerFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TriggerFile {
+    metric: TriggerMetric,
+    stage: Option<String>,
+    scorer: Option<String>,
+    above: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,8 +174,71 @@ pub struct Scorer {
     pub include_failed: bool,
 }
 
+/// Metric a trigger watches. Rates are 0..=1 over finished sessions of the
+/// current factory version within the improvement window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerMetric {
+    /// Failed / finished sessions of `stage`.
+    StageFailureRate,
+    /// Sessions of `stage` whose verdict was REJECT / finished sessions.
+    StageRejectRate,
+    /// Average session cost of `stage` in USD.
+    StageAvgCostUsd,
+    /// Failing / scored results of `scorer`.
+    ScorerFailRate,
+}
+
+impl TriggerMetric {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::StageFailureRate => "stage_failure_rate",
+            Self::StageRejectRate => "stage_reject_rate",
+            Self::StageAvgCostUsd => "stage_avg_cost_usd",
+            Self::ScorerFailRate => "scorer_fail_rate",
+        }
+    }
+}
+
+/// Run the improver when `metric` (for `subject`: a stage or scorer id) exceeds `above`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trigger {
+    pub metric: TriggerMetric,
+    pub subject: String,
+    pub above: f64,
+}
+
+impl Trigger {
+    /// Stable key, e.g. `stage_failure_rate:implement>0.25`.
+    pub fn key(&self) -> String {
+        format!("{}:{}>{}", self.metric.as_str(), self.subject, self.above)
+    }
+}
+
+/// Self-improvement settings (`improvement:` in factory.yaml).
+#[derive(Debug, Clone)]
+pub struct Improvement {
+    /// Improver instructions (prompt file contents).
+    pub prompt: String,
+    pub model: String,
+    pub budget_usd: f64,
+    pub timeout: Duration,
+    /// Days of history the improver observes.
+    pub window_days: u32,
+    /// Don't run (automatically) with fewer finished sessions than this.
+    pub min_sessions: u64,
+    /// Run periodically when there is new data (None = triggers / manual only).
+    pub interval_hours: Option<u64>,
+    /// No automatic run while this many proposals are queued, running or awaiting review.
+    pub max_open_proposals: u32,
+    pub allowed_tools: Vec<String>,
+    pub triggers: Vec<Trigger>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Factory {
+    /// Canonical path of factory.yaml.
+    pub path: PathBuf,
     pub name: String,
     /// Content hash of factory.yaml + agent prompts (12 hex chars).
     pub version: String,
@@ -153,6 +248,7 @@ pub struct Factory {
     pub stages: Vec<Stage>,
     pub agents: BTreeMap<String, Agent>,
     pub scorers: Vec<Scorer>,
+    pub improvement: Option<Improvement>,
 }
 
 impl Factory {
@@ -240,12 +336,63 @@ impl Factory {
             });
         }
 
+        let improvement = match &file.improvement {
+            None => None,
+            Some(im) => {
+                let prompt_path = base.join(&im.prompt);
+                let prompt = std::fs::read_to_string(&prompt_path)
+                    .with_context(|| format!("improvement: read prompt {}", prompt_path.display()))?;
+                hasher.update(b"improver:");
+                hasher.update(prompt.as_bytes());
+                let budget_usd = im.budget_usd.unwrap_or(DEFAULT_IMPROVER_BUDGET_USD);
+                ensure!(budget_usd > 0.0, "improvement: budget_usd must be > 0");
+                ensure!(im.interval_hours != Some(0), "improvement: interval_hours must be > 0");
+                let window_days = im.window_days.unwrap_or(DEFAULT_WINDOW_DAYS);
+                ensure!(window_days > 0, "improvement: window_days must be > 0");
+                let mut triggers = Vec::new();
+                for t in &im.triggers {
+                    let m = t.metric.as_str();
+                    let subject = match t.metric {
+                        TriggerMetric::ScorerFailRate => {
+                            ensure!(t.stage.is_none(), "trigger {m}: use `scorer`, not `stage`");
+                            let id = t.scorer.clone().with_context(|| format!("trigger {m}: `scorer` is required"))?;
+                            ensure!(scorer_ids.contains(id.as_str()), "trigger {m}: unknown scorer '{id}'");
+                            id
+                        }
+                        _ => {
+                            ensure!(t.scorer.is_none(), "trigger {m}: use `stage`, not `scorer`");
+                            let id = t.stage.clone().with_context(|| format!("trigger {m}: `stage` is required"))?;
+                            ensure!(ids.contains(id.as_str()), "trigger {m}: unknown stage '{id}'");
+                            id
+                        }
+                    };
+                    if m.ends_with("_rate") {
+                        ensure!((0.0..1.0).contains(&t.above), "trigger {m}: `above` must be within 0..1");
+                    }
+                    triggers.push(Trigger { metric: t.metric, subject, above: t.above });
+                }
+                Some(Improvement {
+                    prompt,
+                    model: im.model.clone().or_else(|| d.model.clone()).unwrap_or_else(|| DEFAULT_IMPROVER_MODEL.into()),
+                    budget_usd,
+                    timeout: Duration::from_secs(60 * im.timeout_min.unwrap_or(DEFAULT_IMPROVER_TIMEOUT_MIN)),
+                    window_days,
+                    min_sessions: im.min_sessions.unwrap_or(DEFAULT_MIN_SESSIONS),
+                    interval_hours: im.interval_hours,
+                    max_open_proposals: im.max_open_proposals.unwrap_or(DEFAULT_MAX_OPEN_PROPOSALS),
+                    allowed_tools: im.allowed_tools.clone().unwrap_or_default(),
+                    triggers,
+                })
+            }
+        };
+
         let repo_path = base.join(&file.repo);
         let repo = std::fs::canonicalize(&repo_path)
             .with_context(|| format!("repo {} not found", repo_path.display()))?;
         let version = hasher.finalize().iter().take(6).map(|b| format!("{b:02x}")).collect();
 
         Ok(Self {
+            path: std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?,
             name: file.name,
             version,
             repo,
@@ -258,6 +405,7 @@ impl Factory {
                 .collect(),
             agents,
             scorers,
+            improvement,
         })
     }
 
@@ -318,6 +466,12 @@ agents:
   b: { prompt: agents/b.md, budget_usd: 0.5, model: claude-haiku-5-5 }
 scorers:
   - { id: s1, target: a, prompt: scorers/s.md, sampling_rate: 0.5 }
+improvement:
+  prompt: scorers/s.md
+  interval_hours: 24
+  triggers:
+    - { metric: stage_failure_rate, stage: impl, above: 0.25 }
+    - { metric: scorer_fail_rate, scorer: s1, above: 0.4 }
 "#;
 
     #[test]
@@ -339,6 +493,12 @@ scorers:
         assert_eq!(sc.model, "claude-haiku-5-5");
         assert_eq!(f.scorers_for("a").count(), 1);
         assert_eq!(f.scorers_for("b").count(), 0);
+        let im = f.improvement.as_ref().unwrap();
+        assert_eq!((im.window_days, im.min_sessions, im.interval_hours), (14, 5, Some(24)));
+        assert_eq!(im.model, "claude-sonnet-5-5");
+        assert_eq!(im.triggers[0].key(), "stage_failure_rate:impl>0.25");
+        assert_eq!(im.triggers[1].subject, "s1");
+        assert!(f.path.is_absolute());
     }
 
     #[test]
@@ -363,6 +523,11 @@ scorers:
             ("unknown field", OK.replace("gate: spec-review", "gaet: x")),
             ("unknown target agent", OK.replace("target: a", "target: zz")),
             ("sampling_rate", OK.replace("sampling_rate: 0.5", "sampling_rate: 2")),
+            ("unknown stage 'zz'", OK.replace("stage: impl, above", "stage: zz, above")),
+            ("unknown scorer", OK.replace("scorer: s1, above", "scorer: nope, above")),
+            ("use `scorer`, not `stage`", OK.replace("scorer: s1, above", "stage: impl, above")),
+            ("within 0..1", OK.replace("above: 0.25", "above: 2")),
+            ("unknown variant", OK.replace("metric: stage_failure_rate", "metric: vibes")),
         ];
         for (needle, yaml) in cases {
             let dir = tempfile::tempdir().unwrap();

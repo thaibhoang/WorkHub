@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { ClipboardCheck, Factory as FactoryIcon, Inbox as InboxIcon, LayoutDashboard, ListTodo, Moon, Sun } from 'lucide-react'
+import { ClipboardCheck, Factory as FactoryIcon, Inbox as InboxIcon, LayoutDashboard, ListTodo, Moon, Sparkles, Sun } from 'lucide-react'
 import { lazy, Suspense, useState } from 'react'
 import { NavLink, Route, Routes } from 'react-router'
 import { Button } from '@/components/ui/button'
@@ -7,7 +7,9 @@ import { api } from '@/lib/api'
 import { useLive } from '@/lib/live'
 import { cn } from '@/lib/utils'
 import FactoryPage from '@/pages/Factory'
+import Improvement from '@/pages/Improvement'
 import Inbox from '@/pages/Inbox'
+import ProposalDetail from '@/pages/ProposalDetail'
 import RunDetail from '@/pages/RunDetail'
 import Runs from '@/pages/Runs'
 import Scorers from '@/pages/Scorers'
@@ -26,6 +28,8 @@ export default function App() {
           <Route path="/inbox" element={<Inbox />} />
           <Route path="/dashboard" element={<Suspense><Dashboard /></Suspense>} />
           <Route path="/scorers" element={<Scorers />} />
+          <Route path="/improvement" element={<Improvement />} />
+          <Route path="/proposals/:id" element={<ProposalDetail />} />
           <Route path="/factory" element={<FactoryPage />} />
           <Route path="*" element={<p className="text-muted-foreground">Not found.</p>} />
         </Routes>
@@ -36,12 +40,15 @@ export default function App() {
 
 function Sidebar() {
   const { data: tasks } = useQuery({ queryKey: ['tasks'], queryFn: () => api.tasks() })
-  const inbox = tasks?.filter((t) => t.status === 'awaiting_gate' || t.status === 'blocked').length ?? 0
+  const { data: proposals } = useQuery({ queryKey: ['proposals', 'inbox'], queryFn: () => api.proposals('inbox') })
+  const inbox =
+    (tasks?.filter((t) => t.status === 'awaiting_gate' || t.status === 'blocked').length ?? 0) + (proposals?.length ?? 0)
   const items = [
     { to: '/', label: 'Runs', icon: ListTodo, end: true },
     { to: '/inbox', label: 'Inbox', icon: InboxIcon, count: inbox },
     { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { to: '/scorers', label: 'Scorers', icon: ClipboardCheck },
+    { to: '/improvement', label: 'Improvement', icon: Sparkles },
     { to: '/factory', label: 'Factory', icon: FactoryIcon },
   ]
   return (

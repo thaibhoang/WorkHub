@@ -11,8 +11,10 @@ use wh_core::{
 use wh_eventstore::{EventStore, Subscription};
 use wh_factory::Factory;
 use wh_foreman::{Dispatch, Foreman};
-use wh_core::SessionId;
+use wh_core::{ProposalId, SessionId};
+use wh_improver::{ImproverConfig, ImproverService, RunResult};
 use wh_metrics::{
+    proposals::{self, ProposalsProjection},
     scores::{self, ScoreFilter, ScoreResultsProjection},
     sessions::SessionFactsProjection,
     tasks::TasksProjection,
@@ -55,6 +57,9 @@ enum Cmd {
         /// Do not run the factory's scorers alongside the pipeline
         #[arg(long)]
         no_scorers: bool,
+        /// Do not run the self-improvement agent (requests, triggers, schedule)
+        #[arg(long)]
+        no_improver: bool,
     },
     /// Grade finished agent sessions with the factory's scorers (LLM-as-judge) until Ctrl+C
     Scorer {
@@ -99,9 +104,52 @@ enum Cmd {
         /// With --foreman: do not run the factory's scorers
         #[arg(long)]
         no_scorers: bool,
+        /// With --foreman: do not run the self-improvement agent
+        #[arg(long)]
+        no_improver: bool,
         /// Built UI to serve at / (skipped if missing)
         #[arg(long, env = "WH_WEB_DIR", default_value = "web/dist")]
         web_dir: PathBuf,
+    },
+    /// Run the self-improvement agent once now (or --dry-run to print what it would see)
+    Improve {
+        #[arg(long, env = "WH_FACTORY", default_value = "factory/factory.yaml")]
+        factory: PathBuf,
+        /// Hint for the improver, e.g. "why does code review reject so often?"
+        #[arg(long)]
+        focus: Option<String>,
+        /// Print the observation report only (no agent run, no cost)
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
+        claude_bin: PathBuf,
+    },
+    /// Self-improvement daemon: run requested improvements, evaluate triggers and
+    /// the schedule, detect rollouts, until Ctrl+C
+    Improver {
+        #[arg(long, env = "WH_FACTORY", default_value = "factory/factory.yaml")]
+        factory: PathBuf,
+        #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
+        claude_bin: PathBuf,
+    },
+    /// List improvement proposals, newest first
+    Proposals {
+        /// requested | running | open | no_proposal | failed | approved | rejected | rolled_out | inbox
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+    },
+    /// Review a proposal: show, approve, reject, apply
+    Proposal {
+        #[command(subcommand)]
+        cmd: ProposalCmd,
+    },
+    /// Pipeline metrics per factory_version (before/after a workflow change)
+    Versions {
+        /// Only tasks of this factory (name)
+        #[arg(long)]
+        factory: Option<String>,
     },
     /// Approve or reject a task waiting at a human gate
     Gate {
@@ -181,6 +229,27 @@ enum ScoreCmd {
         #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
         claude_bin: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum ProposalCmd {
+    Show { id: ProposalId },
+    /// Approve; with --apply also cherry-pick it onto the factory repo right away
+    Approve {
+        id: ProposalId,
+        #[arg(long)]
+        comment: Option<String>,
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Reject with a comment the improver will read next time
+    Reject {
+        id: ProposalId,
+        #[arg(long)]
+        comment: String,
+    },
+    /// Cherry-pick an approved proposal onto the factory repo's current branch
+    Apply { id: ProposalId },
 }
 
 #[derive(Subcommand)]
@@ -285,7 +354,9 @@ async fn main() -> Result<()> {
         .database_url
         .or_else(|| std::env::var("DATABASE_URL").ok())
         .ok_or_else(|| anyhow::anyhow!("DATABASE_URL is not set (see .env.example)"))?;
-    let pool = PgPoolOptions::new().max_connections(5).connect(&url).await?;
+    // Every following consumer (4 projections, SSE, foreman, scorer, improver) holds a
+    // LISTEN connection for its lifetime, so leave plenty of room for queries.
+    let pool = PgPoolOptions::new().max_connections(20).connect(&url).await?;
     let store = EventStore::new(pool.clone());
 
     match cli.cmd {
@@ -349,6 +420,20 @@ async fn main() -> Result<()> {
                     st.on_reject.as_ref().map(|t| format!("  on_reject → {t}")).unwrap_or_default(),
                 );
             }
+            if let Some(im) = &f.improvement {
+                println!(
+                    "\nimprovement: model {}  budget ${}  window {}d  min sessions {}  schedule {}  max open {}",
+                    im.model,
+                    im.budget_usd,
+                    im.window_days,
+                    im.min_sessions,
+                    im.interval_hours.map(|h| format!("every {h}h")).unwrap_or_else(|| "off".into()),
+                    im.max_open_proposals
+                );
+                for t in &im.triggers {
+                    println!("  trigger {} for {} > {}", t.metric.as_str(), t.subject, t.above);
+                }
+            }
             if !f.scorers.is_empty() {
                 println!("\nscorers:");
                 for sc in &f.scorers {
@@ -364,15 +449,110 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Foreman { factory, max_parallel, claude_bin, no_scorers } => {
+        Cmd::Foreman { factory, max_parallel, claude_bin, no_scorers, no_improver } => {
             let f = Factory::load(&factory)?;
             println!("foreman for factory '{}' (version {}), Ctrl+C to stop", f.name, f.version);
             let scorer = run_scorer(&store, f.clone(), max_parallel, claude_bin.clone(), !no_scorers);
-            let (a, b, c) =
-                tokio::join!(run_foreman(&store, f, max_parallel, claude_bin), run_projections(&store), scorer);
+            let improver = run_improver(&store, f.clone(), claude_bin.clone(), !no_improver);
+            let (a, b, c, d) = tokio::join!(
+                run_foreman(&store, f, max_parallel, claude_bin),
+                run_projections(&store),
+                scorer,
+                improver
+            );
             a?;
             b?;
             c?;
+            d?;
+        }
+        Cmd::Improver { factory, claude_bin } => {
+            let f = Factory::load(&factory)?;
+            anyhow::ensure!(f.improvement.is_some(), "factory '{}' has no `improvement:` section", f.name);
+            println!("improver for factory '{}' (version {}), Ctrl+C to stop", f.name, f.version);
+            let (a, b) = tokio::join!(run_improver(&store, f, claude_bin, true), run_projections(&store));
+            a?;
+            b?;
+        }
+        Cmd::Improve { factory, focus, dry_run, claude_bin } => {
+            let f = Factory::load(&factory)?;
+            wh_metrics::catch_up_all(&store).await?;
+            let cfg = ImproverConfig { data_dir: data_dir() };
+            let svc = ImproverService::new(store.clone(), f, ClaudeCode::new(claude_bin), cfg, wh_improver::Dispatch::Inline)?;
+            if dry_run {
+                println!("{}", wh_improver::render(&svc.observe().await?));
+                return Ok(());
+            }
+            println!("running the improver for factory '{}' (version {})…", svc.factory().name, svc.factory().version);
+            let (id, r) = svc.run_now(local_user(), focus).await?;
+            match r {
+                RunResult::Proposed { title, files, factory_version, cost_usd } => println!(
+                    "proposal {id}: {title}\n  files: {}\n  → factory version {factory_version}  (${cost_usd:.4})\n\
+                     review it: wh proposal show {id}",
+                    files.join(", ")
+                ),
+                RunResult::NoProposal { reason, cost_usd } => println!("no proposal: {reason}  (${cost_usd:.4})"),
+                RunResult::Failed { message, cost_usd } => println!("improver failed: {message}  (${cost_usd:.4})"),
+                RunResult::NotPending => println!("{id} was already handled"),
+            }
+        }
+        Cmd::Proposals { status, limit } => {
+            wh_metrics::catch_up_all(&store).await?;
+            println!("{:<36}  {:<11}  {:>8}  {:<20}  title / note", "proposal", "status", "cost$", "trigger");
+            for p in proposals::proposals(&pool, None, status.as_deref(), limit).await? {
+                println!(
+                    "{}  {:<11}  {:>8.4}  {:<20}  {}",
+                    p.proposal_id,
+                    p.status,
+                    p.cost_usd,
+                    truncate(&p.trigger, 20),
+                    p.title.as_deref().or(p.message.as_deref()).map(first_line).unwrap_or("-"),
+                );
+            }
+        }
+        Cmd::Proposal { cmd } => match cmd {
+            ProposalCmd::Show { id } => show_proposal(&store, id).await?,
+            ProposalCmd::Approve { id, comment, apply } => {
+                wh_improver::commands::decide(&store, local_user(), id, true, comment).await?;
+                println!("approved");
+                if apply {
+                    let v = wh_improver::commands::apply(&store, local_user(), id).await?;
+                    println!("applied: factory version is now {v}; restart the foreman to use it");
+                } else {
+                    println!("roll it out with: wh proposal apply {id}");
+                }
+            }
+            ProposalCmd::Reject { id, comment } => {
+                wh_improver::commands::decide(&store, local_user(), id, false, Some(comment)).await?;
+                println!("rejected");
+            }
+            ProposalCmd::Apply { id } => {
+                let v = wh_improver::commands::apply(&store, local_user(), id).await?;
+                println!("applied: factory version is now {v}; restart the foreman to use it");
+            }
+        },
+        Cmd::Versions { factory } => {
+            wh_metrics::catch_up_all(&store).await?;
+            println!(
+                "{:<12}  {:>5}  {:>8}  {:>6}  {:>7}  {:>7}  {:>8}  {:>8}  {:>9}  {:>11}  first seen",
+                "version", "tasks", "sessions", "fail%", "reject%", "retries", "avg$", "p50", "tool err%", "scorer pass"
+            );
+            let pct = |x: Option<f64>| x.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "-".into());
+            for v in proposals::version_stats(&pool, factory.as_deref()).await? {
+                println!(
+                    "{:<12}  {:>5}  {:>8}  {:>6}  {:>7}  {:>7}  {:>8.4}  {:>8}  {:>9}  {:>11}  {}",
+                    v.factory_version,
+                    v.tasks,
+                    v.sessions,
+                    pct(v.fail_rate),
+                    pct(v.reject_rate),
+                    v.retries,
+                    v.avg_cost_usd.unwrap_or(0.0),
+                    v.p50_duration_ms.map(fmt_ms).unwrap_or_else(|| "-".into()),
+                    pct(v.tool_error_rate),
+                    if v.scored > 0 { format!("{} n={}", pct(v.score_pass_rate), v.scored) } else { "-".into() },
+                    v.first_at.format("%Y-%m-%d %H:%M"),
+                );
+            }
         }
         Cmd::Scorer { factory, max_parallel, claude_bin } => {
             let f = Factory::load(&factory)?;
@@ -425,7 +605,7 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Serve { addr, factory, foreman, max_parallel, claude_bin, no_scorers, web_dir } => {
+        Cmd::Serve { addr, factory, foreman, max_parallel, claude_bin, no_scorers, no_improver, web_dir } => {
             let f = match Factory::load(&factory) {
                 Ok(f) => Some(f),
                 Err(e) if !foreman => {
@@ -451,8 +631,9 @@ async fn main() -> Result<()> {
                     (true, Some(f)) => {
                         println!("foreman for factory '{}' (version {})", f.name, f.version);
                         let scorer = run_scorer(&store, f.clone(), max_parallel, claude_bin.clone(), !no_scorers);
-                        let (a, b) = tokio::join!(run_foreman(&store, f, max_parallel, claude_bin), scorer);
-                        a.and(b)
+                        let improver = run_improver(&store, f.clone(), claude_bin.clone(), !no_improver);
+                        let (a, b, c) = tokio::join!(run_foreman(&store, f, max_parallel, claude_bin), scorer, improver);
+                        a.and(b).and(c)
                     }
                     _ => Ok(()),
                 }
@@ -592,17 +773,137 @@ async fn run_scorer(store: &EventStore, f: Factory, max_parallel: usize, claude_
     Subscription::new(store.clone()).run(&mut svc, ctrl_c()).await
 }
 
+/// Improver until Ctrl+C: recover, then run requests as they arrive and evaluate
+/// triggers / schedule every few minutes.
+async fn run_improver(store: &EventStore, f: Factory, claude_bin: PathBuf, enabled: bool) -> Result<()> {
+    if !enabled || f.improvement.is_none() {
+        return Ok(());
+    }
+    let im = f.improvement.as_ref().expect("checked");
+    let mut how = vec!["on request".to_owned()];
+    if !im.triggers.is_empty() {
+        how.push(format!("{} trigger(s)", im.triggers.len()));
+    }
+    if let Some(h) = im.interval_hours {
+        how.push(format!("every {h}h with new sessions"));
+    }
+    println!("improver: {} (model {})", how.join(", "), im.model);
+    // One improvement at a time: each one reads the outcome of the previous.
+    let dispatch = wh_improver::Dispatch::Spawn(std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+    let cfg = ImproverConfig { data_dir: data_dir() };
+    let mut svc = ImproverService::new(store.clone(), f, ClaudeCode::new(claude_bin), cfg, dispatch)?;
+    let (failed, pending) = svc.recover().await?;
+    if failed > 0 {
+        println!("{failed} interrupted improver run(s) marked failed");
+    }
+    wh_metrics::catch_up_all(store).await?;
+    for id in svc.detect_rollouts().await? {
+        println!("proposal {id} is live in factory version {}", svc.factory().version);
+    }
+    for id in pending {
+        svc.dispatch(id).await;
+    }
+    let ticker = svc.clone();
+    let ticks = async move {
+        let mut every = tokio::time::interval(Duration::from_secs(5 * 60));
+        let stop = ctrl_c();
+        tokio::pin!(stop);
+        loop {
+            tokio::select! {
+                _ = &mut stop => return Ok::<(), anyhow::Error>(()),
+                _ = every.tick() => match ticker.tick().await {
+                    Ok(reqs) => reqs.iter().for_each(|(id, why)| println!("improver requested {id}: {why}")),
+                    Err(e) => eprintln!("improver tick failed: {e:#}"),
+                },
+            }
+        }
+    };
+    let sub = Subscription::new(store.clone());
+    let (a, b) = tokio::join!(sub.run(&mut svc, ctrl_c()), ticks);
+    a.and(b)
+}
+
+async fn show_proposal(store: &EventStore, id: ProposalId) -> Result<()> {
+    wh_metrics::catch_up_all(store).await?;
+    let pool = store.pool();
+    let p = proposals::proposal(pool, id.0).await?.context("proposal not found")?;
+    println!("{}  [{}]", p.title.as_deref().unwrap_or("(no proposal)"), p.status);
+    println!(
+        "trigger: {}  requested by {} {}  cost ${:.4}",
+        p.trigger,
+        p.requested_by,
+        p.requested_at.format("%Y-%m-%d %H:%M"),
+        p.cost_usd
+    );
+    if let Some(f) = &p.focus {
+        println!("focus: {f}");
+    }
+    if let Some(v) = &p.base_factory_version {
+        println!(
+            "factory version: {v} → {}{}",
+            p.proposed_factory_version.as_deref().unwrap_or("-"),
+            p.branch.as_deref().map(|b| format!("  (branch {b})")).unwrap_or_default()
+        );
+    }
+    for (label, text) in [
+        ("rationale", &p.rationale),
+        ("expected impact", &p.expected_impact),
+        ("note", &p.message),
+        ("reviewer", &p.decision_comment),
+    ] {
+        if let Some(t) = text {
+            println!("\n{label}:\n  {}", t.replace('\n', "\n  "));
+        }
+    }
+    if let Some(ev) = p.evidence.as_array().filter(|a| !a.is_empty()) {
+        let ids: Vec<_> = ev.iter().filter_map(|v| v.as_str()).collect();
+        println!("\nevidence sessions: {}", ids.join(", "));
+    }
+    if let Some(diff) = &p.diff {
+        println!("\n{diff}");
+    }
+    let versions = proposals::version_stats(pool, Some(&p.factory)).await?;
+    let find = |v: &Option<String>| versions.iter().find(|x| Some(&x.factory_version) == v.as_ref());
+    if let (Some(b), Some(a)) = (find(&p.base_factory_version), find(&p.rolled_out_version)) {
+        let pct = |x: Option<f64>| x.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "-".into());
+        println!("\nbefore → after ({} → {}):", b.factory_version, a.factory_version);
+        println!("  sessions     {} → {}", b.sessions, a.sessions);
+        println!("  fail rate    {} → {}", pct(b.fail_rate), pct(a.fail_rate));
+        println!("  reject rate  {} → {}", pct(b.reject_rate), pct(a.reject_rate));
+        println!("  avg cost     ${:.4} → ${:.4}", b.avg_cost_usd.unwrap_or(0.0), a.avg_cost_usd.unwrap_or(0.0));
+        println!("  scorer pass  {} → {}", pct(b.score_pass_rate), pct(a.score_pass_rate));
+    }
+    match p.status.as_str() {
+        "open" => println!("\napprove: wh proposal approve {id} [--apply]   reject: wh proposal reject {id} --comment ..."),
+        "approved" => println!("\nroll out: wh proposal apply {id}"),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i.saturating_sub(1)]),
+        None => s.to_owned(),
+    }
+}
+
 /// Keep every projection following the log until Ctrl+C.
 async fn run_projections(store: &EventStore) -> Result<()> {
     let pool = store.pool().clone();
     let sub = || Subscription::new(store.clone());
-    let (sa, sb, sc) = (sub(), sub(), sub());
+    let (sa, sb, sc, sd) = (sub(), sub(), sub(), sub());
     let mut tasks = TasksProjection::new(pool.clone());
     let mut sessions = SessionFactsProjection::new(pool.clone());
-    let mut scores = ScoreResultsProjection::new(pool);
-    let (a, b, c) =
-        tokio::join!(sa.run(&mut tasks, ctrl_c()), sb.run(&mut sessions, ctrl_c()), sc.run(&mut scores, ctrl_c()));
-    a.and(b).and(c)
+    let mut scores = ScoreResultsProjection::new(pool.clone());
+    let mut proposals = ProposalsProjection::new(pool);
+    let (a, b, c, d) = tokio::join!(
+        sa.run(&mut tasks, ctrl_c()),
+        sb.run(&mut sessions, ctrl_c()),
+        sc.run(&mut scores, ctrl_c()),
+        sd.run(&mut proposals, ctrl_c())
+    );
+    a.and(b).and(c).and(d)
 }
 
 async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {

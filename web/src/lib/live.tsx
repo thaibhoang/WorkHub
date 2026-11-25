@@ -30,9 +30,13 @@ export function LiveProvider({ children }: { children: ReactNode }) {
     const flush = () => {
       const p = pending.current
       p.timer = undefined
-      for (const id of p.tasks) qc.invalidateQueries({ queryKey: ['task', id] })
+      for (const id of p.tasks) {
+        qc.invalidateQueries({ queryKey: ['task', id] })
+        qc.invalidateQueries({ queryKey: ['proposal', id] })
+      }
       if (p.global) {
-        for (const key of ['tasks', 'sessions', 'stats', 'dashboard', 'scorers', 'scores']) qc.invalidateQueries({ queryKey: [key] })
+        for (const key of ['tasks', 'sessions', 'stats', 'dashboard', 'scorers', 'scores', 'proposals', 'improvement'])
+          qc.invalidateQueries({ queryKey: [key] })
       }
       p.tasks.clear()
       p.global = false

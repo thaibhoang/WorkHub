@@ -79,12 +79,14 @@ pub struct SessionDetail {
     pub branch: Option<String>,
     pub transcript: Option<String>,
     pub factory_version: Option<String>,
+    /// Pipeline verdict for the session's stage: succeeded | failed | rejected.
+    pub stage_outcome: Option<String>,
 }
 
 const SESSION_COLS: &str = "session_id, task_id, agent, stage, runtime, model, status, failure_class, \
      failure_message, attempt, retry_of, dispatched_at, ended_at, duration_ms, num_turns, tool_calls, tool_errors, \
      input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, workdir, branch, transcript, \
-     factory_version";
+     factory_version, stage_outcome";
 
 /// Sessions of one task in dispatch order (the run timeline).
 pub async fn task_sessions(pool: &PgPool, task: Uuid) -> anyhow::Result<Vec<SessionDetail>> {

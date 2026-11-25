@@ -4,6 +4,7 @@
 pub mod event;
 pub mod failure;
 pub mod ids;
+pub mod proposal;
 pub mod score;
 pub mod session;
 pub mod task;

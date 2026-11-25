@@ -136,7 +136,9 @@ pub struct EventMeta {
 - `AgentSessionCompleted{outcome, num_turns, duration_ms, cost_usd, artifacts[]}`
 - `AgentSessionFailed{failure_class, message, retryable}`
 
-**Quality / Improvement** (stream `score-{id}`): `ScoreStarted{scorer, target_session, task_id, agent, stage, model, pass_threshold, manual}`, `ScoreRecorded{score, pass, classification, rationale, cost_usd, usage}`, `ScoreFailed{message, cost_usd}`, `BenchmarkRunCompleted{suite, variant, results}`, `ProposalCreated{title, rationale, evidence[], diff_ref}`, `ProposalDecided{approved|rejected, by}`, `ProposalRolledOut{factory_version}`.
+**Quality / Improvement** (stream `score-{id}`): `ScoreStarted{scorer, target_session, task_id, agent, stage, model, pass_threshold, manual}`, `ScoreRecorded{score, pass, classification, rationale, cost_usd, usage}`, `ScoreFailed{message, cost_usd}`, `BenchmarkRunCompleted{suite, variant, results}`.
+
+**Proposal** (stream `proposal-{id}`): `ImprovementRequested{factory, trigger, focus}`, `ImprovementStarted{base_factory_version, window_days, sessions_observed}`, `ProposalCreated{title, rationale, expected_impact, evidence[], files[], diff, branch, commit, proposed_factory_version, cost_usd}` | `ImprovementSkipped{reason}` | `ImprovementFailed{message}`, `ProposalDecided{approved, reviewer, comment}`, `ProposalRolledOut{factory_version, commit}`.
 
 ### 4.3 Phân loại lỗi (`failure_class`)
 
@@ -197,8 +199,9 @@ Rollout  → merge → factory_version mới
 Measure  → so sánh metrics trước/sau theo factory_version; benchmark suite nếu có
 ```
 
-- Đề xuất **luôn là PR** vào factory repo → audit được, revert được.
+- Đề xuất **luôn là một commit trên branch riêng** (`wh/proposal/<id>`) của repo chứa factory → audit được, revert được (local-only nên chưa mở PR GitHub).
 - Improver tự đo hiệu quả bản thân: approval rate, cost, và delta metrics sau rollout.
+- Đã triển khai ở phase 5, xem "Ghi chú phase 5" bên dưới.
 
 ### 5.7 Benchmarks (giai đoạn sau)
 Tập task cố định (có lời giải/đánh giá) để chạy lại với các biến thể (model, skill, prompt) → so sánh khách quan trước khi rollout.
@@ -206,7 +209,7 @@ Tập task cố định (có lời giải/đánh giá) để chạy lại với 
 ### 5.8 API & UI (`wh-api`, `web/`)
 - **axum** REST + **SSE** để stream event live (timeline, trạng thái run).
 - Màn hình (theo Warp Factories): Inbox (gate + proposal cần duyệt), Runs, Run detail (transcript + Timeline/Agents/Artifacts/Metadata), Dashboard (Productivity / Spending / Scorers), Agents, Scorers, Self-improvement, Factory definition (read-only, link về repo).
-- Phase 3 đã làm: Runs, Run detail (pipeline strip, duyệt gate / resume / cancel, Gantt session theo stage, stage outputs, transcript, raw events), Inbox (gate + blocked; proposal đợi phase 5), Dashboard, Factory. Phase 4 thêm Scorers (pass rate / cost theo scorer, kết quả gần đây), điểm trên từng session, ô pass rate + judge cost trên Dashboard. Agents/Self-improvement để các phase sau.
+- Phase 3 đã làm: Runs, Run detail (pipeline strip, duyệt gate / resume / cancel, Gantt session theo stage, stage outputs, transcript, raw events), Inbox (gate + blocked; proposal đợi phase 5), Dashboard, Factory. Phase 4 thêm Scorers (pass rate / cost theo scorer, kết quả gần đây), điểm trên từng session, ô pass rate + judge cost trên Dashboard. Phase 5 thêm Self-improvement (track record của improver, proposal, metrics theo factory_version kèm delta), trang proposal (diff, evidence, duyệt/áp dụng, before → after) và proposal trong Inbox. Agents để phase sau.
 
 ---
 
@@ -257,11 +260,17 @@ scorers:
     budget_usd: 0.25
 
 improvement:
-  schedule: "0 2 * * *"
-  triggers:
-    - metric: stage_failure_rate
-      stage: implement
-      above: 0.25
+  prompt: improver/improver.md
+  model: claude-opus-5-5
+  budget_usd: 3.0
+  window_days: 14                  # dữ liệu improver được xem
+  min_sessions: 8                  # ít dữ liệu hơn thì không tự chạy
+  interval_hours: 24               # định kỳ, chỉ khi có session mới
+  max_open_proposals: 2
+  triggers:                        # mỗi trigger bắn tối đa 1 lần / factory_version
+    - { metric: stage_failure_rate, stage: implement, above: 0.3 }
+    - { metric: stage_reject_rate, stage: code_review, above: 0.5 }
+    - { metric: scorer_fail_rate, scorer: test-evidence, above: 0.4 }
 ```
 
 ---
@@ -304,7 +313,7 @@ MVP chạy **một binary** (`workhubd`) chứa mọi consumer dưới dạng to
 | **2. Pipeline** ✅ | Foreman + factory.yaml, triage→spec→implement→review→verify, gate qua CLI | Một task đi hết vòng, có rework loop |
 | **3. Quan sát** ✅ | API + SSE + UI: Runs, Run timeline, Dashboard | Xem live, metrics cycle time/cost/fail rate |
 | **4. Chất lượng** ✅ | Scorers | Pass rate theo scorer, cost scorer |
-| **5. Tự cải tiến** | Improver + Inbox duyệt + so sánh theo factory_version | Proposal → PR → đo delta |
+| **5. Tự cải tiến** ✅ | Improver + Inbox duyệt + so sánh theo factory_version | Proposal → PR → đo delta |
 | **6. Mở rộng** | Benchmarks, GitHub/Slack/Linear, Docker sandbox, NATS | — |
 
 Nên **dogfood** từ phase 2: dùng WorkHub để phát triển chính WorkHub.
@@ -353,3 +362,14 @@ Nên **dogfood** từ phase 2: dùng WorkHub để phát triển chính WorkHub.
 - Read model `score_results` (projection mới, rebuild được). Query: `scorer_stats` (pass rate all-time + 7 ngày, lỗi, cost), `scorer_stats_by_version` (pass rate theo `factory_version` của **session được chấm**, tín hiệu trước/sau cho improver phase 5), totals dashboard có `scorer_cost_usd` (tách khỏi spend của agent).
 - API: `/api/scorers`, `/api/scores?scorer&task&session&failing`, scores trong task/session detail, `scorers` trong `/api/factory`. CLI: `wh scores [--scorer] [--failing]`, `wh stats` có bảng scorer.
 - Kiểm chứng thật: chấm một session cũ bằng Haiku, $0.0013/lần, judge chạy với `tools: []`.
+
+### Ghi chú phase 5 (Self-improvement)
+- Crate `wh-improver`. Aggregate **Proposal** (`proposal-<id>`): mỗi lần improver chạy là một stream, kể cả khi không đề xuất gì (`ImprovementSkipped`) hoặc lỗi (`ImprovementFailed`), để cost và approval rate của chính improver đo được.
+- **Yêu cầu chạy**: chỉ có một con đường là event `ImprovementRequested`. Người gọi `wh improve`, nút "Run improver" (API `POST /api/proposals`) hoặc `tick()` của improver (5 phút/lần) đều tạo event này. Lần chạy tự động có id xác định (`ProposalId::for_key`) và append với `NoStream`: trigger tính theo `(trigger, factory_version)` nên chỉ bắn một lần mỗi version (rollout là "nạp lại" trigger); schedule tính theo slot `interval_hours` và chỉ chạy khi có ≥ `min_sessions` session mới kể từ lần chạy trước. Không tự chạy khi đã có `max_open_proposals` proposal đang chờ/chạy/chờ duyệt. Lịch dùng `interval_hours` thay cho cron (khác với bản thiết kế ban đầu) để khỏi phải parse cron.
+- **At most once**: consumer `improver:<factory>` claim request bằng `ImprovementStarted` với `Exact(1)`. Khởi động sẽ đánh `ImprovementFailed` cho run kẹt ở `Started` và chạy lại các request còn chờ. Improver chạy tuần tự (semaphore 1), vì mỗi lần cần thấy kết quả lần trước.
+- **Observe** (`observe.rs`): metrics theo version và theo (version, stage) từ `session_facts` (có thêm cột `stage_outcome` lấy từ `StageExited` → reject rate), lỗi theo `failure_class` kèm message mẫu, kết quả scorer fail kèm rationale, feedback dạng text đọc thẳng từ task stream (review REJECT, gate bị từ chối, task blocked, comment khi resume), 10 proposal gần nhất kèm comment của reviewer (để không đề xuất lại ý đã bị từ chối), và tối đa 4 transcript rút gọn của session xấu. `wh improve --dry-run` in đúng báo cáo này, không tốn tiền.
+- **Propose**: Claude Code (`acceptEdits`) chạy trong git worktree của repo chứa factory, trên branch `wh/proposal/<id>` tạo từ HEAD. Agent chỉ được sửa file trong thư mục của factory.yaml. Sau đó WorkHub kiểm tra lần lượt: phải có JSON trả lời (`title/rationale/expected_impact/evidence` hoặc `no_proposal`), không có file nào ngoài thư mục, `Factory::load` trên worktree phải hợp lệ, và `factory_version` phải đổi. Đạt hết mới commit và ghi `ProposalCreated` kèm diff + version dự kiến. Không đạt thì ghi `ImprovementFailed` (cost vẫn tính) và xoá branch. Worktree của checkout chính không bị đụng tới.
+- **Review / Rollout**: `wh proposal approve|reject|apply`, hoặc UI. Từ chối bắt buộc phải có comment. `apply` cherry-pick commit lên branch hiện tại của repo factory: từ chối nếu các file liên quan đang có thay đổi chưa commit, abort nếu conflict. Sau đó nạp lại factory và ghi `ProposalRolledOut{factory_version}`. Merge tay cũng được: khi improver khởi động/tick mà factory đang nạp có đúng version dự kiến thì tự ghi rollout. Foreman đang chạy vẫn giữ factory cũ cho tới khi restart (chưa có hot reload).
+- **Measure**: `wh_metrics::proposals::version_stats` (fail%, reject%, retries, avg cost, p50, tool err%, scorer pass% theo `factory_version`), `wh versions`, bảng version trên UI kèm delta so với version trước, trang proposal hiện before (base version) → after (version đã rollout).
+- Pool kết nối của CLI tăng lên 20, vì mỗi consumer chạy liên tục (4 projection, SSE, foreman, scorer, improver) giữ một connection LISTEN. Với 5 connection như trước, khi thêm projection thứ tư API đã bị treo khoảng 30s.
+- Kiểm chứng thật: chạy improver bằng Haiku ($0.008, 27s) trên dữ liệu thật của task demo ở phase 2. Nó chẩn đoán đúng nguyên nhân (3 lần review REJECT vì `greet.sh` thiếu quyền thực thi, rồi task bị block ở rework limit), thêm đúng một dòng vào `agents/implementation.md`, trích 3 session làm evidence, và tự nói rõ là không nới quyền tool.

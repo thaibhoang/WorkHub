@@ -66,6 +66,8 @@ export interface SessionDetail {
   branch: string | null
   transcript: string | null
   factory_version: string | null
+  /** Pipeline verdict for the session's stage. */
+  stage_outcome: 'succeeded' | 'failed' | 'rejected' | null
 }
 
 export interface StageResult {
@@ -245,6 +247,111 @@ export interface FactoryDef {
     }
   }[]
   scorers: ScorerDef[]
+  improvement: ImprovementDef | null
+}
+
+export interface ImprovementDef {
+  model: string
+  budget_usd: number
+  window_days: number
+  min_sessions: number
+  interval_hours: number | null
+  max_open_proposals: number
+  triggers: { metric: string; subject: string; above: number }[]
+  prompt: string
+}
+
+export type ProposalStatus =
+  | 'requested'
+  | 'running'
+  | 'open'
+  | 'no_proposal'
+  | 'failed'
+  | 'approved'
+  | 'rejected'
+  | 'rolled_out'
+
+/** One improver run / proposal; `proposals_view` row. */
+export interface ProposalRow {
+  proposal_id: string
+  factory: string
+  status: ProposalStatus
+  trigger: string
+  focus: string | null
+  requested_by: string
+  requested_at: string
+  started_at: string | null
+  finished_at: string | null
+  base_factory_version: string | null
+  sessions_observed: number | null
+  title: string | null
+  rationale: string | null
+  expected_impact: string | null
+  evidence: string[]
+  files: string[]
+  diff: string | null
+  branch: string | null
+  commit_sha: string | null
+  proposed_factory_version: string | null
+  message: string | null
+  cost_usd: number
+  duration_ms: number | null
+  transcript: string | null
+  decided_by: string | null
+  decided_at: string | null
+  decision_comment: string | null
+  rolled_out_at: string | null
+  rolled_out_version: string | null
+}
+
+/** Pipeline metrics of one factory_version. */
+export interface VersionStats {
+  factory_version: string
+  tasks: number
+  sessions: number
+  failed: number
+  retries: number
+  rejected: number
+  fail_rate: number | null
+  reject_rate: number | null
+  avg_cost_usd: number | null
+  cost_usd: number
+  p50_duration_ms: number | null
+  tool_error_rate: number | null
+  scored: number
+  score_pass_rate: number | null
+  first_at: string
+  last_at: string
+}
+
+export interface ImproverStats {
+  runs: number
+  proposals: number
+  no_proposal: number
+  failed: number
+  open: number
+  approved: number
+  rejected: number
+  rolled_out: number
+  approval_rate: number | null
+  cost_usd: number
+  last_run_at: string | null
+}
+
+export interface ImprovementResponse {
+  factory: string | null
+  current_version: string | null
+  config: ImprovementDef | null
+  stats: ImproverStats
+  versions: VersionStats[]
+}
+
+export interface ProposalDetail {
+  proposal: ProposalRow | null
+  events: WhEvent[]
+  evidence: SessionDetail[]
+  before: VersionStats | null
+  after: VersionStats | null
 }
 
 export interface Transcript {
@@ -297,6 +404,14 @@ export const api = {
     p.set('limit', String(q.limit ?? 100))
     return request<ScoreRow[]>('GET', `/scores?${p}`)
   },
+  proposals: (status?: string) => request<ProposalRow[]>('GET', `/proposals${status ? `?status=${status}` : ''}`),
+  proposal: (id: string) => request<ProposalDetail>('GET', `/proposals/${id}`),
+  requestImprovement: (focus?: string) =>
+    request<{ proposal_id: string; message: string }>('POST', '/proposals', { focus }),
+  decideProposal: (id: string, approved: boolean, comment?: string) =>
+    request<{ message: string }>('POST', `/proposals/${id}/decide`, { approved, comment }),
+  applyProposal: (id: string) => request<{ message: string }>('POST', `/proposals/${id}/apply`),
+  improvement: () => request<ImprovementResponse>('GET', '/improvement'),
   events: (after = 0, limit = 100) => request<WhEvent[]>('GET', `/events?after=${after}&limit=${limit}`),
 }
 

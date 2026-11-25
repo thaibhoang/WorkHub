@@ -65,3 +65,21 @@ scorers:
     prompt: scorers/review-evidence.md
     description: Review verdicts are consistent, evidenced with file:line, and actionable
     pass_threshold: 0.6
+
+# Self-improvement (phase 5). The improver reads the metrics above, edits this
+# directory on a `wh/proposal/<id>` branch and waits for a human in the Inbox.
+# Runs on demand (`wh improve`, UI), on a trigger (once per factory_version) or
+# on the schedule when there are new sessions.
+improvement:
+  prompt: improver/improver.md
+  model: claude-opus-5-5
+  budget_usd: 3.0
+  timeout_min: 20
+  window_days: 14
+  min_sessions: 8
+  interval_hours: 24
+  max_open_proposals: 2
+  triggers:
+    - { metric: stage_failure_rate, stage: implement, above: 0.3 }
+    - { metric: stage_reject_rate, stage: code_review, above: 0.5 }
+    - { metric: scorer_fail_rate, scorer: test-evidence, above: 0.4 }

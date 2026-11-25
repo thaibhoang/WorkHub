@@ -11,7 +11,8 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use wh_api::{AppState, Live};
 use wh_core::{
-    Actor, EventMeta, NewEvent, ScoreId, SessionId, TaskId,
+    Actor, EventMeta, NewEvent, ProposalId, ScoreId, SessionId, TaskId,
+    proposal::ProposalEvent,
     score::ScoreEvent,
     session::{SessionEvent, TokenUsage},
     task::{StageOutcome, TaskEvent},
@@ -274,6 +275,94 @@ async fn sessions_stats_and_dashboard(pool: PgPool) {
 
     let (_, dash) = call(&app, "GET", "/api/dashboard?days=7", None).await;
     assert_eq!((dash["totals"]["scores"].as_i64(), dash["totals"]["scorer_cost_usd"].as_f64()), (Some(1), Some(0.003)));
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn proposals_request_review_and_improvement_overview(pool: PgPool) {
+    let f = factory();
+    let version = f.version.clone();
+    let (app, store) = app(&pool, Some(f));
+
+    // A human request queues an improver run for the server's factory.
+    let (st, req) = call(&app, "POST", "/api/proposals", Some(json!({"focus": "review rejects"}))).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{req}");
+    let requested = req["proposal_id"].as_str().unwrap().to_owned();
+    let (_, inbox) = call(&app, "GET", "/api/proposals?status=inbox", None).await;
+    assert!(inbox.as_array().unwrap().is_empty(), "queued runs are not in the inbox");
+    let (_, all) = call(&app, "GET", "/api/proposals", None).await;
+    assert_eq!((all[0]["status"].as_str(), all[0]["focus"].as_str()), (Some("requested"), Some("review rejects")));
+
+    // An open proposal (as the improver would leave it).
+    let id = ProposalId::new();
+    let sys = || {
+        let mut m = EventMeta::new(id.0, Actor::System { component: "improver".into() });
+        m.factory_version = Some(version.clone());
+        m
+    };
+    let evs = [
+        ProposalEvent::ImprovementRequested { factory: "workhub-dev".into(), trigger: "schedule".into(), focus: None },
+        ProposalEvent::ImprovementStarted { base_factory_version: version.clone(), window_days: 14, sessions_observed: 9 },
+        ProposalEvent::ProposalCreated {
+            title: "Tell implement to run cargo fmt".into(),
+            rationale: "ci fails on fmt".into(),
+            expected_impact: Some("fail 30% -> 5%".into()),
+            evidence: vec![SessionId::new()],
+            files: vec!["factory/agents/implementation.md".into()],
+            diff: "+run cargo fmt".into(),
+            branch: format!("wh/proposal/{id}"),
+            commit: "abc".into(),
+            proposed_factory_version: "ffffffffffff".into(),
+            factory_repo: "/nonexistent".into(),
+            factory_file: "factory/factory.yaml".into(),
+            cost_usd: 0.4,
+            usage: TokenUsage::default(),
+            duration_ms: 1000,
+            transcript: None,
+        },
+    ];
+    for e in evs {
+        append(&store, &id.stream_id(), NewEvent::from_domain(&e, sys()).unwrap()).await;
+    }
+    wh_metrics::catch_up_all(&store).await.unwrap();
+
+    let (_, inbox) = call(&app, "GET", "/api/proposals?status=inbox", None).await;
+    assert_eq!(inbox.as_array().unwrap().len(), 1);
+    let (st, d) = call(&app, "GET", &format!("/api/proposals/{id}"), None).await;
+    assert_eq!(st, StatusCode::OK, "{d}");
+    assert_eq!(d["proposal"]["title"], "Tell implement to run cargo fmt");
+    assert_eq!(d["events"].as_array().unwrap().len(), 3);
+    assert!(d["evidence"].as_array().unwrap().is_empty(), "unknown sessions are skipped");
+
+    // Review: reject needs a comment; apply needs approval; stale decisions fail.
+    let uri = format!("/api/proposals/{id}/decide");
+    let (st, _) = call(&app, "POST", &uri, Some(json!({"approved": false}))).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    let (st, _) = call(&app, "POST", &format!("/api/proposals/{id}/apply"), None).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    let (st, r) = call(&app, "POST", &uri, Some(json!({"approved": false, "comment": "fmt is in CI already"}))).await;
+    assert_eq!(st, StatusCode::OK, "{r}");
+    let (st, _) = call(&app, "POST", &uri, Some(json!({"approved": true}))).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    let (_, d) = call(&app, "GET", &format!("/api/proposals/{id}"), None).await;
+    assert_eq!((d["proposal"]["status"].as_str(), d["proposal"]["decision_comment"].as_str()), (Some("rejected"), Some("fmt is in CI already")));
+
+    let (st, _) = call(&app, "GET", "/api/proposals/not-a-uuid", None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = call(&app, "GET", &format!("/api/proposals/{}", ProposalId::new()), None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (st, im) = call(&app, "GET", "/api/improvement", None).await;
+    assert_eq!(st, StatusCode::OK, "{im}");
+    assert_eq!(im["current_version"].as_str(), Some(version.as_str()));
+    assert_eq!(im["config"]["triggers"].as_array().unwrap().len(), 3);
+    assert_eq!((im["stats"]["proposals"].as_i64(), im["stats"]["rejected"].as_i64()), (Some(1), Some(1)));
+    assert_eq!(im["stats"]["approval_rate"].as_f64(), Some(0.0));
+    assert!(all.as_array().unwrap().iter().any(|p| p["proposal_id"] == requested.as_str()));
+
+    // Without an improvement section the request is refused.
+    let (app2, _) = self::app(&pool, None);
+    let (st, _) = call(&app2, "POST", "/api/proposals", Some(json!({}))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]

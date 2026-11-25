@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wh_core::{RecordedEvent, SessionId, session::SessionEvent};
+use wh_core::{RecordedEvent, SessionId, session::SessionEvent, task::TaskEvent};
 use wh_eventstore::EventHandler;
 
 use crate::Projection;
@@ -117,6 +117,18 @@ impl EventHandler for SessionFactsProjection {
     }
 
     async fn handle(&mut self, ev: &RecordedEvent) -> anyhow::Result<()> {
+        if ev.event_type == "StageExited" {
+            // Verdict the pipeline gave the session's stage (rejects are review loops).
+            if let TaskEvent::StageExited { outcome, session: Some(SessionId(id)), .. } = ev.decode::<TaskEvent>()? {
+                sqlx::query(&Self::guarded("stage_outcome = $3"))
+                    .bind(id)
+                    .bind(ev.global_seq)
+                    .bind(outcome.as_str())
+                    .execute(&self.pool)
+                    .await?;
+            }
+            return Ok(());
+        }
         let Some(SessionId(id)) = SessionId::from_stream_id(&ev.stream_id) else {
             return Ok(());
         };

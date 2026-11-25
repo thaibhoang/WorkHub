@@ -2187,6 +2187,7 @@ dependencies = [
  "wh-core",
  "wh-eventstore",
  "wh-factory",
+ "wh-improver",
  "wh-metrics",
 ]
 
@@ -2207,6 +2208,7 @@ dependencies = [
  "wh-eventstore",
  "wh-factory",
  "wh-foreman",
+ "wh-improver",
  "wh-metrics",
  "wh-runner",
  "wh-scorer",
@@ -2265,12 +2267,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "wh-improver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wh-core",
+ "wh-eventstore",
+ "wh-factory",
+ "wh-metrics",
+ "wh-runner",
+ "wh-scorer",
+]
+
+[[package]]
 name = "wh-metrics"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
  "serde",
+ "serde_json",
  "sqlx",
  "tokio",
  "uuid",

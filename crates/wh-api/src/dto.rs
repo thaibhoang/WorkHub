@@ -10,6 +10,7 @@ use wh_core::{
 };
 use wh_factory::Factory;
 use wh_metrics::{
+    proposals::{ProposalRow, VersionStats},
     queries::{SessionDetail, TaskSummary},
     scores::ScoreRow,
 };
@@ -108,6 +109,62 @@ pub struct SessionDetailResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ProposalDetail {
+    /// `None` while the projection has not caught up.
+    pub proposal: Option<ProposalRow>,
+    pub events: Vec<EventDto>,
+    /// Sessions the improver cited.
+    pub evidence: Vec<SessionDetail>,
+    /// Metrics of the version the proposal was based on, and of the version it rolled out as.
+    pub before: Option<VersionStats>,
+    pub after: Option<VersionStats>,
+}
+
+/// `improvement:` settings from factory.yaml.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImprovementDto {
+    pub model: String,
+    pub budget_usd: f64,
+    pub window_days: u32,
+    pub min_sessions: u64,
+    pub interval_hours: Option<u64>,
+    pub max_open_proposals: u32,
+    pub triggers: Vec<TriggerDto>,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TriggerDto {
+    pub metric: &'static str,
+    pub subject: String,
+    pub above: f64,
+}
+
+impl From<&wh_factory::Improvement> for ImprovementDto {
+    fn from(i: &wh_factory::Improvement) -> Self {
+        Self {
+            model: i.model.clone(),
+            budget_usd: i.budget_usd,
+            window_days: i.window_days,
+            min_sessions: i.min_sessions,
+            interval_hours: i.interval_hours,
+            max_open_proposals: i.max_open_proposals,
+            triggers: i
+                .triggers
+                .iter()
+                .map(|t| TriggerDto { metric: t.metric.as_str(), subject: t.subject.clone(), above: t.above })
+                .collect(),
+            prompt: i.prompt.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImproveBody {
+    pub focus: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct FactoryDto {
     pub name: String,
     pub version: String,
@@ -116,6 +173,7 @@ pub struct FactoryDto {
     pub max_rework_loops: u32,
     pub stages: Vec<StageDto>,
     pub scorers: Vec<ScorerDto>,
+    pub improvement: Option<ImprovementDto>,
 }
 
 /// A scorer definition from factory.yaml.
@@ -201,6 +259,7 @@ impl From<&Factory> for FactoryDto {
                 })
                 .collect(),
             scorers: f.scorers.iter().map(ScorerDto::from).collect(),
+            improvement: f.improvement.as_ref().map(ImprovementDto::from),
         }
     }
 }
