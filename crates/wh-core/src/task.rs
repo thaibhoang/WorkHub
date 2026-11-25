@@ -1,6 +1,15 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{benchmark::BenchmarkContext, event::DomainEvent, ids::SessionId};
+use crate::{
+    benchmark::BenchmarkContext,
+    event::DomainEvent,
+    ids::{SessionId, TaskId},
+};
+
+/// Pseudo stage id used for shipping (push + pull request) after the last
+/// pipeline stage. Gates and blocks at shipping time name this stage.
+pub const SHIP_STAGE: &str = "ship";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -9,6 +18,8 @@ pub enum TaskSource {
     Web,
     /// A benchmark case created by the benchmark runner.
     Benchmark,
+    /// Created from a labelled GitHub issue.
+    Github,
 }
 
 impl TaskSource {
@@ -17,6 +28,7 @@ impl TaskSource {
             Self::Cli => "cli",
             Self::Web => "web",
             Self::Benchmark => "benchmark",
+            Self::Github => "github",
         }
     }
 }
@@ -37,6 +49,9 @@ pub enum TaskEvent {
         /// Set when the task is a benchmark case (driven by the benchmark runner).
         #[serde(default)]
         benchmark: Option<BenchmarkContext>,
+        /// The external item this task came from (a GitHub issue).
+        #[serde(default)]
+        external_ref: Option<ExternalRef>,
     },
     StageEntered {
         stage: String,
@@ -78,6 +93,136 @@ pub enum TaskEvent {
     TaskCancelled {
         reason: String,
     },
+    /// WorkHub pushed the task branch and opened (or updated) its pull request.
+    /// The task now waits for the PR to be reviewed and merged.
+    TaskShipped {
+        /// `owner/name` of the GitHub repository.
+        repo: String,
+        pr_number: u64,
+        pr_url: String,
+        branch: String,
+        /// Head commit that was pushed.
+        commit: String,
+        /// True when this ship opened the PR, false when it pushed to an existing one.
+        #[serde(default)]
+        created: bool,
+    },
+    /// A review on the task's PR (recorded once per review by the GitHub poller).
+    PrReviewed {
+        review_id: String,
+        reviewer: String,
+        /// `APPROVED` | `CHANGES_REQUESTED` | `COMMENTED` | `DISMISSED`.
+        state: String,
+        #[serde(default)]
+        body: String,
+        /// Inline comments the reviewer left with this review.
+        #[serde(default)]
+        comments: Vec<PrComment>,
+        #[serde(default)]
+        submitted_at: Option<DateTime<Utc>>,
+    },
+    /// Every check on the PR head `commit` finished (recorded once per commit).
+    PrChecksCompleted {
+        commit: String,
+        /// `success` or `failure`.
+        conclusion: String,
+        #[serde(default)]
+        failed: Vec<FailedCheck>,
+    },
+    PrMerged {
+        #[serde(default)]
+        merged_at: Option<DateTime<Utc>>,
+        #[serde(default)]
+        merged_by: Option<String>,
+    },
+    /// The PR was closed without being merged.
+    PrClosed {
+        #[serde(default)]
+        closed_at: Option<DateTime<Utc>>,
+    },
+}
+
+/// Where a task came from outside WorkHub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalRef {
+    /// `owner/name`.
+    pub repo: String,
+    pub issue: u64,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrComment {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub line: Option<u64>,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedCheck {
+    pub name: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Tail of the failed job's log, when it could be fetched.
+    #[serde(default)]
+    pub log: Option<String>,
+}
+
+pub const CHANGES_REQUESTED: &str = "CHANGES_REQUESTED";
+
+const MAX_LOG: usize = 4_000;
+
+/// Rework instructions for a `CHANGES_REQUESTED` review.
+pub fn review_feedback(reviewer: &str, body: &str, comments: &[PrComment]) -> String {
+    let mut s = format!("A human reviewer ({reviewer}) requested changes on the pull request.\n");
+    if !body.trim().is_empty() {
+        s.push_str(&format!("\n{}\n", body.trim()));
+    }
+    if !comments.is_empty() {
+        s.push_str("\nInline comments:\n");
+        for c in comments {
+            let at = match (&c.path, c.line) {
+                (Some(p), Some(l)) => format!("{p}:{l}"),
+                (Some(p), None) => p.clone(),
+                _ => "general".into(),
+            };
+            s.push_str(&format!("- {at}: {}\n", c.body.trim()));
+        }
+    }
+    s
+}
+
+/// Rework instructions for failed PR checks (names, links, log tails).
+pub fn ci_feedback(failed: &[FailedCheck]) -> String {
+    let mut s = String::from("CI failed on the pull request. Make these checks pass:\n");
+    if failed.is_empty() {
+        s.push_str("- (no failed check names reported)\n");
+    }
+    for c in failed {
+        s.push_str(&format!("\n### {}{}\n", c.name, c.url.as_deref().map(|u| format!(" ({u})")).unwrap_or_default()));
+        if let Some(log) = c.log.as_deref().filter(|l| !l.trim().is_empty()) {
+            let chars: Vec<char> = log.chars().collect();
+            let tail: String = chars[chars.len().saturating_sub(MAX_LOG)..].iter().collect();
+            s.push_str(&format!("\n```\n{}\n```\n", tail.trim_end()));
+        }
+    }
+    s
+}
+
+/// Git branch shared by every stage of a task (and the head of its PR).
+pub fn task_branch(task: TaskId) -> String {
+    format!("wh/task/{}", &task.0.simple().to_string()[20..])
+}
+
+impl TaskId {
+    /// Stable task id for an external item such as `github:owner/name#12`, so
+    /// polling the same issue twice never creates two tasks.
+    pub fn for_external(key: &str) -> Self {
+        let ns = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, b"workhub-task-external");
+        Self(uuid::Uuid::new_v5(&ns, key.as_bytes()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +257,11 @@ impl DomainEvent for TaskEvent {
             Self::TaskResumed { .. } => "TaskResumed",
             Self::TaskCompleted { .. } => "TaskCompleted",
             Self::TaskCancelled { .. } => "TaskCancelled",
+            Self::TaskShipped { .. } => "TaskShipped",
+            Self::PrReviewed { .. } => "PrReviewed",
+            Self::PrChecksCompleted { .. } => "PrChecksCompleted",
+            Self::PrMerged { .. } => "PrMerged",
+            Self::PrClosed { .. } => "PrClosed",
         }
     }
 }
@@ -123,6 +273,8 @@ pub enum TaskStatus {
     Running { stage: String },
     AwaitingGate { gate: String, stage: String },
     Blocked { reason: String },
+    /// PR open, waiting for review / CI / merge.
+    Shipped,
     Done,
     Cancelled,
 }
@@ -132,6 +284,19 @@ pub struct StageResult {
     pub stage: String,
     pub outcome: StageOutcome,
     pub summary: Option<String>,
+}
+
+/// The task's pull request, from the latest `TaskShipped`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    pub repo: String,
+    pub number: u64,
+    pub url: String,
+    pub branch: String,
+    /// Head commit of the latest push.
+    pub commit: String,
+    /// Merged or closed.
+    pub closed: bool,
 }
 
 /// Task aggregate state, folded from its event stream.
@@ -149,6 +314,13 @@ pub struct TaskState {
     pub rework_loops: u32,
     /// Stage named by the latest `TaskBlocked` (where `resume` restarts by default).
     pub blocked_stage: Option<String>,
+    pub external_ref: Option<ExternalRef>,
+    pub pr: Option<PullRequest>,
+    /// Stages re-run because of PR feedback (changes requested, failed CI).
+    pub pr_rework_loops: u32,
+    /// PR feedback received while waiting on the PR and not yet handed to a stage
+    /// (several reviews / a failed CI run can arrive in the same poll).
+    pub pr_feedback: Vec<String>,
     pub last: Option<TaskEvent>,
 }
 
@@ -164,15 +336,19 @@ impl TaskState {
     pub fn apply(&mut self, version: i64, ev: TaskEvent) {
         self.version = version;
         match &ev {
-            TaskEvent::TaskCreated { title, body, factory, benchmark, .. } => {
+            TaskEvent::TaskCreated { title, body, factory, benchmark, external_ref, .. } => {
                 self.title = title.clone();
                 self.body = body.clone();
                 self.factory = factory.clone();
                 self.benchmark = benchmark.clone();
+                self.external_ref = external_ref.clone();
                 self.status = TaskStatus::Open;
             }
             TaskEvent::StageEntered { stage, feedback } => {
-                if feedback.is_some() {
+                self.pr_feedback.clear();
+                if self.status == TaskStatus::Shipped {
+                    self.pr_rework_loops += 1;
+                } else if feedback.is_some() {
                     self.rework_loops += 1;
                 }
                 self.status = TaskStatus::Running { stage: stage.clone() };
@@ -193,6 +369,46 @@ impl TaskState {
             TaskEvent::TaskResumed { .. } => self.status = TaskStatus::Open,
             TaskEvent::TaskCompleted { .. } => self.status = TaskStatus::Done,
             TaskEvent::TaskCancelled { .. } => self.status = TaskStatus::Cancelled,
+            TaskEvent::TaskShipped { repo, pr_number, pr_url, branch, commit, .. } => {
+                self.pr = Some(PullRequest {
+                    repo: repo.clone(),
+                    number: *pr_number,
+                    url: pr_url.clone(),
+                    branch: branch.clone(),
+                    commit: commit.clone(),
+                    closed: false,
+                });
+                // Feedback that arrived during a rework was about the previous push.
+                self.pr_feedback.clear();
+                self.status = TaskStatus::Shipped;
+            }
+            // Reviews and checks are facts; the foreman decides whether they cause rework.
+            TaskEvent::PrReviewed { reviewer, state, body, comments, .. } => {
+                if state == CHANGES_REQUESTED && self.status == TaskStatus::Shipped {
+                    self.pr_feedback.push(review_feedback(reviewer, body, comments));
+                }
+            }
+            TaskEvent::PrChecksCompleted { commit, conclusion, failed } => {
+                let current = self.pr.as_ref().is_some_and(|pr| &pr.commit == commit);
+                if conclusion != "success" && current && self.status == TaskStatus::Shipped {
+                    self.pr_feedback.push(ci_feedback(failed));
+                }
+            }
+            TaskEvent::PrMerged { .. } => {
+                if let Some(pr) = &mut self.pr {
+                    pr.closed = true;
+                }
+                self.status = TaskStatus::Done;
+            }
+            TaskEvent::PrClosed { .. } => {
+                if let Some(pr) = &mut self.pr {
+                    pr.closed = true;
+                }
+                if !matches!(self.status, TaskStatus::Done | TaskStatus::Cancelled) {
+                    self.blocked_stage = None;
+                    self.status = TaskStatus::Blocked { reason: "pull request closed without merging".into() };
+                }
+            }
         }
         self.last = Some(ev);
     }
@@ -254,7 +470,7 @@ mod tests {
     #[test]
     fn fold_tracks_status_and_rework() {
         let s = TaskState::fold([
-            (1, TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("f".into()), benchmark: None }),
+            (1, TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("f".into()), benchmark: None, external_ref: None }),
             (2, TaskEvent::StageEntered { stage: "impl".into(), feedback: None }),
             (3, TaskEvent::StageExited { stage: "impl".into(), outcome: StageOutcome::Succeeded, summary: None, session: None }),
             (4, TaskEvent::StageEntered { stage: "impl".into(), feedback: Some("fix".into()) }),
@@ -262,6 +478,40 @@ mod tests {
         assert_eq!((s.version, s.rework_loops), (4, 1));
         assert_eq!(s.status, TaskStatus::Running { stage: "impl".into() });
         assert_eq!(s.last_stage(), Some("impl"));
+    }
+
+    #[test]
+    fn fold_tracks_pull_request_feedback_and_merge() {
+        let shipped = |commit: &str| TaskEvent::TaskShipped {
+            repo: "a/b".into(),
+            pr_number: 1,
+            pr_url: "u".into(),
+            branch: "wh/task/x".into(),
+            commit: commit.into(),
+            created: true,
+        };
+        let review = |state: &str| TaskEvent::PrReviewed {
+            review_id: state.into(),
+            reviewer: "bob".into(),
+            state: state.into(),
+            body: "please fix".into(),
+            comments: vec![],
+            submitted_at: None,
+        };
+        let checks = |commit: &str| TaskEvent::PrChecksCompleted { commit: commit.into(), conclusion: "failure".into(), failed: vec![] };
+        let mut s = TaskState::fold([(1, shipped("c1")), (2, review("COMMENTED")), (3, review(CHANGES_REQUESTED)), (4, checks("old"))]);
+        assert_eq!(s.status, TaskStatus::Shipped);
+        assert_eq!(s.pr_feedback.len(), 1, "only changes requested on the current push");
+        s.apply(5, checks("c1"));
+        assert_eq!(s.pr_feedback.len(), 2);
+        s.apply(6, TaskEvent::StageEntered { stage: "impl".into(), feedback: Some("x".into()) });
+        assert_eq!((s.pr_rework_loops, s.rework_loops, s.pr_feedback.len()), (1, 0, 0));
+        s.apply(7, review(CHANGES_REQUESTED)); // during the rework: ignored
+        s.apply(8, shipped("c2"));
+        assert!(s.pr_feedback.is_empty());
+        s.apply(9, TaskEvent::PrMerged { merged_at: None, merged_by: None });
+        assert_eq!(s.status, TaskStatus::Done);
+        assert!(s.pr.unwrap().closed);
     }
 
     #[test]

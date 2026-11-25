@@ -1,4 +1,5 @@
 mod bench;
+mod github;
 mod sandbox;
 
 use std::{path::PathBuf, time::Duration};
@@ -24,6 +25,7 @@ use wh_metrics::{
     tasks::TasksProjection,
 };
 use bench::{bench_cmd, run_bench_worker};
+use github::{GithubCmd, github_cmd, run_github};
 use sandbox::{SandboxCmd, sandbox_cmd};
 use wh_scorer::{Graded, ScorerConfig, ScorerService};
 use wh_runner::{OutcomeStatus, RunSpec, Runner, RunnerConfig, Signal, claude_code::ClaudeCode};
@@ -74,6 +76,11 @@ enum Cmd {
         /// Do not run queued benchmark runs
         #[arg(long)]
         no_bench: bool,
+        /// Do not poll GitHub (PR reviews / CI / merges, issue intake); shipping still happens
+        #[arg(long)]
+        no_github: bool,
+        #[arg(long, env = "WH_GH_BIN", default_value = "gh")]
+        gh_bin: PathBuf,
     },
     /// Grade finished agent sessions with the factory's scorers (LLM-as-judge) until Ctrl+C
     Scorer {
@@ -124,6 +131,11 @@ enum Cmd {
         /// With --foreman: do not run queued benchmark runs
         #[arg(long)]
         no_bench: bool,
+        /// With --foreman: do not poll GitHub (shipping still happens)
+        #[arg(long)]
+        no_github: bool,
+        #[arg(long, env = "WH_GH_BIN", default_value = "gh")]
+        gh_bin: PathBuf,
         /// Directory of benchmark suites offered in the UI
         #[arg(long, env = "WH_BENCH_DIR", default_value = "benchmarks")]
         bench_dir: PathBuf,
@@ -180,6 +192,11 @@ enum Cmd {
     Gate {
         #[command(subcommand)]
         cmd: GateCmd,
+    },
+    /// GitHub (factories with `github:`): check the setup, poll once
+    Github {
+        #[command(subcommand)]
+        cmd: GithubCmd,
     },
     /// Inspect a factory definition
     Factory {
@@ -239,6 +256,15 @@ enum TaskCmd {
         task: TaskId,
         #[arg(long)]
         reason: String,
+    },
+    /// Push the task branch and open / update its PR now (retry a failed ship, or
+    /// ship a task that finished before `github:` was configured)
+    Ship {
+        task: TaskId,
+        #[arg(long, env = "WH_FACTORY", default_value = "factory/factory.yaml")]
+        factory: PathBuf,
+        #[arg(long, env = "WH_GH_BIN", default_value = "gh")]
+        gh_bin: PathBuf,
     },
 }
 
@@ -464,6 +490,7 @@ async fn main() -> Result<()> {
                         t.rework_loops,
                         t.title,
                         t.blocked_reason.map(|r| format!("  [blocked: {}]", first_line(&r))).unwrap_or_default()
+                            + &t.pr_url.map(|u| format!("  [PR {}: {u}]", t.pr_state.as_deref().unwrap_or("?"))).unwrap_or_default()
                     );
                 }
             }
@@ -475,6 +502,13 @@ async fn main() -> Result<()> {
             TaskCmd::Cancel { task, reason } => {
                 commands::cancel(&store, local_user(), task, reason).await?;
                 println!("cancelled");
+            }
+            TaskCmd::Ship { task, factory, gh_bin } => {
+                let f = Factory::load(&factory)?;
+                let ev = wh_github::commands::ship_task(&store, &f, &wh_github::Gh::new(gh_bin), local_user(), task).await?;
+                if let TaskEvent::TaskShipped { pr_url, created, .. } = ev {
+                    println!("{} {pr_url}", if created { "opened" } else { "pushed to" });
+                }
             }
         },
         Cmd::Gate { cmd } => {
@@ -517,6 +551,19 @@ async fn main() -> Result<()> {
                     println!("  trigger {} for {} > {}", t.metric.as_str(), t.subject, t.above);
                 }
             }
+            if let Some(g) = &f.github {
+                println!(
+                    "\ngithub: {} via {}  base {}  rework → {}  poll {}s{}{}{}",
+                    g.repo.as_deref().unwrap_or("(repo from remote)"),
+                    g.remote,
+                    g.base.as_deref().unwrap_or("(default branch)"),
+                    g.rework_stage,
+                    g.poll_interval.as_secs(),
+                    if g.draft { "  draft" } else { "" },
+                    g.ship_gate.as_ref().map(|s| format!("  ship gate: {s}")).unwrap_or_default(),
+                    g.issues.as_ref().map(|i| format!("  issues labelled '{}'", i.label)).unwrap_or_default(),
+                );
+            }
             if !f.scorers.is_empty() {
                 println!("\nscorers:");
                 for sc in &f.scorers {
@@ -532,22 +579,25 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Foreman { factory, max_parallel, claude_bin, no_scorers, no_improver, no_bench } => {
+        Cmd::Foreman { factory, max_parallel, claude_bin, no_scorers, no_improver, no_bench, no_github, gh_bin } => {
             let f = Factory::load(&factory)?;
             println!("foreman for factory '{}' (version {}), Ctrl+C to stop", f.name, f.version);
             let scorer = run_scorer(&store, f.clone(), max_parallel, claude_bin.clone(), !no_scorers);
             let improver = run_improver(&store, f.clone(), claude_bin.clone(), !no_improver);
             let bench = run_bench_worker(&store, claude_bin.clone(), !no_bench);
-            let (a, b, c, d, e) = tokio::join!(
-                run_foreman(&store, f, max_parallel, claude_bin),
+            let gh = run_github(&store, f.clone(), gh_bin.clone(), !no_github);
+            let (a, b, c, d, e, g) = tokio::join!(
+                run_foreman(&store, f, max_parallel, claude_bin, gh_bin),
                 run_projections(&store),
                 scorer,
                 improver,
-                bench
+                bench,
+                gh
             );
-            a.and(b).and(c).and(d).and(e)?;
+            a.and(b).and(c).and(d).and(e).and(g)?;
         }
         Cmd::Bench { cmd } => bench_cmd(&store, cmd).await?,
+        Cmd::Github { cmd } => github_cmd(&store, cmd).await?,
         Cmd::Improver { factory, claude_bin } => {
             let f = Factory::load(&factory)?;
             anyhow::ensure!(f.improvement.is_some(), "factory '{}' has no `improvement:` section", f.name);
@@ -688,7 +738,20 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::Serve { addr, factory, foreman, max_parallel, claude_bin, no_scorers, no_improver, no_bench, bench_dir, web_dir } => {
+        Cmd::Serve {
+            addr,
+            factory,
+            foreman,
+            max_parallel,
+            claude_bin,
+            no_scorers,
+            no_improver,
+            no_bench,
+            no_github,
+            gh_bin,
+            bench_dir,
+            web_dir,
+        } => {
             let f = match Factory::load(&factory) {
                 Ok(f) => Some(f),
                 Err(e) if !foreman => {
@@ -717,9 +780,15 @@ async fn main() -> Result<()> {
                         let scorer = run_scorer(&store, f.clone(), max_parallel, claude_bin.clone(), !no_scorers);
                         let improver = run_improver(&store, f.clone(), claude_bin.clone(), !no_improver);
                         let bench = run_bench_worker(&store, claude_bin.clone(), !no_bench);
-                        let (a, b, c, d) =
-                            tokio::join!(run_foreman(&store, f, max_parallel, claude_bin), scorer, improver, bench);
-                        a.and(b).and(c).and(d)
+                        let gh = run_github(&store, f.clone(), gh_bin.clone(), !no_github);
+                        let (a, b, c, d, e) = tokio::join!(
+                            run_foreman(&store, f, max_parallel, claude_bin, gh_bin),
+                            scorer,
+                            improver,
+                            bench,
+                            gh
+                        );
+                        a.and(b).and(c).and(d).and(e)
                     }
                     _ => Ok(()),
                 }
@@ -824,15 +893,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn ctrl_c() {
+pub(crate) async fn ctrl_c() {
     tokio::signal::ctrl_c().await.ok();
 }
 
 /// Foreman daemon until Ctrl+C (recovers interrupted stages first).
-async fn run_foreman(store: &EventStore, f: Factory, max_parallel: usize, claude_bin: PathBuf) -> Result<()> {
+async fn run_foreman(store: &EventStore, f: Factory, max_parallel: usize, claude_bin: PathBuf, gh_bin: PathBuf) -> Result<()> {
     let runner = Runner::new(store.clone(), ClaudeCode::new(claude_bin), RunnerConfig { data_dir: data_dir() });
     let dispatch = Dispatch::Spawn(std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel)));
-    let mut foreman = Foreman::new(store.clone(), f, runner, dispatch);
+    let mut foreman = Foreman::new(store.clone(), f, runner, dispatch).with_gh(wh_github::Gh::new(gh_bin));
     for task in foreman.recover_interrupted().await? {
         println!("task {task} was interrupted mid-stage → blocked. Restart it with: wh task resume {task}");
     }
@@ -998,6 +1067,12 @@ async fn run_projections(store: &EventStore) -> Result<()> {
 async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {
     let state = commands::load_task(store, task).await?;
     println!("{}  [{:?}]  rework loops: {}", state.title, state.status, state.rework_loops);
+    if let Some(ext) = &state.external_ref {
+        println!("from issue {}#{}  {}", ext.repo, ext.issue, ext.url);
+    }
+    if let Some(pr) = &state.pr {
+        println!("PR #{} {}  ({} PR rework loop(s))", pr.number, pr.url, state.pr_rework_loops);
+    }
     for e in store.read_stream(&task.stream_id()).await? {
         let detail = match e.decode::<TaskEvent>()? {
             TaskEvent::StageEntered { stage, feedback } => {
@@ -1016,9 +1091,22 @@ async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {
             ),
             TaskEvent::TaskBlocked { reason, .. } => first_line(&reason).to_string(),
             TaskEvent::TaskCompleted { branch } => branch.unwrap_or_default(),
+            TaskEvent::TaskShipped { pr_url, created, commit, .. } => {
+                format!("{} {pr_url} @ {}", if created { "opened" } else { "pushed" }, &commit[..commit.len().min(10)])
+            }
+            TaskEvent::PrReviewed { reviewer, state, body, comments, .. } => format!(
+                "{state} by {reviewer}{}{}",
+                if body.trim().is_empty() { String::new() } else { format!(": {}", first_line(&body)) },
+                if comments.is_empty() { String::new() } else { format!(" (+{} inline)", comments.len()) }
+            ),
+            TaskEvent::PrChecksCompleted { conclusion, failed, .. } => {
+                let names: Vec<_> = failed.iter().map(|c| c.name.as_str()).collect();
+                if names.is_empty() { conclusion } else { format!("{conclusion}: {}", names.join(", ")) }
+            }
+            TaskEvent::PrMerged { merged_by, .. } => merged_by.map(|b| format!("by {b}")).unwrap_or_default(),
             _ => String::new(),
         };
-        println!("  {}  {:<14} {detail}", e.meta.occurred_at.format("%H:%M:%S"), e.event_type);
+        println!("  {}  {:<17} {detail}", e.meta.occurred_at.format("%H:%M:%S"), e.event_type);
     }
     let pool = store.pool();
     wh_metrics::catch_up_all(store).await?;

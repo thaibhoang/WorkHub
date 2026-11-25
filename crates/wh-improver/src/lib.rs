@@ -39,7 +39,7 @@ use wh_factory::{Factory, Improvement};
 use wh_runner::{AgentRequest, AgentRuntime, OutcomeStatus, worktree::Worktree};
 
 pub use observe::{Observation, render};
-pub use prompt::{Answer, Fired, Workspace, build_prompt, evaluate_triggers, parse_answer};
+pub use prompt::{Answer, Fired, PrMetric, Workspace, build_prompt, evaluate_triggers, parse_answer};
 
 pub(crate) mod git {
     use std::path::Path;
@@ -245,8 +245,8 @@ impl<R: AgentRuntime + 'static> ImproverService<R> {
         let room = |q: i64| q < im.max_open_proposals as i64;
 
         if !im.triggers.is_empty() && room(queued) {
-            let (stages, scorers) = observe::current_metrics(pool, &f.name, &f.version, im.window_days).await?;
-            for fired in evaluate_triggers(&im.triggers, &stages, &scorers, im.min_sessions as i64) {
+            let (stages, scorers, pr) = observe::current_metrics(pool, &f.name, &f.version, im.window_days).await?;
+            for fired in evaluate_triggers(&im.triggers, &stages, &scorers, &pr, im.min_sessions as i64) {
                 if !room(queued) {
                     break;
                 }

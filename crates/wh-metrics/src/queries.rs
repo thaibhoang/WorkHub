@@ -26,12 +26,26 @@ pub struct TaskSummary {
     /// Set for benchmark cases (hidden from the task list).
     pub benchmark_run: Option<Uuid>,
     pub benchmark_case: Option<String>,
+    /// GitHub (phase 8): the issue the task came from and its pull request.
+    pub external_ref: Option<String>,
+    pub pr_url: Option<String>,
+    pub pr_number: Option<i32>,
+    /// open | merged | closed
+    pub pr_state: Option<String>,
+    pub shipped_at: Option<DateTime<Utc>>,
+    pub first_review_at: Option<DateTime<Utc>>,
+    pub merged_at: Option<DateTime<Utc>>,
+    pub pr_reviews: i32,
+    pub changes_requested: i32,
+    pub ci_failures: i32,
+    pub pr_rework_loops: i32,
 }
 
 const TASK_SUMMARY_SQL: &str = "SELECT t.task_id, t.title, t.source, t.factory, t.status, t.current_stage, \
      t.rework_loops, t.gate_rejections, t.blocked_reason, t.created_at, t.updated_at, t.completed_at, \
      COALESCE(s.sessions, 0) AS sessions, COALESCE(s.cost_usd, 0) AS cost_usd, \
-     t.benchmark_run, t.benchmark_case \
+     t.benchmark_run, t.benchmark_case, t.external_ref, t.pr_url, t.pr_number, t.pr_state, t.shipped_at, \
+     t.first_review_at, t.merged_at, t.pr_reviews, t.changes_requested, t.ci_failures, t.pr_rework_loops \
      FROM tasks_view t LEFT JOIN ( \
        SELECT task_id, count(*) AS sessions, sum(cost_usd) AS cost_usd FROM session_facts GROUP BY task_id \
      ) s ON s.task_id = t.task_id";
@@ -239,4 +253,55 @@ pub async fn stats_by_stage(pool: &PgPool) -> anyhow::Result<Vec<StageStats>> {
     )
     .fetch_all(pool)
     .await?)
+}
+
+/// Pull request cycle times over tasks shipped in the last `days` days (live
+/// tasks only). Durations are milliseconds; `None` when there is no data.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct CycleTimes {
+    pub shipped: i64,
+    pub merged: i64,
+    /// PRs still open.
+    pub open: i64,
+    /// Shipped tasks whose PR got at least one `CHANGES_REQUESTED` review.
+    pub changes_requested_tasks: i64,
+    /// Shipped tasks whose PR had at least one failed CI run.
+    pub ci_failed_tasks: i64,
+    pub avg_pr_rework: Option<f64>,
+    pub kickoff_to_pr_p50_ms: Option<f64>,
+    pub kickoff_to_pr_p95_ms: Option<f64>,
+    pub pr_to_first_review_p50_ms: Option<f64>,
+    pub pr_to_first_review_p95_ms: Option<f64>,
+    pub review_to_merge_p50_ms: Option<f64>,
+    pub review_to_merge_p95_ms: Option<f64>,
+    pub kickoff_to_merge_p50_ms: Option<f64>,
+    pub kickoff_to_merge_p95_ms: Option<f64>,
+}
+
+pub async fn cycle_times(pool: &PgPool, days: i32) -> anyhow::Result<CycleTimes> {
+    let ms = |a: &str, b: &str, p: f64| {
+        format!("percentile_cont({p}) WITHIN GROUP (ORDER BY extract(epoch FROM {b} - {a}) * 1000) FILTER (WHERE {a} IS NOT NULL AND {b} IS NOT NULL)")
+    };
+    let sql = format!(
+        "SELECT count(*) AS shipped, count(*) FILTER (WHERE pr_state = 'merged') AS merged, \
+           count(*) FILTER (WHERE pr_state = 'open') AS open, \
+           count(*) FILTER (WHERE changes_requested > 0) AS changes_requested_tasks, \
+           count(*) FILTER (WHERE ci_failures > 0) AS ci_failed_tasks, \
+           avg(pr_rework_loops)::float8 AS avg_pr_rework, \
+           {} AS kickoff_to_pr_p50_ms, {} AS kickoff_to_pr_p95_ms, \
+           {} AS pr_to_first_review_p50_ms, {} AS pr_to_first_review_p95_ms, \
+           {} AS review_to_merge_p50_ms, {} AS review_to_merge_p95_ms, \
+           {} AS kickoff_to_merge_p50_ms, {} AS kickoff_to_merge_p95_ms \
+         FROM tasks_view WHERE benchmark_run IS NULL AND shipped_at IS NOT NULL \
+           AND shipped_at >= now() - make_interval(days => $1)",
+        ms("created_at", "shipped_at", 0.5),
+        ms("created_at", "shipped_at", 0.95),
+        ms("shipped_at", "first_review_at", 0.5),
+        ms("shipped_at", "first_review_at", 0.95),
+        ms("first_review_at", "merged_at", 0.5),
+        ms("first_review_at", "merged_at", 0.95),
+        ms("created_at", "merged_at", 0.5),
+        ms("created_at", "merged_at", 0.95),
+    );
+    Ok(sqlx::query_as(&sql).bind(days).fetch_one(pool).await?)
 }

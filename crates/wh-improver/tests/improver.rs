@@ -132,6 +132,7 @@ async fn session(store: &EventStore, f: &Factory, stage: &str, failed: bool, rej
         source: TaskSource::Cli,
         factory: Some(f.name.clone()),
         benchmark: None,
+        external_ref: None,
     };
     append(store, &task.stream_id(), task.0, v, created).await;
     let dispatched = SessionEvent::AgentDispatched {

@@ -60,7 +60,7 @@ pub async fn create_task(store: &EventStore, actor: Actor, t: NewTask) -> Result
     }
     let body = t.body.filter(|b| !b.trim().is_empty());
     let id = TaskId::new();
-    let ev = TaskEvent::TaskCreated { title, body, source: t.source, factory: t.factory, benchmark: None };
+    let ev = TaskEvent::TaskCreated { title, body, source: t.source, factory: t.factory, benchmark: None, external_ref: None };
     append(store, id, ExpectedVersion::NoStream, actor, ev).await?;
     Ok(id)
 }
@@ -132,6 +132,7 @@ pub fn status_name(s: &TaskStatus) -> &'static str {
         TaskStatus::Running { .. } => "running",
         TaskStatus::AwaitingGate { .. } => "awaiting_gate",
         TaskStatus::Blocked { .. } => "blocked",
+        TaskStatus::Shipped => "shipped",
         TaskStatus::Done => "done",
         TaskStatus::Cancelled => "cancelled",
     }

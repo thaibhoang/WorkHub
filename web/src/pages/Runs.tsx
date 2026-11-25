@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router'
 import { NewTaskDialog } from '@/components/NewTaskDialog'
 import { PageHeader } from '@/components/PageHeader'
-import { TaskStatusBadge } from '@/components/status'
+import { PrLink, TaskStatusBadge } from '@/components/status'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { api, firstLine, fmtAgo, fmtMs, fmtUsd, shortId, type TaskSummary } from '@/lib/api'
@@ -13,6 +13,7 @@ const FILTERS = [
   { id: 'active', label: 'Active' },
   { id: 'awaiting_gate', label: 'Needs review' },
   { id: 'blocked', label: 'Blocked' },
+  { id: 'shipped', label: 'PR open' },
   { id: 'done', label: 'Done' },
 ] as const
 
@@ -95,11 +96,15 @@ export function RunsTable({ rows }: { rows: TaskSummary[] }) {
                   <div className="truncate text-xs text-muted-foreground">
                     <span className="font-mono">{shortId(t.task_id)}</span>
                     {t.factory ? ` · ${t.factory}` : ' · manual'}
+                    {t.external_ref ? ` · ${t.external_ref}` : null}
                     {t.blocked_reason ? <span className="text-fail"> · {firstLine(t.blocked_reason)}</span> : null}
                   </div>
                 </TableCell>
                 <TableCell>
-                  <TaskStatusBadge status={t.status} />
+                  <div className="flex flex-col gap-0.5">
+                    <TaskStatusBadge status={t.status} />
+                    {t.pr_url ? <PrLink url={t.pr_url} number={t.pr_number} state={t.pr_state} /> : null}
+                  </div>
                 </TableCell>
                 <TableCell className="hidden font-mono text-xs md:table-cell">{t.current_stage ?? '–'}</TableCell>
                 <TableCell className="hidden text-right tabular-nums lg:table-cell">

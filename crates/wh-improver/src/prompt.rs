@@ -97,6 +97,13 @@ pub struct ScorerMetric {
     pub failed: i64,
 }
 
+/// Pull requests of the current factory version within the window.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PrMetric {
+    pub shipped: i64,
+    pub changes_requested: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fired {
     pub trigger: Trigger,
@@ -116,11 +123,16 @@ pub fn evaluate_triggers(
     triggers: &[Trigger],
     stages: &[StageMetric],
     scorers: &[ScorerMetric],
+    pr: &PrMetric,
     min_samples: i64,
 ) -> Vec<Fired> {
     let mut out = Vec::new();
     for t in triggers {
         let (value, samples) = match t.metric {
+            TriggerMetric::PrChangesRequestedRate if pr.shipped > 0 => {
+                (pr.changes_requested as f64 / pr.shipped as f64, pr.shipped)
+            }
+            TriggerMetric::PrChangesRequestedRate => continue,
             TriggerMetric::ScorerFailRate => match scorers.iter().find(|s| s.scorer == t.subject) {
                 Some(s) if s.scored > 0 => (s.failed as f64 / s.scored as f64, s.scored),
                 _ => continue,
@@ -206,12 +218,16 @@ mod tests {
             StageMetric { stage: "review".into(), finished: 2, failed: 0, rejected: 0, avg_cost_usd: 3.0 },
         ];
         let scorers = [ScorerMetric { scorer: "s1".into(), scored: 5, failed: 2 }];
-        let fired = evaluate_triggers(&triggers, &stages, &scorers, 5);
+        let fired = evaluate_triggers(&triggers, &stages, &scorers, &PrMetric::default(), 5);
         let keys: Vec<_> = fired.iter().map(|f| f.trigger.key()).collect();
         // review cost is high but has only 2 samples; reject rate 0.2 < 0.5.
         assert_eq!(keys, ["stage_failure_rate:impl>0.25", "scorer_fail_rate:s1>0.3"]);
         assert_eq!(fired[0].describe(), "stage_failure_rate for impl is 0.300 > 0.25 (n=10)");
-        assert_eq!(evaluate_triggers(&triggers, &stages, &scorers, 1).len(), 3);
+        assert_eq!(evaluate_triggers(&triggers, &stages, &scorers, &PrMetric::default(), 1).len(), 3);
+        let pr_trigger = [trig(TriggerMetric::PrChangesRequestedRate, "pr", 0.5)];
+        let pr = PrMetric { shipped: 4, changes_requested: 3 };
+        assert_eq!(evaluate_triggers(&pr_trigger, &[], &[], &pr, 4)[0].value, 0.75);
+        assert!(evaluate_triggers(&pr_trigger, &[], &[], &pr, 5).is_empty());
     }
 
     #[test]

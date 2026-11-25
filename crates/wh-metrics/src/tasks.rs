@@ -26,6 +26,8 @@ pub struct TaskRow {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    pub pr_url: Option<String>,
+    pub pr_state: Option<String>,
 }
 
 impl TasksProjection {
@@ -38,7 +40,7 @@ impl TasksProjection {
     pub async fn list(pool: &PgPool) -> anyhow::Result<Vec<TaskRow>> {
         Ok(sqlx::query_as(
             "SELECT task_id, title, source, factory, status, current_stage, rework_loops, gate_rejections, \
-             blocked_reason, created_at, updated_at, completed_at FROM tasks_view WHERE benchmark_run IS NULL \
+             blocked_reason, created_at, updated_at, completed_at, pr_url, pr_state FROM tasks_view WHERE benchmark_run IS NULL \
              ORDER BY created_at DESC",
         )
         .fetch_all(pool)
@@ -68,12 +70,12 @@ impl EventHandler for TasksProjection {
             return Ok(());
         };
         match ev.decode::<TaskEvent>()? {
-            TaskEvent::TaskCreated { title, source, factory, benchmark, .. } => {
+            TaskEvent::TaskCreated { title, source, factory, benchmark, external_ref, .. } => {
                 sqlx::query(
                     "INSERT INTO tasks_view \
                      (task_id, title, source, factory, status, current_stage, created_at, updated_at, last_seq, \
-                      benchmark_run, benchmark_case) \
-                     VALUES ($1, $2, $3, $4, 'open', NULL, $5, $5, $6, $7, $8) ON CONFLICT (task_id) DO NOTHING",
+                      benchmark_run, benchmark_case, external_ref) \
+                     VALUES ($1, $2, $3, $4, 'open', NULL, $5, $5, $6, $7, $8, $9) ON CONFLICT (task_id) DO NOTHING",
                 )
                 .bind(id)
                 .bind(title)
@@ -83,13 +85,15 @@ impl EventHandler for TasksProjection {
                 .bind(ev.global_seq)
                 .bind(benchmark.as_ref().map(|b| b.run.0))
                 .bind(benchmark.map(|b| b.case))
+                .bind(external_ref.map(|e| format!("{}#{}", e.repo, e.issue)))
                 .execute(&self.pool)
                 .await?;
             }
             TaskEvent::StageEntered { stage, feedback } => {
                 sqlx::query(&Self::guarded(
-                    "status = 'running', current_stage = $4, blocked_reason = NULL, \
-                     rework_loops = rework_loops + $5",
+                    "rework_loops = rework_loops + CASE WHEN status = 'shipped' THEN 0 ELSE $5 END, \
+                     pr_rework_loops = pr_rework_loops + CASE WHEN status = 'shipped' THEN 1 ELSE 0 END, \
+                     status = 'running', current_stage = $4, blocked_reason = NULL",
                 ))
                 .bind(id)
                 .bind(ev.global_seq)
@@ -126,6 +130,66 @@ impl EventHandler for TasksProjection {
                 self.exec(&Self::guarded("status = 'done', current_stage = NULL, completed_at = $3"), id, ev).await?
             }
             TaskEvent::TaskCancelled { .. } => self.exec(&Self::guarded("status = 'cancelled'"), id, ev).await?,
+            TaskEvent::TaskShipped { pr_url, pr_number, .. } => {
+                sqlx::query(&Self::guarded(
+                    "status = 'shipped', current_stage = NULL, blocked_reason = NULL, pr_url = $4, pr_number = $5, \
+                     pr_state = 'open', shipped_at = COALESCE(shipped_at, $3)",
+                ))
+                .bind(id)
+                .bind(ev.global_seq)
+                .bind(ev.meta.occurred_at)
+                .bind(pr_url)
+                .bind(pr_number as i32)
+                .execute(&self.pool)
+                .await?;
+            }
+            TaskEvent::PrReviewed { state, submitted_at, .. } => {
+                sqlx::query(&Self::guarded(
+                    "pr_reviews = pr_reviews + 1, changes_requested = changes_requested + $5, \
+                     first_review_at = COALESCE(first_review_at, $4)",
+                ))
+                .bind(id)
+                .bind(ev.global_seq)
+                .bind(ev.meta.occurred_at)
+                .bind(submitted_at.unwrap_or(ev.meta.occurred_at))
+                .bind(i32::from(state == wh_core::task::CHANGES_REQUESTED))
+                .execute(&self.pool)
+                .await?;
+            }
+            TaskEvent::PrChecksCompleted { conclusion, .. } => {
+                sqlx::query(&Self::guarded("ci_failures = ci_failures + $4"))
+                    .bind(id)
+                    .bind(ev.global_seq)
+                    .bind(ev.meta.occurred_at)
+                    .bind(i32::from(conclusion != "success"))
+                    .execute(&self.pool)
+                    .await?;
+            }
+            TaskEvent::PrMerged { merged_at, .. } => {
+                let at = merged_at.unwrap_or(ev.meta.occurred_at);
+                sqlx::query(&Self::guarded(
+                    "status = 'done', current_stage = NULL, pr_state = 'merged', merged_at = $4, completed_at = $4",
+                ))
+                .bind(id)
+                .bind(ev.global_seq)
+                .bind(ev.meta.occurred_at)
+                .bind(at)
+                .execute(&self.pool)
+                .await?;
+            }
+            TaskEvent::PrClosed { .. } => {
+                sqlx::query(&Self::guarded(
+                    "pr_state = 'closed', \
+                     status = CASE WHEN status IN ('done', 'cancelled') THEN status ELSE 'blocked' END, \
+                     blocked_reason = CASE WHEN status IN ('done', 'cancelled') THEN blocked_reason \
+                       ELSE 'pull request closed without merging' END",
+                ))
+                .bind(id)
+                .bind(ev.global_seq)
+                .bind(ev.meta.occurred_at)
+                .execute(&self.pool)
+                .await?;
+            }
         }
         Ok(())
     }

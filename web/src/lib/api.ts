@@ -1,6 +1,8 @@
 // Typed client for the `wh serve` API (see crates/wh-api).
 
-export type TaskStatus = 'open' | 'running' | 'awaiting_gate' | 'blocked' | 'done' | 'cancelled'
+export type TaskStatus = 'open' | 'running' | 'awaiting_gate' | 'blocked' | 'shipped' | 'done' | 'cancelled'
+
+export type PrState = 'open' | 'merged' | 'closed'
 
 export interface TaskSummary {
   task_id: string
@@ -20,6 +22,18 @@ export interface TaskSummary {
   /** Set for benchmark cases (they never appear in the task list). */
   benchmark_run: string | null
   benchmark_case: string | null
+  /** GitHub (phase 8): `owner/name#N` of the source issue and the task's PR. */
+  external_ref: string | null
+  pr_url: string | null
+  pr_number: number | null
+  pr_state: PrState | null
+  shipped_at: string | null
+  first_review_at: string | null
+  merged_at: string | null
+  pr_reviews: number
+  changes_requested: number
+  ci_failures: number
+  pr_rework_loops: number
 }
 
 export interface EventMeta {
@@ -91,6 +105,9 @@ export interface TaskState {
   body: string | null
   rework_loops: number
   results: StageResult[]
+  pr: { repo: string; number: number; url: string; branch: string; commit: string; closed: boolean } | null
+  pr_rework_loops: number
+  external_ref: { repo: string; issue: number; url: string } | null
 }
 
 export interface TaskDetail {
@@ -227,6 +244,25 @@ export interface Dashboard {
     tasks_created: number
     tasks_done: number
   }[]
+  cycle: CycleTimes
+}
+
+/** Pull request cycle times over tasks shipped in the window (`wh_metrics::queries::cycle_times`). */
+export interface CycleTimes {
+  shipped: number
+  merged: number
+  open: number
+  changes_requested_tasks: number
+  ci_failed_tasks: number
+  avg_pr_rework: number | null
+  kickoff_to_pr_p50_ms: number | null
+  kickoff_to_pr_p95_ms: number | null
+  pr_to_first_review_p50_ms: number | null
+  pr_to_first_review_p95_ms: number | null
+  review_to_merge_p50_ms: number | null
+  review_to_merge_p95_ms: number | null
+  kickoff_to_merge_p50_ms: number | null
+  kickoff_to_merge_p95_ms: number | null
 }
 
 export interface FactoryDef {
@@ -254,6 +290,19 @@ export interface FactoryDef {
   }[]
   scorers: ScorerDef[]
   improvement: ImprovementDef | null
+  github: GithubDef | null
+}
+
+export interface GithubDef {
+  repo: string | null
+  remote: string
+  base: string | null
+  draft: boolean
+  labels: string[]
+  poll_interval_sec: number
+  ship_gate: string | null
+  rework_stage: string
+  issue_label: string | null
 }
 
 export interface ImprovementDef {

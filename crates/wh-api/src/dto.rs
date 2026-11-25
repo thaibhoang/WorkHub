@@ -56,6 +56,28 @@ pub struct TaskStateDto {
     pub body: Option<String>,
     pub rework_loops: u32,
     pub results: Vec<StageResultDto>,
+    /// The task's pull request (phase 8).
+    pub pr: Option<PrDto>,
+    pub pr_rework_loops: u32,
+    /// `owner/name#N` of the issue the task came from.
+    pub external_ref: Option<ExternalRefDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PrDto {
+    pub repo: String,
+    pub number: u64,
+    pub url: String,
+    pub branch: String,
+    pub commit: String,
+    pub closed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalRefDto {
+    pub repo: String,
+    pub issue: u64,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +109,19 @@ impl From<&TaskState> for TaskStateDto {
                 .iter()
                 .map(|r| StageResultDto { stage: r.stage.clone(), outcome: r.outcome.as_str(), summary: r.summary.clone() })
                 .collect(),
+            pr: s.pr.as_ref().map(|p| PrDto {
+                repo: p.repo.clone(),
+                number: p.number,
+                url: p.url.clone(),
+                branch: p.branch.clone(),
+                commit: p.commit.clone(),
+                closed: p.closed,
+            }),
+            pr_rework_loops: s.pr_rework_loops,
+            external_ref: s
+                .external_ref
+                .as_ref()
+                .map(|e| ExternalRefDto { repo: e.repo.clone(), issue: e.issue, url: e.url.clone() }),
         }
     }
 }
@@ -174,6 +209,37 @@ pub struct FactoryDto {
     pub stages: Vec<StageDto>,
     pub scorers: Vec<ScorerDto>,
     pub improvement: Option<ImprovementDto>,
+    pub github: Option<GithubDto>,
+}
+
+/// `github:` from factory.yaml (phase 8).
+#[derive(Debug, Clone, Serialize)]
+pub struct GithubDto {
+    pub repo: Option<String>,
+    pub remote: String,
+    pub base: Option<String>,
+    pub draft: bool,
+    pub labels: Vec<String>,
+    pub poll_interval_sec: u64,
+    pub ship_gate: Option<String>,
+    pub rework_stage: String,
+    pub issue_label: Option<String>,
+}
+
+impl From<&wh_factory::Github> for GithubDto {
+    fn from(g: &wh_factory::Github) -> Self {
+        Self {
+            repo: g.repo.clone(),
+            remote: g.remote.clone(),
+            base: g.base.clone(),
+            draft: g.draft,
+            labels: g.labels.clone(),
+            poll_interval_sec: g.poll_interval.as_secs(),
+            ship_gate: g.ship_gate.clone(),
+            rework_stage: g.rework_stage.clone(),
+            issue_label: g.issues.as_ref().map(|i| i.label.clone()),
+        }
+    }
 }
 
 /// A scorer definition from factory.yaml.
@@ -263,6 +329,7 @@ impl From<&Factory> for FactoryDto {
                 .collect(),
             scorers: f.scorers.iter().map(ScorerDto::from).collect(),
             improvement: f.improvement.as_ref().map(ImprovementDto::from),
+            github: f.github.as_ref().map(GithubDto::from),
         }
     }
 }

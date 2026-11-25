@@ -2235,6 +2235,7 @@ dependencies = [
  "wh-eventstore",
  "wh-factory",
  "wh-foreman",
+ "wh-github",
  "wh-improver",
  "wh-metrics",
  "wh-runner",
@@ -2283,6 +2284,7 @@ name = "wh-foreman"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
@@ -2290,8 +2292,28 @@ dependencies = [
  "wh-core",
  "wh-eventstore",
  "wh-factory",
+ "wh-github",
  "wh-metrics",
  "wh-runner",
+]
+
+[[package]]
+name = "wh-github"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wh-core",
+ "wh-eventstore",
+ "wh-factory",
+ "wh-metrics",
 ]
 
 [[package]]
