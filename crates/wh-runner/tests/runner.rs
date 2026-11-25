@@ -7,7 +7,7 @@ use std::{
 
 use sqlx::PgPool;
 use tokio::sync::mpsc::UnboundedSender;
-use wh_core::{FailureClass, TaskId, session::{SessionEvent, TokenUsage}};
+use wh_core::{DockerSandbox, FailureClass, Sandbox, TaskId, session::{SessionEvent, TokenUsage}};
 use wh_eventstore::EventStore;
 use wh_metrics::sessions::SessionFactsProjection;
 use wh_runner::{AgentRequest, AgentRuntime, Outcome, OutcomeStatus, RunSpec, Runner, RunnerConfig, Signal};
@@ -65,6 +65,7 @@ fn spec(repo: &Path, task: TaskId, base_ref: &str) -> RunSpec {
         feedback: None,
         factory_version: None,
         benchmark: None,
+        sandbox: Default::default(),
     }
 }
 
@@ -244,4 +245,87 @@ async fn retries_stop_at_max_and_skip_non_retryable(pool: PgPool) {
     s.task_id = TaskId::new();
     let budget = Runner::new(store.clone(), flaky(u32::MAX, FailureClass::BudgetExceeded, false), cfg);
     assert_eq!(budget.run(s, |_| {}).await.unwrap().attempts.len(), 1, "non-retryable is not retried");
+}
+
+/// Runtime double for the docker sandbox: checks the container the runner prepared.
+struct ContainerProbe;
+
+impl AgentRuntime for ContainerProbe {
+    fn name(&self) -> &str {
+        "fake"
+    }
+    async fn run(&self, req: &AgentRequest, _tx: UnboundedSender<Signal>) -> Outcome {
+        let c = req.container.as_ref().expect("docker sandbox must hand the runtime a container");
+        let wd = req.workdir.display().to_string();
+        assert_eq!(c.workdir, req.workdir);
+        assert_eq!(c.mounts[0], format!("{wd}:{wd}:rw"), "worktree mounted at the same path");
+        // Linked worktree: the main repo's git dir read-only, this worktree's git dir read-write.
+        assert!(c.mounts[1].ends_with("/.git:ro"), "{:?}", c.mounts);
+        assert!(c.mounts[2].contains("/.git/worktrees/") && c.mounts[2].ends_with(":rw"), "{:?}", c.mounts);
+        assert!(c.mounts[3].ends_with(":/home/wh:rw"));
+        assert!(c.home_dir.is_dir(), "home exists while the session runs");
+        assert!(c.user.is_some());
+        assert_eq!(c.name, format!("wh-{}", c.session));
+        std::fs::write(req.workdir.join("out.txt"), "x").unwrap();
+        success()
+    }
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn docker_sandbox_prepares_container_and_records_it(pool: PgPool) {
+    let repo = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    git_repo(repo.path());
+    let store = EventStore::new(pool.clone());
+    let runner = Runner::new(store.clone(), ContainerProbe, RunnerConfig { data_dir: data.path().into() });
+
+    let mut s = spec(repo.path(), TaskId::new(), "HEAD");
+    s.sandbox = Sandbox::Docker(DockerSandbox::new("img:test"));
+    s.commit_on_success = true;
+    let report = runner.run(s, |_| {}).await.unwrap();
+    let last = report.last();
+    assert_eq!(last.outcome.status, OutcomeStatus::Succeeded);
+    // The host commits what the agent wrote in the container.
+    let started = store.read_stream(&last.session_id.stream_id()).await.unwrap();
+    let sandbox = started.iter().find_map(|e| match e.decode::<SessionEvent>() {
+        Ok(SessionEvent::AgentSessionStarted { sandbox, .. }) => sandbox,
+        _ => None,
+    });
+    assert_eq!(sandbox, Some(Sandbox::Docker(DockerSandbox::new("img:test"))));
+    let completed = started.iter().find_map(|e| match e.decode::<SessionEvent>() {
+        Ok(SessionEvent::AgentSessionCompleted { commit, .. }) => commit,
+        _ => None,
+    });
+    assert!(completed.is_some(), "changes made in the container are committed");
+    assert!(!data.path().join("sandbox-home").join(last.session_id.to_string()).exists(), "home removed");
+
+    wh_metrics::catch_up_all(&store).await.unwrap();
+    let row = wh_metrics::queries::session(&pool, last.session_id.0).await.unwrap().unwrap();
+    assert_eq!(row.sandbox.as_deref(), Some("docker:img:test"));
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn missing_volume_is_env_setup_and_not_retried(pool: PgPool) {
+    let repo = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    git_repo(repo.path());
+    let store = EventStore::new(pool.clone());
+    let runner = Runner::new(store.clone(), ContainerProbe, RunnerConfig { data_dir: data.path().into() });
+
+    let mut d = DockerSandbox::new("img:test");
+    d.volumes = vec!["/definitely/not/here:/cache".into()];
+    let mut s = spec(repo.path(), TaskId::new(), "HEAD");
+    s.sandbox = Sandbox::Docker(d);
+    s.max_retries = 2;
+    let report = runner.run(s, |_| {}).await.unwrap();
+    assert_eq!(report.attempts.len(), 1, "env_setup is not retried");
+    match &report.last().outcome.status {
+        OutcomeStatus::Failed { class, message, retryable } => {
+            assert_eq!(*class, FailureClass::EnvSetup);
+            assert!(message.contains("/definitely/not/here"), "{message}");
+            assert!(!retryable);
+        }
+        other => panic!("expected failure, got {other:?}"),
+    }
+    assert!(std::fs::read_dir(data.path().join("worktrees")).unwrap().next().is_none(), "worktree cleaned up");
 }

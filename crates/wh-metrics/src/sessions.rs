@@ -158,12 +158,13 @@ impl EventHandler for SessionFactsProjection {
                 .execute(&self.pool)
                 .await?;
             }
-            SessionEvent::AgentSessionStarted { workdir, branch, .. } => {
-                sqlx::query(&Self::guarded("status = 'running', workdir = $3, branch = $4"))
+            SessionEvent::AgentSessionStarted { workdir, branch, sandbox, .. } => {
+                sqlx::query(&Self::guarded("status = 'running', workdir = $3, branch = $4, sandbox = $5"))
                     .bind(id)
                     .bind(seq)
                     .bind(workdir)
                     .bind(branch)
+                    .bind(sandbox.map(|s| s.label()))
                     .execute(&self.pool)
                     .await?;
             }

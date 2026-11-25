@@ -4,7 +4,8 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    ffi::OsString,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -18,53 +19,93 @@ use tokio::{
 };
 use wh_core::{FailureClass, session::TokenUsage};
 
-use crate::runtime::{AgentRequest, AgentRuntime, Outcome, OutcomeStatus, Signal};
+use crate::{
+    docker,
+    runtime::{AgentRequest, AgentRuntime, Outcome, OutcomeStatus, Signal},
+};
 
 pub struct ClaudeCode {
     pub bin: PathBuf,
+    /// `docker` binary, used for sessions with a container.
+    pub docker_bin: PathBuf,
+    /// Claude Code binary name/path inside agent images.
+    pub container_bin: String,
 }
 
 impl ClaudeCode {
     pub fn new(bin: impl Into<PathBuf>) -> Self {
-        Self { bin: bin.into() }
+        Self { bin: bin.into(), docker_bin: "docker".into(), container_bin: "claude".into() }
     }
 
-    fn command(&self, req: &AgentRequest) -> Command {
-        let mut cmd = Command::new(&self.bin);
-        cmd.arg("-p")
-            .arg(&req.prompt)
-            .args(["--output-format", "stream-json", "--verbose", "--no-session-persistence"]);
+    /// Claude Code arguments (without the binary). Pure.
+    pub fn args(req: &AgentRequest) -> Vec<OsString> {
+        let mut a: Vec<OsString> = Vec::new();
+        let mut push = |s: &str| a.push(s.into());
+        push("-p");
+        push(&req.prompt);
+        for s in ["--output-format", "stream-json", "--verbose", "--no-session-persistence"] {
+            push(s);
+        }
         if let Some(m) = &req.model {
-            cmd.args(["--model", m]);
+            push("--model");
+            push(m);
         }
         if let Some(b) = req.budget_usd {
-            cmd.args(["--max-budget-usd", &b.to_string()]);
+            push("--max-budget-usd");
+            push(&b.to_string());
         }
         if let Some(p) = &req.permission_mode {
-            cmd.args(["--permission-mode", p]);
+            push("--permission-mode");
+            push(p);
         }
         if !req.allowed_tools.is_empty() {
-            cmd.arg("--allowed-tools").args(&req.allowed_tools);
+            push("--allowed-tools");
+            for t in &req.allowed_tools {
+                push(t);
+            }
         }
         match req.tools.as_deref() {
             Some([]) => {
-                cmd.args(["--tools", ""]);
+                push("--tools");
+                push("");
             }
             Some(tools) => {
-                cmd.arg("--tools").arg(tools.join(","));
+                push("--tools");
+                push(&tools.join(","));
             }
             None => {}
         }
         if !req.with_user_mcp {
-            cmd.arg("--strict-mcp-config");
+            push("--strict-mcp-config");
         }
-        cmd.current_dir(&req.workdir)
-            .env_remove("CLAUDECODE")
+        a
+    }
+
+    fn command(&self, req: &AgentRequest) -> Command {
+        let mut cmd = match &req.container {
+            None => {
+                let mut c = Command::new(&self.bin);
+                c.args(Self::args(req)).current_dir(&req.workdir);
+                c
+            }
+            Some(container) => {
+                let mut inner: Vec<OsString> = vec![self.container_bin.clone().into()];
+                inner.extend(Self::args(req));
+                let mut c = Command::new(&self.docker_bin);
+                c.args(docker::run_args(container, &inner));
+                c
+            }
+        };
+        cmd.env_remove("CLAUDECODE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         cmd
+    }
+
+    fn launcher(&self, req: &AgentRequest) -> &Path {
+        if req.container.is_some() { &self.docker_bin } else { &self.bin }
     }
 }
 
@@ -78,10 +119,12 @@ impl AgentRuntime for ClaudeCode {
         let mut child = match self.command(req).spawn() {
             Ok(c) => c,
             Err(e) => {
-                let msg = format!("failed to start {}: {e}", self.bin.display());
+                let msg = format!("failed to start {}: {e}", self.launcher(req).display());
                 return Outcome::failed(FailureClass::EnvSetup, msg, false, started.elapsed());
             }
         };
+        let mut guard =
+            docker::Guard { docker_bin: self.docker_bin.clone(), name: req.container.as_ref().map(|c| c.name.clone()) };
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
         let stderr_task = tokio::spawn(async move {
@@ -116,6 +159,9 @@ impl AgentRuntime for ClaudeCode {
         }
         if timed_out {
             let _ = child.kill().await;
+            if let Some(name) = guard.name.take() {
+                docker::remove(&self.docker_bin, &name).await;
+            }
             let mut o = parser.outcome().unwrap_or_else(|| Outcome::failed(FailureClass::Timeout, "", true, Duration::ZERO));
             o.status = OutcomeStatus::Failed {
                 class: FailureClass::Timeout,
@@ -127,7 +173,15 @@ impl AgentRuntime for ClaudeCode {
         }
 
         let status = child.wait().await;
+        guard.name = None; // `--rm` removes a container whose process exited
         let stderr = stderr_task.await.unwrap_or_default();
+        let code = status.as_ref().ok().and_then(|s| s.code());
+        if req.container.is_some() && parser.outcome().is_none() && matches!(code, Some(125..=127)) {
+            // 125: docker itself failed (no such image, bad flag, daemon down);
+            // 126/127: the agent binary is missing or not executable in the image.
+            let msg = format!("container failed to start (exit {}): {}", code.unwrap_or(0), tail(&stderr, 2000));
+            return Outcome::failed(FailureClass::EnvSetup, msg, false, started.elapsed());
+        }
         parser.outcome().unwrap_or_else(|| {
             let msg = format!(
                 "claude exited ({}) without a result. stderr: {}",

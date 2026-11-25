@@ -224,6 +224,8 @@ pub struct AgentDto {
     pub max_retries: u32,
     pub permission_mode: String,
     pub allowed_tools: Vec<String>,
+    /// Full sandbox config: `{"kind":"worktree"}` or `{"kind":"docker","image":...}`.
+    pub sandbox: wh_core::Sandbox,
     pub prompt: String,
 }
 
@@ -253,6 +255,7 @@ impl From<&Factory> for FactoryDto {
                             max_retries: a.max_retries,
                             permission_mode: a.permission_mode.clone(),
                             allowed_tools: a.allowed_tools.clone(),
+                            sandbox: a.sandbox.clone(),
                             prompt: a.prompt.clone(),
                         },
                     }

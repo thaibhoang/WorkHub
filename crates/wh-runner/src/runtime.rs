@@ -3,6 +3,8 @@ use std::{future::Future, path::PathBuf, time::Duration};
 use tokio::sync::mpsc::UnboundedSender;
 use wh_core::{FailureClass, session::TokenUsage};
 
+use crate::docker::Container;
+
 /// Everything a runtime needs to execute one agent session.
 #[derive(Debug, Clone)]
 pub struct AgentRequest {
@@ -19,6 +21,8 @@ pub struct AgentRequest {
     /// Restrict the built-in tool set (`Some(vec![])` = no tools, e.g. for a judge).
     /// `None` keeps the runtime's default tools.
     pub tools: Option<Vec<String>>,
+    /// Run the agent inside this container instead of directly on the host.
+    pub container: Option<Container>,
 }
 
 /// Live progress reported while the session runs.

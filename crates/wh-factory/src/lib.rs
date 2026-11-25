@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+pub use wh_core::{DockerSandbox, Sandbox};
 
 const DEFAULT_BUDGET_USD: f64 = 2.0;
 const DEFAULT_TIMEOUT_MIN: u64 = 30;
@@ -104,6 +105,99 @@ struct Settings {
     max_retries: Option<u32>,
     permission_mode: Option<String>,
     allowed_tools: Option<Vec<String>>,
+    sandbox: Option<SandboxFile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SandboxKind {
+    Worktree,
+    Docker,
+}
+
+/// `sandbox:` in `defaults` or on an agent. An agent's block replaces the default
+/// block as a whole (fields are not merged).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SandboxFile {
+    kind: SandboxKind,
+    image: Option<String>,
+    network: Option<String>,
+    cpus: Option<f64>,
+    memory: Option<String>,
+    pids_limit: Option<u32>,
+    env: Option<Vec<String>>,
+    volumes: Option<Vec<String>>,
+    copy_credentials: Option<bool>,
+}
+
+impl SandboxFile {
+    fn resolve(&self, base: &Path) -> anyhow::Result<Sandbox> {
+        if self.kind == SandboxKind::Worktree {
+            let docker_only = self.image.is_some()
+                || self.network.is_some()
+                || self.cpus.is_some()
+                || self.memory.is_some()
+                || self.pids_limit.is_some()
+                || self.env.is_some()
+                || self.volumes.is_some()
+                || self.copy_credentials.is_some();
+            ensure!(!docker_only, "container settings need `kind: docker`");
+            return Ok(Sandbox::Worktree);
+        }
+        let mut d = DockerSandbox::new(self.image.clone().unwrap_or_else(|| DockerSandbox::DEFAULT_IMAGE.into()));
+        ensure!(!d.image.trim().is_empty(), "image is empty");
+        if let Some(n) = &self.network {
+            ensure!(!n.trim().is_empty(), "network is empty");
+            d.network = n.clone();
+        }
+        if let Some(c) = self.cpus {
+            ensure!(c > 0.0, "cpus must be > 0");
+        }
+        d.cpus = self.cpus;
+        d.memory = self.memory.clone();
+        d.pids_limit = self.pids_limit;
+        for name in self.env.iter().flatten() {
+            let valid = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            ensure!(valid, "env: '{name}' is not a variable name (values are passed through from the host)");
+        }
+        d.env = self.env.clone().unwrap_or_default();
+        d.volumes = self.volumes.iter().flatten().map(|v| resolve_volume(v, base)).collect::<anyhow::Result<_>>()?;
+        d.copy_credentials = self.copy_credentials.unwrap_or(true);
+        Ok(Sandbox::Docker(d))
+    }
+}
+
+/// `host:container[:ro|rw]` with the host path made absolute (`~/` = $HOME,
+/// relative = relative to the factory file).
+fn resolve_volume(spec: &str, base: &Path) -> anyhow::Result<String> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let (host, container, mode) = match parts.as_slice() {
+        [h, c] => (*h, *c, None),
+        [h, c, m] => (*h, *c, Some(*m)),
+        _ => bail!("volume '{spec}': expected host:container[:ro|rw]"),
+    };
+    ensure!(!host.is_empty(), "volume '{spec}': host path is empty");
+    ensure!(container.starts_with('/'), "volume '{spec}': container path must be absolute");
+    ensure!(matches!(mode, None | Some("ro") | Some("rw")), "volume '{spec}': mode must be ro or rw");
+    let host = if let Some(rest) = host.strip_prefix("~/") {
+        let home = std::env::var_os("HOME").context("volume uses ~ but HOME is not set")?;
+        PathBuf::from(home).join(rest)
+    } else {
+        let p = Path::new(host);
+        if p.is_absolute() { p.to_owned() } else { absolute(&base.join(p)) }
+    };
+    let host = host.to_str().with_context(|| format!("volume '{spec}': host path is not UTF-8"))?.to_owned();
+    ensure!(!host.contains(':'), "volume '{spec}': host path contains ':'");
+    Ok(match mode {
+        Some(m) => format!("{host}:{container}:{m}"),
+        None => format!("{host}:{container}"),
+    })
+}
+
+fn absolute(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_owned())
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +247,8 @@ pub struct Agent {
     pub max_retries: u32,
     pub permission_mode: String,
     pub allowed_tools: Vec<String>,
+    /// Where the agent's sessions run (worktree on the host, or a container).
+    pub sandbox: Sandbox,
 }
 
 /// LLM-as-judge definition: grades sessions of `target` agent with `prompt`.
@@ -270,6 +366,10 @@ impl Factory {
             hasher.update(name.as_bytes());
             hasher.update(prompt.as_bytes());
             let s = &a.settings;
+            let sandbox = match s.sandbox.as_ref().or(d.sandbox.as_ref()) {
+                None => Sandbox::Worktree,
+                Some(sb) => sb.resolve(base).with_context(|| format!("agent '{name}': sandbox"))?,
+            };
             let budget_usd = s.budget_usd.or(d.budget_usd).unwrap_or(DEFAULT_BUDGET_USD);
             ensure!(budget_usd > 0.0, "agent '{name}': budget_usd must be > 0");
             agents.insert(name.clone(), Agent {
@@ -286,6 +386,7 @@ impl Factory {
                     .or_else(|| d.permission_mode.clone())
                     .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.into()),
                 allowed_tools: s.allowed_tools.clone().or_else(|| d.allowed_tools.clone()).unwrap_or_default(),
+                sandbox,
             });
         }
 
@@ -502,6 +603,31 @@ improvement:
     }
 
     #[test]
+    fn sandbox_defaults_and_agent_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = Factory::load(&write(dir.path(), OK)).unwrap();
+        assert_eq!(f.agents["a"].sandbox, Sandbox::Worktree);
+
+        let yaml = OK
+            .replace(
+                "max_retries: 1 }",
+                "max_retries: 1, sandbox: { kind: docker, network: host, memory: 4g, env: [GH_TOKEN], \
+                 volumes: [\"cache:/cache:ro\", \"/abs:/abs\"] } }",
+            )
+            .replace("model: claude-haiku-5-5 }", "model: claude-haiku-5-5, sandbox: { kind: worktree } }");
+        let f = Factory::load(&write(dir.path(), &yaml)).unwrap();
+        let Sandbox::Docker(d) = &f.agents["a"].sandbox else { panic!("expected docker") };
+        assert_eq!(d.image, DockerSandbox::DEFAULT_IMAGE);
+        assert_eq!((d.network.as_str(), d.memory.as_deref()), ("host", Some("4g")));
+        assert_eq!(d.env, vec!["GH_TOKEN".to_string()]);
+        let cache = std::path::absolute(dir.path().join("cache")).unwrap();
+        assert_eq!(d.volumes, vec![format!("{}:/cache:ro", cache.display()), "/abs:/abs".into()]);
+        assert!(d.copy_credentials);
+        assert_eq!(f.agents["b"].sandbox, Sandbox::Worktree);
+        assert_eq!(f.agents["a"].sandbox.label(), "docker:workhub-agent:latest");
+    }
+
+    #[test]
     fn version_changes_when_a_prompt_changes() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(dir.path(), OK);
@@ -528,6 +654,10 @@ improvement:
             ("use `scorer`, not `stage`", OK.replace("scorer: s1, above", "stage: impl, above")),
             ("within 0..1", OK.replace("above: 0.25", "above: 2")),
             ("unknown variant", OK.replace("metric: stage_failure_rate", "metric: vibes")),
+            ("need `kind: docker`", OK.replace("max_retries: 1 }", "max_retries: 1, sandbox: { kind: worktree, image: x } }")),
+            ("container path must be absolute", OK.replace("max_retries: 1 }", "max_retries: 1, sandbox: { kind: docker, volumes: [\"a:b\"] } }")),
+            ("not a variable name", OK.replace("max_retries: 1 }", "max_retries: 1, sandbox: { kind: docker, env: [\"A=1\"] } }")),
+            ("unknown field", OK.replace("max_retries: 1 }", "max_retries: 1, sandbox: { kind: docker, img: x } }")),
         ];
         for (needle, yaml) in cases {
             let dir = tempfile::tempdir().unwrap();

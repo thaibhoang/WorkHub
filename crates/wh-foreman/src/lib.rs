@@ -15,7 +15,7 @@ use anyhow::Context;
 
 use tokio::sync::Semaphore;
 use wh_core::{
-    Actor, BenchmarkRunId, EventMeta, FailureClass, NewEvent, RecordedEvent, SessionId, TaskId,
+    Actor, BenchmarkRunId, EventMeta, FailureClass, NewEvent, RecordedEvent, Sandbox, SessionId, TaskId,
     session::SessionEvent,
     task::{TaskEvent, TaskState},
 };
@@ -174,6 +174,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             feedback,
             factory_version: Some(f.version.clone()),
             benchmark: bench.map(|b| b.run),
+            sandbox: agent.sandbox.clone(),
         }
     }
 
@@ -264,6 +265,13 @@ pub async fn recover_interrupted(
             transcript: None,
         };
         let _ = store.append(&stream, ExpectedVersion::Exact(version), vec![NewEvent::from_domain(&ev, meta(task_id))?]).await;
+        // A container outlives the `docker run` client of a crashed process.
+        let in_container = events.iter().any(|e| {
+            matches!(e.decode(), Ok(SessionEvent::AgentSessionStarted { sandbox: Some(Sandbox::Docker(_)), .. }))
+        });
+        if let (true, Some(session)) = (in_container, SessionId::from_stream_id(&stream)) {
+            wh_runner::docker::remove(std::path::Path::new("docker"), &wh_runner::docker::container_name(session)).await;
+        }
     }
     Ok(blocked)
 }

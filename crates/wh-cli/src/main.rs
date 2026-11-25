@@ -1,4 +1,5 @@
 mod bench;
+mod sandbox;
 
 use std::{path::PathBuf, time::Duration};
 
@@ -23,6 +24,7 @@ use wh_metrics::{
     tasks::TasksProjection,
 };
 use bench::{bench_cmd, run_bench_worker};
+use sandbox::{SandboxCmd, sandbox_cmd};
 use wh_scorer::{Graded, ScorerConfig, ScorerService};
 use wh_runner::{OutcomeStatus, RunSpec, Runner, RunnerConfig, Signal, claude_code::ClaudeCode};
 
@@ -49,6 +51,11 @@ enum Cmd {
     },
     /// Run one agent session on a repo (in a fresh git worktree)
     Run(RunArgs),
+    /// Docker sandbox: build the agent image, check the setup, list/clean containers
+    Sandbox {
+        #[command(subcommand)]
+        cmd: SandboxCmd,
+    },
     /// Drive factory tasks through the pipeline (plus projections) until Ctrl+C
     Foreman {
         #[arg(long, env = "WH_FACTORY", default_value = "factory/factory.yaml")]
@@ -378,6 +385,15 @@ struct RunArgs {
     cleanup: bool,
     #[arg(long, env = "WH_CLAUDE_BIN", default_value = "claude")]
     claude_bin: PathBuf,
+    /// Run the agent in a Docker container over the worktree (see `wh sandbox`)
+    #[arg(long)]
+    docker: bool,
+    /// Image for --docker
+    #[arg(long, default_value = wh_core::DockerSandbox::DEFAULT_IMAGE, requires = "docker")]
+    image: String,
+    /// Container network for --docker (the agent must reach the Anthropic API)
+    #[arg(long, default_value = wh_core::DockerSandbox::DEFAULT_NETWORK, requires = "docker")]
+    network: String,
 }
 
 #[derive(Subcommand)]
@@ -476,12 +492,13 @@ async fn main() -> Result<()> {
             for st in &f.stages {
                 let a = f.agent(st);
                 println!(
-                    "  {:<12} agent {:<15} model {:<18} budget ${:<5} retries {}{}{}",
+                    "  {:<12} agent {:<15} model {:<18} budget ${:<5} retries {}  {}{}{}",
                     st.id,
                     a.name,
                     a.model.as_deref().unwrap_or("(default)"),
                     a.budget_usd,
                     a.max_retries,
+                    a.sandbox.label(),
                     st.gate.as_ref().map(|g| format!("  gate: {g}")).unwrap_or_default(),
                     st.on_reject.as_ref().map(|t| format!("  on_reject → {t}")).unwrap_or_default(),
                 );
@@ -713,6 +730,7 @@ async fn main() -> Result<()> {
             c?;
         }
         Cmd::Run(args) => run_agent(&store, args).await?,
+        Cmd::Sandbox { cmd } => sandbox_cmd(&store, cmd).await?,
         Cmd::Sessions { limit } => {
             println!(
                 "{:<36}  {:<14}  {:>3}  {:<9}  {:<15}  {:>8}  {:>5}  {:>9}  {:>8}",
@@ -1060,6 +1078,13 @@ async fn run_agent(store: &EventStore, a: RunArgs) -> Result<()> {
         feedback: None,
         factory_version: None,
         benchmark: None,
+        sandbox: if a.docker {
+            let mut d = wh_core::DockerSandbox::new(a.image);
+            d.network = a.network;
+            wh_core::Sandbox::Docker(d)
+        } else {
+            wh_core::Sandbox::Worktree
+        },
     };
     println!("task {task_id}");
     let runner = Runner::new(store.clone(), ClaudeCode::new(a.claude_bin), RunnerConfig { data_dir: data_dir() });
@@ -1105,7 +1130,7 @@ async fn run_agent(store: &EventStore, a: RunArgs) -> Result<()> {
 }
 
 /// `$WH_DATA_DIR`, else `$XDG_DATA_HOME/workhub`, else `~/.local/share/workhub`.
-fn data_dir() -> PathBuf {
+pub(crate) fn data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("WH_DATA_DIR") {
         return d.into();
     }

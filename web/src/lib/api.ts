@@ -67,6 +67,8 @@ export interface SessionDetail {
   cost_usd: number
   workdir: string | null
   branch: string | null
+  /** `worktree` or `docker:<image>`; null for sessions before sandboxes (worktree). */
+  sandbox: string | null
   transcript: string | null
   factory_version: string | null
   /** Pipeline verdict for the session's stage. */
@@ -246,6 +248,7 @@ export interface FactoryDef {
       max_retries: number
       permission_mode: string
       allowed_tools: string[]
+      sandbox: Sandbox
       prompt: string
     }
   }[]
@@ -596,3 +599,18 @@ export function fmtPct(v: number | null | undefined, digits = 0): string {
 export function firstLine(s: string): string {
   return s.split('\n').find((l) => l.trim())?.trim() ?? ''
 }
+
+/** Where an agent's sessions run (`sandbox:` in factory.yaml). */
+export type Sandbox =
+  | { kind: 'worktree' }
+  | {
+      kind: 'docker'
+      image: string
+      network: string
+      cpus: number | null
+      memory: string | null
+      pids_limit: number | null
+      env: string[]
+      volumes: string[]
+      copy_credentials: boolean
+    }

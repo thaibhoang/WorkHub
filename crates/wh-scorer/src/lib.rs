@@ -292,6 +292,7 @@ impl<R: AgentRuntime> Inner<R> {
             with_user_mcp: false,
             timeout: scorer.timeout,
             tools: Some(Vec::new()),
+            container: None,
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let o = self.runtime.run(&req, tx).await;

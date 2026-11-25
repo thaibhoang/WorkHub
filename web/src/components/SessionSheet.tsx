@@ -35,6 +35,7 @@ function Body({ s, scores }: { s: SessionDetail; scores: ScoreRow[] }) {
   })
   const facts: [string, string][] = [
     ['Model', s.model ?? '–'],
+    ['Sandbox', s.sandbox ?? (s.workdir ? 'worktree' : '–')],
     ['Attempt', String(s.attempt)],
     ['Duration', fmtMs(s.duration_ms)],
     ['Cost', fmtUsd(s.cost_usd, 4)],

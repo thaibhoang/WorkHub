@@ -4,13 +4,14 @@ use anyhow::Context;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 use wh_core::{
-    Actor, BenchmarkRunId, EventMeta, FailureClass, NewEvent, SessionId, TaskId,
+    Actor, BenchmarkRunId, EventMeta, FailureClass, NewEvent, Sandbox, SessionId, TaskId,
     session::SessionEvent,
     task::{StageOutcome, TaskEvent, Verdict, parse_verdict},
 };
 use wh_eventstore::{EventStore, ExpectedVersion};
 
 use crate::{
+    docker,
     runtime::{AgentRequest, AgentRuntime, Outcome, OutcomeStatus, Signal},
     worktree::Worktree,
 };
@@ -56,6 +57,8 @@ pub struct RunSpec {
     pub factory_version: Option<String>,
     /// Benchmark run the session belongs to (recorded on `AgentDispatched`).
     pub benchmark: Option<BenchmarkRunId>,
+    /// Where the agent runs: directly in the worktree, or in a container over it.
+    pub sandbox: Sandbox,
 }
 
 #[derive(Debug, Clone)]
@@ -169,10 +172,27 @@ impl<R: AgentRuntime> Runner<R> {
                 return Ok(SessionReport { session_id, attempt, outcome, workdir: None, branch: None });
             }
         };
+        let container = match spec.sandbox.docker() {
+            None => None,
+            Some(cfg) => match docker::prepare(session_id, cfg, &worktree.path, &self.config.data_dir).await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    let msg = format!("docker sandbox: {e:#}");
+                    let outcome = Outcome::failed(FailureClass::EnvSetup, msg, false, Duration::ZERO);
+                    s.finish(&outcome, None, None).await?;
+                    if let Err(e) = worktree.remove().await {
+                        tracing::warn!("failed to remove worktree {}: {e:#}", worktree.path.display());
+                    }
+                    remove_home(&self.config.data_dir, session_id).await;
+                    return Ok(SessionReport { session_id, attempt, outcome, workdir: None, branch: None });
+                }
+            },
+        };
         s.session(SessionEvent::AgentSessionStarted {
             workdir: worktree.path.display().to_string(),
             branch: worktree.branch.clone(),
             base_ref: spec.base_ref.clone(),
+            sandbox: Some(spec.sandbox.clone()),
         })
         .await?;
 
@@ -190,6 +210,7 @@ impl<R: AgentRuntime> Runner<R> {
             with_user_mcp: spec.with_user_mcp,
             timeout: spec.timeout,
             tools: None,
+            container,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -207,6 +228,10 @@ impl<R: AgentRuntime> Runner<R> {
         while let Ok(sig) = rx.try_recv() {
             on_signal(&sig);
             s.signal(sig).await?;
+        }
+        if req.container.is_some() {
+            // The throwaway home may hold a copy of the user's credentials.
+            remove_home(&self.config.data_dir, session_id).await;
         }
 
         let mut outcome = outcome;
@@ -321,6 +346,15 @@ impl<'a> Recorder<'a> {
             },
         })
         .await
+    }
+}
+
+async fn remove_home(data_dir: &std::path::Path, session: SessionId) {
+    let dir = data_dir.join("sandbox-home").join(session.to_string());
+    if let Err(e) = tokio::fs::remove_dir_all(&dir).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("failed to remove sandbox home {}: {e}", dir.display());
     }
 }
 

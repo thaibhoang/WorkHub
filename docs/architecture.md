@@ -164,7 +164,7 @@ Cần cố định từ đầu để thống kê tỉ lệ fail có ý nghĩa:
 - Áp chính sách: retry tối đa N, giới hạn rework loop, budget mỗi task, escalate sang người.
 
 ### 5.3 Runner (`wh-runner`)
-- Nhận `DispatchAgent`, tạo sandbox (MVP: **git worktree** riêng mỗi session; sau: Docker/K8s), chạy agent, đọc stream, phát event.
+- Nhận `DispatchAgent`, tạo sandbox (**git worktree** riêng mỗi session; từ phase 7 có thể chạy agent trong **container Docker** trên worktree đó, cấu hình `sandbox:` trong factory), chạy agent, đọc stream, phát event.
 - **Adapter Claude Code headless** (MVP): spawn `claude -p <prompt> --output-format stream-json` với `--model`, allowed tools, system prompt/skills theo agent definition. Parse từng dòng JSON → `AgentToolCalled`, `AgentUsageReported`; message `result` cuối cho cost, duration, num_turns.
 - Trait `AgentRuntime` để thêm adapter khác (Claude API trực tiếp, Codex…) mà không đổi lõi.
 - Transcript đầy đủ → `wh-artifacts` (filesystem/S3), event chỉ giữ tham chiếu.
@@ -320,7 +320,8 @@ MVP chạy **một binary** (`workhubd`) chứa mọi consumer dưới dạng to
 | **4. Chất lượng** ✅ | Scorers | Pass rate theo scorer, cost scorer |
 | **5. Tự cải tiến** ✅ | Improver + Inbox duyệt + so sánh theo factory_version | Proposal → PR → đo delta |
 | **6. Benchmarks** ✅ | Suite task cố định + check ẩn, chạy trên factory tại một git ref, so sánh run (proposal vs base) | Proposal → benchmark base/proposal → so sánh pass rate/cost trước khi duyệt |
-| **7. Mở rộng** | GitHub/Slack/Linear, Docker sandbox, NATS | — |
+| **7. Docker sandbox** ✅ | Agent chạy trong container (image riêng, giới hạn tài nguyên, git chỉ đọc), cấu hình theo agent trong factory | Pipeline + benchmark chạy trong container, metrics ghi rõ sandbox |
+| **8. Mở rộng** | GitHub/Slack/Linear, NATS | — |
 
 Nên **dogfood** từ phase 2: dùng WorkHub để phát triển chính WorkHub.
 
@@ -331,7 +332,7 @@ Nên **dogfood** từ phase 2: dùng WorkHub để phát triển chính WorkHub.
 1. **UI**: React + TypeScript + shadcn/ui (thư mục `web/`, bắt đầu ở phase 3).
 2. **Triển khai**: local một máy — Postgres trong Docker (`docker-compose.yml`) + binary Rust.
 3. **Nguồn task**: task nội bộ WorkHub, tạo qua CLI `wh` (sau là UI). GitHub để sau.
-4. **Sandbox**: git worktree mỗi agent session.
+4. **Sandbox**: git worktree mỗi agent session; từ phase 7 có thêm Docker trên worktree đó (chọn theo agent).
 
 ### Ghi chú triển khai event store
 - Mọi lệnh append lấy một **advisory lock toàn cục** trong transaction → `global_seq` tăng đúng theo thứ tự commit, consumer đọc `global_seq > checkpoint` không bao giờ bỏ sót event. Đủ cho chạy local; khi cần throughput cao sẽ thay bằng cơ chế khác.
@@ -390,3 +391,16 @@ Nên **dogfood** từ phase 2: dùng WorkHub để phát triển chính WorkHub.
 - **At most once / khôi phục**: giống improver. `BenchmarkRequested` (CLI/API) được claim bằng `BenchmarkStarted` ở `Exact(1)`. `wh bench run` ghi cả hai event trong một lần append rồi chạy luôn, nên daemon không giành được run đó. `BenchmarkStarted.pid` cho phép phần khôi phục lúc khởi động bỏ qua run của một process vẫn còn sống (`kill -0`). Run mồ côi bị đánh `BenchmarkFailed`, task đang dở bị block. Worker chạy tuần tự từng run một (semaphore 1), vì run dài, tốn tiền, và chạy song song sẽ làm sai lệch thời gian đo.
 - Read model `benchmark_runs` + `benchmark_cases` (`wh_metrics::benchmarks`: `runs`, `run`, `cases`, `case_stats`, `compare`). CLI: `wh bench suites|run|runs|show|compare|worker`. Worker chạy trong `wh foreman` / `wh serve --foreman` (tắt bằng `--no-bench`). API: `GET/POST /api/benchmarks`, `/api/benchmarks/suites`, `/api/benchmarks/{id}`, `/api/benchmarks/compare?a&b`. Từ API chỉ chạy được suite nằm trong `--bench-dir`.
 - Kiểm chứng thật (factory demo dùng Haiku, suite `smoke` có 2 case shell với check ẩn): bản factory tốt pass 2/2 với $0.014–0.016 mỗi run. Bản có prompt implement bị làm tệ đi (chỉ mô tả, không sửa file) được chạy qua `--ref HEAD`, rồi `wh bench compare` đặt hai bản cạnh nhau theo từng case.
+
+### Ghi chú phase 7 (Docker sandbox)
+- Phase 7 chỉ làm **Docker sandbox**. GitHub/Slack/Linear vẫn trái với quyết định local-only, còn NATS chưa cần khi chạy một máy, nên cả hai chuyển sang phase 8.
+- **Mô hình**: worktree vẫn được tạo và commit **trên host** như cũ (branch task chung, commit khi stage thành công). Docker chỉ thay process chạy agent: `docker run --rm --init --pull never` với worktree mount **đúng đường dẫn như trên host** (rw). Git dir chung của repo mount **read-only**, còn git dir riêng của worktree (`.git/worktrees/<n>`, chứa index/HEAD) mount rw. Nhờ vậy agent đọc được `git log/diff/show/status`, nhưng không ghi được object hay ref, tức chỉ WorkHub commit. Container chạy bằng uid:gid của chủ worktree (file agent ghi ra vẫn thuộc user), với `--cap-drop ALL`, `no-new-privileges`, label `workhub.session=<id>`, tên `wh-<session>`.
+- **Cấu hình** (`wh-factory`): `sandbox:` nằm trong `defaults` hoặc trên từng agent, và block của agent **thay thế cả block** mặc định (không merge từng field). Các field: `kind: worktree|docker`, `image` (mặc định `workhub-agent:latest`), `network` (mặc định `bridge`, vì agent cần gọi API; dùng `host` nếu cần Postgres trên localhost), `cpus`, `memory`, `pids_limit`, `env` (**tên** biến lấy từ host, truyền bằng `-e NAME` nên giá trị không lọt vào command line hay event), `volumes` (`host:container[:ro|rw]`, `~/` và đường dẫn tương đối theo file factory được resolve khi load), `copy_credentials`. Sandbox nằm trong yaml nên đổi sandbox cũng ra `factory_version` mới, và so sánh trước/sau hay benchmark được như mọi thay đổi khác.
+- **Auth**: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` luôn được truyền theo tên nếu có trên host. Nếu không có biến auth nào và `copy_credentials` (mặc định bật), `~/.claude/.credentials.json` được **copy** vào home tạm của session (`<data>/sandbox-home/<session>`, mount làm `/home/wh`), và thư mục này bị xoá ngay khi session xong. Cách khuyến nghị là token dài hạn từ `claude setup-token` đặt trong `CLAUDE_CODE_OAUTH_TOKEN`.
+- **Temp dir**: Docker tạo các thư mục cha còn thiếu của bind mount với owner root. Khi chạy thật, repo nằm dưới `/tmp/claude-1000/...` sinh ra `/tmp/claude-1000` thuộc root trong container, và Claude Code từ chối dùng thư mục đó làm temp dir. Vì vậy `TMPDIR`/`CLAUDE_CODE_TMPDIR` được trỏ vào `/home/wh/.tmp`.
+- **Lỗi và dọn dẹp**: volume không tồn tại hay đường dẫn có `:` bị bắt trước khi chạy và ghi `env_setup`. Docker exit 125 (không có image, daemon lỗi) hoặc 126/127 (thiếu `claude` trong image) cũng là `env_setup`, không retry. Kill client `docker run` không dừng được container, nên khi timeout runner `docker rm -f` container, và một guard `Drop` làm việc tương tự khi future bị huỷ. Foreman khởi động lại (`recover_interrupted`) cũng xoá container của session mồ côi. `wh sandbox prune` dọn container và sandbox home của session không còn chạy.
+- **Event / metrics**: `AgentSessionStarted.sandbox` (`#[serde(default)]`, event cũ = worktree) ghi lại toàn bộ cấu hình sandbox. Cột `session_facts.sandbox` (`worktree` | `docker:<image>`, migration 0009) hiện trên session sheet, còn trang Factory hiện sandbox của từng agent. Thêm `build.rs` cho `wh-eventstore` để migration mới làm `MIGRATOR` build lại.
+- **Image**: `docker/agent.Dockerfile` (node 22 slim + git, ripgrep, jq + Claude Code từ npm). `wh sandbox build` pin Claude Code theo đúng `claude --version` của host. Factory nào cần toolchain thì `FROM workhub-agent:latest` rồi khai báo image riêng. Factory dogfood của WorkHub vẫn chạy worktree, vì agent cần cargo + Postgres; muốn dùng Docker thì cần image có Rust, `network: host` và volume cache cargo.
+- **Chọn permission**: container là ranh giới, nên agent trong Docker có thể dùng `permission_mode: bypassPermissions` (đã thử: chạy bằng uid thường, không phải root). Lần chạy benchmark thật với `acceptEdits` cho thấy mọi tool error đều là bị từ chối quyền, không có lỗi nào do sandbox. Lưu ý improver được sửa `sandbox:` (nằm trong factory) như mọi setting khác, nên người duyệt cần xem kỹ proposal nới `network`/`volumes`.
+- CLI: `wh run --docker [--image] [--network]`, `wh sandbox build|check [--factory] [--smoke]|ps|prune [--force]`. `check --smoke` chạy một session Haiku thật (~$0.002) theo đúng đường đi của runner (worktree → `docker::prepare` → Claude Code trong container), rồi kiểm tra agent đọc được repo, ghi được file và file thuộc đúng user. Session này không ghi event.
+- Kiểm chứng thật: `wh sandbox check --smoke` pass ($0.0018). `wh run --docker` (Haiku) sửa `greet.sh`, file thuộc user, container và home đều bị xoá. Timeout 1 phút: container bị xoá, lỗi `timeout`. Image không tồn tại: `env_setup`, không retry. Benchmark `smoke` trên factory demo với mọi agent trong Docker (`memory: 2g`, `pids_limit: 512`) pass 2/2 với $0.012, reviewer đọc được `git diff HEAD~1` từ git dir read-only.

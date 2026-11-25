@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { PageHeader } from '@/components/PageHeader'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
-import { api, fmtUsd } from '@/lib/api'
+import { api, fmtUsd, type Sandbox } from '@/lib/api'
 import { ApiDown } from './Runs'
 
 /** Read-only view of the factory the server loaded (edit factory/factory.yaml in the repo). */
@@ -53,7 +53,14 @@ export default function FactoryPage() {
                 </CardTitle>
                 <CardDescription className="tabular-nums">
                   {st.agent.model ?? 'default model'} · budget {fmtUsd(st.agent.budget_usd)} · timeout {st.agent.timeout_min}m ·{' '}
-                  {st.agent.max_retries} retries · {st.agent.permission_mode}
+                  {st.agent.max_retries} retries · {st.agent.permission_mode} ·{' '}
+                  {st.agent.sandbox.kind === 'docker' ? (
+                    <span title={sandboxDetail(st.agent.sandbox)}>
+                      docker <code className="text-xs">{st.agent.sandbox.image}</code>
+                    </span>
+                  ) : (
+                    'worktree'
+                  )}
                 </CardDescription>
               </CardHeader>
               <CardContent className="grid gap-2">
@@ -109,4 +116,15 @@ export default function FactoryPage() {
       ) : null}
     </>
   )
+}
+
+function sandboxDetail(s: Sandbox): string {
+  if (s.kind !== 'docker') return 'git worktree on the host'
+  const parts = [`network ${s.network}`]
+  if (s.cpus) parts.push(`${s.cpus} cpus`)
+  if (s.memory) parts.push(`memory ${s.memory}`)
+  if (s.pids_limit) parts.push(`pids ${s.pids_limit}`)
+  if (s.env.length) parts.push(`env ${s.env.join(', ')}`)
+  if (s.volumes.length) parts.push(`volumes ${s.volumes.join(', ')}`)
+  return parts.join(' · ')
 }

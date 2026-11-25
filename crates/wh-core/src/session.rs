@@ -4,6 +4,7 @@ use crate::{
     event::DomainEvent,
     failure::FailureClass,
     ids::{BenchmarkRunId, SessionId, TaskId},
+    sandbox::Sandbox,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +43,9 @@ pub enum SessionEvent {
         workdir: String,
         branch: String,
         base_ref: String,
+        /// Where the agent ran. Absent on events from before sandboxes (= worktree).
+        #[serde(default)]
+        sandbox: Option<Sandbox>,
     },
     /// The runtime reported its own session id and the model actually used.
     AgentRuntimeReady {
