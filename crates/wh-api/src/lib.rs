@@ -485,6 +485,8 @@ struct Dashboard {
     days: i32,
     totals: queries::Totals,
     daily: Vec<queries::DailyPoint>,
+    /// Pull request cycle times (phase 8); zero counts without GitHub.
+    cycle: queries::CycleTimes,
 }
 
 async fn dashboard(State(s): State<AppState>, Query(q): Query<DaysQuery>) -> ApiResult<Dashboard> {
@@ -493,6 +495,7 @@ async fn dashboard(State(s): State<AppState>, Query(q): Query<DaysQuery>) -> Api
         days,
         totals: queries::totals(s.pool(), days).await?,
         daily: queries::daily(s.pool(), days).await?,
+        cycle: queries::cycle_times(s.pool(), days).await?,
     }))
 }
 

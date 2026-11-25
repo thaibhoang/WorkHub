@@ -51,6 +51,7 @@ pub struct Foreman<R> {
     dispatch: Dispatch,
     scope: Scope,
     name: String,
+    gh: wh_github::Gh,
 }
 
 /// Reviewer recorded on gates a benchmark foreman approves.
@@ -59,7 +60,21 @@ pub const BENCHMARK_REVIEWER: &str = "benchmark";
 impl<R: AgentRuntime + 'static> Foreman<R> {
     pub fn new(store: EventStore, factory: Factory, runner: Runner<R>, dispatch: Dispatch) -> Self {
         let name = format!("foreman:{}", factory.name);
-        Self { store, factory: Arc::new(factory), runner: Arc::new(runner), dispatch, scope: Scope::Live, name }
+        Self {
+            store,
+            factory: Arc::new(factory),
+            runner: Arc::new(runner),
+            dispatch,
+            scope: Scope::Live,
+            name,
+            gh: wh_github::Gh::default(),
+        }
+    }
+
+    /// Use another `gh` binary for shipping (tests use a fake one).
+    pub fn with_gh(mut self, gh: wh_github::Gh) -> Self {
+        self.gh = gh;
+        self
     }
 
     /// A foreman for the cases of one benchmark run, driven with [`Self::drive`].
@@ -72,6 +87,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             dispatch: Dispatch::Inline,
             scope: Scope::Benchmark(run),
             name,
+            gh: wh_github::Gh::default(),
         }
     }
 
@@ -104,7 +120,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
     }
 
     pub fn task_branch(task: TaskId) -> String {
-        format!("wh/task/{}", &task.0.simple().to_string()[20..])
+        wh_core::task::task_branch(task)
     }
 
     /// Call once at startup, before subscribing. A stage that was running when the
@@ -326,6 +342,26 @@ impl<R: AgentRuntime + 'static> EventHandler for Foreman<R> {
             Action::Complete => {
                 let branch = Some(Self::task_branch(task));
                 self.append(task, &state, ev, TaskEvent::TaskCompleted { branch }).await
+            }
+            Action::Ship => {
+                // Pushing is idempotent and the PR is looked up before being created,
+                // so a redelivered event at worst pushes again and finds the same PR.
+                let next = match wh_github::ship(&self.gh, &self.factory, task, &state).await {
+                    Ok(shipped) => {
+                        if let TaskEvent::TaskShipped { pr_url, .. } = &shipped {
+                            tracing::info!(%task, pr_url, "shipped");
+                        }
+                        shipped
+                    }
+                    Err(e) => {
+                        tracing::warn!(%task, "ship failed: {e}");
+                        TaskEvent::TaskBlocked {
+                            stage: Some(wh_core::task::SHIP_STAGE.into()),
+                            reason: format!("ship failed {e}"),
+                        }
+                    }
+                };
+                self.append(task, &state, ev, next).await
             }
             Action::Block { stage, reason } => {
                 tracing::warn!(%task, reason, "task blocked");

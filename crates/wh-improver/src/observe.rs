@@ -7,7 +7,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wh_metrics::proposals::{self, VersionStats};
 
-use crate::prompt::{ScorerMetric, StageMetric};
+use crate::prompt::{PrMetric, ScorerMetric, StageMetric};
 
 const MAX_TEXT: usize = 600;
 const MAX_TRANSCRIPT: usize = 2_500;
@@ -193,14 +193,24 @@ pub async fn gather(pool: &PgPool, factory: &str, version: &str, window_days: u3
     // Review rejections, human gate rejections, blocks and resume guidance (text lives in the log).
     let feedback: Vec<Feedback> = sqlx::query_as(
         "SELECT e.event_type AS kind, e.payload->>'stage' AS stage, \
-           COALESCE(e.payload->>'summary', e.payload->>'comment', e.payload->>'reason') AS text, \
+           COALESCE(e.payload->>'summary', e.payload->>'comment', e.payload->>'reason', \
+             CASE WHEN e.event_type = 'PrReviewed' THEN e.payload->>'state' || ' by ' || (e.payload->>'reviewer') || ': ' \
+               || COALESCE(e.payload->>'body', '') || COALESCE((SELECT ' | ' || string_agg( \
+                 COALESCE(c->>'path', '') || ': ' || (c->>'body'), ' | ') FROM jsonb_array_elements(e.payload->'comments') c), '') \
+             WHEN e.event_type = 'PrChecksCompleted' THEN 'failed checks: ' || COALESCE((SELECT string_agg( \
+                 (f->>'name') || COALESCE(' — ' || right(f->>'log', 300), ''), '; ') \
+               FROM jsonb_array_elements(e.payload->'failed') f), '?') END) AS text, \
            t.title AS task_title, e.payload->>'session' AS session, e.recorded_at AS at \
          FROM events e JOIN tasks_view t ON e.stream_id = 'task-' || t.task_id::text \
          WHERE t.factory = $1 AND t.benchmark_run IS NULL AND e.recorded_at >= $2 \
            AND ((e.event_type = 'StageExited' AND e.payload->>'outcome' = 'rejected') \
              OR (e.event_type = 'GateDecided' AND e.payload->>'approved' = 'false') \
              OR e.event_type = 'TaskBlocked' \
-             OR (e.event_type = 'TaskResumed' AND e.payload->>'comment' IS NOT NULL)) \
+             OR (e.event_type = 'TaskResumed' AND e.payload->>'comment' IS NOT NULL) \
+             OR (e.event_type = 'PrReviewed' AND (e.payload->>'state' = 'CHANGES_REQUESTED' \
+                 OR COALESCE(e.payload->>'body', '') <> '' OR jsonb_array_length(e.payload->'comments') > 0)) \
+             OR (e.event_type = 'PrChecksCompleted' AND e.payload->>'conclusion' <> 'success') \
+             OR e.event_type = 'PrClosed') \
          ORDER BY e.global_seq DESC LIMIT 20",
     )
     .bind(factory)
@@ -265,7 +275,7 @@ pub async fn current_metrics(
     factory: &str,
     version: &str,
     window_days: u32,
-) -> anyhow::Result<(Vec<StageMetric>, Vec<ScorerMetric>)> {
+) -> anyhow::Result<(Vec<StageMetric>, Vec<ScorerMetric>, PrMetric)> {
     let since = Utc::now() - chrono::Duration::days(window_days as i64);
     let stages: Vec<(String, i64, i64, i64, f64)> = sqlx::query_as(
         "SELECT f.stage, count(*), count(*) FILTER (WHERE f.status = 'failed'), \
@@ -291,12 +301,24 @@ pub async fn current_metrics(
     .bind(since)
     .fetch_all(pool)
     .await?;
+    // Shipped tasks that ran at least one session on this version.
+    let (shipped, changes_requested): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE t.changes_requested > 0) FROM tasks_view t \
+         WHERE t.factory = $1 AND t.benchmark_run IS NULL AND t.shipped_at >= $3 AND EXISTS ( \
+           SELECT 1 FROM session_facts f WHERE f.task_id = t.task_id AND f.factory_version = $2)",
+    )
+    .bind(factory)
+    .bind(version)
+    .bind(since)
+    .fetch_one(pool)
+    .await?;
     Ok((
         stages
             .into_iter()
             .map(|(stage, finished, failed, rejected, avg_cost_usd)| StageMetric { stage, finished, failed, rejected, avg_cost_usd })
             .collect(),
         scorers.into_iter().map(|(scorer, scored, failed)| ScorerMetric { scorer, scored, failed }).collect(),
+        PrMetric { shipped, changes_requested },
     ))
 }
 
@@ -391,13 +413,16 @@ pub fn render(o: &Observation) -> String {
     }
 
     if !o.feedback.is_empty() {
-        p.push_str("\n## Review rejections, human feedback and blocks (newest first)\n\n");
+        p.push_str("\n## Review rejections, human feedback (gates, PR reviews), CI failures and blocks (newest first)\n\n");
         for f in &o.feedback {
             let kind = match f.kind.as_str() {
                 "StageExited" => "review REJECT",
                 "GateDecided" => "human gate rejected",
                 "TaskBlocked" => "task blocked",
                 "TaskResumed" => "human resumed with guidance",
+                "PrReviewed" => "human PR review",
+                "PrChecksCompleted" => "CI failed on the PR",
+                "PrClosed" => "PR closed without merging",
                 k => k,
             };
             p.push_str(&format!(

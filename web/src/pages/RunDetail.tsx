@@ -6,7 +6,7 @@ import { toast } from 'sonner'
 import { PageHeader } from '@/components/PageHeader'
 import { ScoreChip } from '@/components/scores'
 import { SessionSheet } from '@/components/SessionSheet'
-import { OUTCOME_TEXT, SessionStatusBadge, TaskStatusBadge } from '@/components/status'
+import { OUTCOME_TEXT, PrLink, SessionStatusBadge, TaskStatusBadge } from '@/components/status'
 import { Timeline } from '@/components/Timeline'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -64,6 +64,14 @@ export default function RunDetail() {
             <span>{task?.factory ?? 'manual task'}</span>
             <span className="tabular-nums">{fmtUsd(cost)} · {sessions.length} sessions</span>
             {state.rework_loops ? <span className="text-warn">{state.rework_loops} rework loops</span> : null}
+            {state.external_ref ? (
+              <a href={state.external_ref.url} target="_blank" rel="noreferrer" className="font-mono hover:underline">
+                {state.external_ref.repo}#{state.external_ref.issue}
+              </a>
+            ) : null}
+            {state.pr ? (
+              <PrLink url={state.pr.url} number={state.pr.number} state={task?.pr_state ?? (state.pr.closed ? 'closed' : 'open')} />
+            ) : null}
             {graded.length ? (
               <span className={cn('tabular-nums', passed < graded.length && 'text-fail')}>
                 {passed}/{graded.length} scores passed
@@ -85,6 +93,7 @@ export default function RunDetail() {
       ) : null}
       {pipeline ? <PipelineStrip factory={pipeline} detail={data} /> : null}
       <ActionPanel id={id} detail={data} factory={pipeline} />
+      <PrPanel detail={data} />
 
       <Tabs defaultValue="timeline" className="mt-6">
         <TabsList>
@@ -144,6 +153,37 @@ function PipelineStrip({ factory, detail }: { factory: FactoryDef; detail: TaskD
           </li>
         )
       })}
+      {factory.github ? (
+        <li className="flex items-center gap-1">
+          <span className="text-muted-foreground">→</span>
+          <span
+            className={cn(
+              'rounded-md border px-2 py-0.5 font-mono text-xs',
+              current === 'ship'
+                ? state.status === 'blocked'
+                  ? 'border-fail text-fail font-semibold'
+                  : 'border-warn text-warn font-semibold'
+                : state.pr
+                  ? state.status === 'done'
+                    ? 'border-ok/50 text-ok'
+                    : 'border-info/60 text-info'
+                  : 'border-dashed text-muted-foreground',
+            )}
+          >
+            ship
+            {factory.github.ship_gate ? <span className="ml-1 opacity-70">⏸</span> : null}
+          </span>
+          <span className="text-muted-foreground">→</span>
+          <span
+            className={cn(
+              'rounded-md border px-2 py-0.5 font-mono text-xs',
+              state.status === 'done' && state.pr ? 'border-ok/50 text-ok' : 'border-dashed text-muted-foreground',
+            )}
+          >
+            merge
+          </span>
+        </li>
+      ) : null}
       {state.status === 'done' ? <span className="ml-2 text-xs text-ok">✓ complete</span> : null}
     </ol>
   )
@@ -171,14 +211,25 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
   const reset = () => setComment('')
 
   if (state.status === 'awaiting_gate') {
-    const output = [...state.results].reverse().find((r) => r.stage === state.stage)
+    const output =
+      state.stage === 'ship' ? state.results.at(-1) : [...state.results].reverse().find((r) => r.stage === state.stage)
     return (
       <Card className="border-warn/50">
         <CardHeader>
           <CardTitle>Review required: {state.gate}</CardTitle>
           <CardDescription>
-            Stage <span className="font-mono">{state.stage}</span> finished. Approve to continue the pipeline, or reject
-            to send it back to the agent with your comment.
+            {state.stage === 'ship' ? (
+              <>
+                Every stage passed. Approve to push the branch and open a pull request on GitHub, or reject to send it
+                back to <span className="font-mono">{factory?.github?.rework_stage ?? 'the agent'}</span> with your
+                comment.
+              </>
+            ) : (
+              <>
+                Stage <span className="font-mono">{state.stage}</span> finished. Approve to continue the pipeline, or
+                reject to send it back to the agent with your comment.
+              </>
+            )}
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4">
@@ -222,11 +273,11 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="__default">{state.blocked_stage ?? 'blocked stage'} (default)</SelectItem>
-                  {factory?.stages
-                    .filter((s) => s.id !== state.blocked_stage)
+                  {[...(factory?.stages.map((s) => s.id) ?? []), ...(factory?.github ? ['ship'] : [])]
+                    .filter((s) => s !== state.blocked_stage)
                     .map((s) => (
-                      <SelectItem key={s.id} value={s.id}>
-                        {s.id}
+                      <SelectItem key={s} value={s}>
+                        {s === 'ship' ? 'ship (push + PR, no agent)' : s}
                       </SelectItem>
                     ))}
                 </SelectContent>
@@ -247,6 +298,75 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
     )
   }
   return null
+}
+
+/** The task's pull request: what humans and CI said, and the PR rework loop. */
+function PrPanel({ detail }: { detail: TaskDetail }) {
+  const { state, task, events } = detail
+  if (!state.pr) return null
+  const pr = state.pr
+  const prEvents = events.filter((e) => e.type.startsWith('Pr') || e.type === 'TaskShipped')
+  return (
+    <Card className="mt-4">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          Pull request <PrLink url={pr.url} number={pr.number} state={task?.pr_state ?? null} />
+        </CardTitle>
+        <CardDescription>
+          <span className="font-mono">{pr.branch}</span> → {pr.repo}
+          {task ? (
+            <span className="ml-2 tabular-nums">
+              · {task.pr_reviews} reviews · {task.changes_requested} changes requested · {task.ci_failures} CI failures ·{' '}
+              {state.pr_rework_loops} PR rework loops
+            </span>
+          ) : null}
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <ul className="grid gap-1.5 text-sm">
+          {prEvents.map((e) => (
+            <li key={e.seq} className="flex gap-3">
+              <span className="w-16 shrink-0 text-xs tabular-nums text-muted-foreground">{fmtTime(e.meta.occurred_at)}</span>
+              <span className="min-w-0">{prEventText(e)}</span>
+            </li>
+          ))}
+        </ul>
+      </CardContent>
+    </Card>
+  )
+}
+
+function prEventText(e: WhEvent) {
+  const p = e.payload
+  switch (e.type) {
+    case 'TaskShipped':
+      return <>{p.created ? 'Opened' : 'Pushed'} <span className="font-mono text-xs">{String(p.commit).slice(0, 10)}</span></>
+    case 'PrReviewed': {
+      const tone = p.state === 'CHANGES_REQUESTED' ? 'text-warn' : p.state === 'APPROVED' ? 'text-ok' : 'text-muted-foreground'
+      return (
+        <>
+          <span className={tone}>{String(p.state).toLowerCase().replace('_', ' ')}</span> by {p.reviewer}
+          {p.body ? <span className="text-muted-foreground">: {String(p.body).split('\n')[0]}</span> : null}
+          {p.comments?.length ? <span className="text-muted-foreground"> (+{p.comments.length} inline)</span> : null}
+        </>
+      )
+    }
+    case 'PrChecksCompleted':
+      return p.conclusion === 'success' ? (
+        <span className="text-ok">CI passed</span>
+      ) : (
+        <>
+          <span className="text-fail">CI failed</span>
+          {p.failed?.length ? `: ${p.failed.map((c: { name: string }) => c.name).join(', ')}` : null}
+        </>
+      )
+    case 'PrMerged':
+      return <span className="text-ok">Merged{p.merged_by ? ` by ${p.merged_by}` : ''}</span>
+    case 'PrClosed':
+      return <span className="text-muted-foreground">Closed without merging</span>
+    default:
+      return e.type
+  }
 }
 
 function CancelButton({ id, status }: { id: string; status: string }) {

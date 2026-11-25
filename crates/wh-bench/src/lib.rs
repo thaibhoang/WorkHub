@@ -407,6 +407,7 @@ impl<R: AgentRuntime + 'static> Inner<R> {
             source: TaskSource::Benchmark,
             factory: Some(p.factory.name.clone()),
             benchmark: Some(ctx),
+            external_ref: None,
         };
         let mut meta = EventMeta::new(task.0, Actor::System { component: "bench".into() });
         meta.causation_id = log.cause;

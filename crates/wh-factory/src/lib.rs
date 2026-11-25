@@ -44,6 +44,31 @@ struct FactoryFile {
     #[serde(default)]
     scorers: Vec<ScorerFile>,
     improvement: Option<ImprovementFile>,
+    github: Option<GithubFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GithubFile {
+    repo: Option<String>,
+    remote: Option<String>,
+    base: Option<String>,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    labels: Vec<String>,
+    poll_interval_sec: Option<u64>,
+    ship_gate: Option<String>,
+    rework_stage: Option<String>,
+    issues: Option<IssuesFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssuesFile {
+    label: Option<String>,
+    #[serde(default)]
+    comment: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -283,6 +308,9 @@ pub enum TriggerMetric {
     StageAvgCostUsd,
     /// Failing / scored results of `scorer`.
     ScorerFailRate,
+    /// Shipped tasks whose PR got a `CHANGES_REQUESTED` review / shipped tasks
+    /// (needs `github:`; no stage or scorer).
+    PrChangesRequestedRate,
 }
 
 impl TriggerMetric {
@@ -292,9 +320,13 @@ impl TriggerMetric {
             Self::StageRejectRate => "stage_reject_rate",
             Self::StageAvgCostUsd => "stage_avg_cost_usd",
             Self::ScorerFailRate => "scorer_fail_rate",
+            Self::PrChangesRequestedRate => "pr_changes_requested_rate",
         }
     }
 }
+
+/// Trigger subject of PR-level metrics.
+pub const PR_SUBJECT: &str = "pr";
 
 /// Run the improver when `metric` (for `subject`: a stage or scorer id) exceeds `above`.
 #[derive(Debug, Clone, PartialEq)]
@@ -331,6 +363,36 @@ pub struct Improvement {
     pub triggers: Vec<Trigger>,
 }
 
+/// GitHub integration (`github:` in factory.yaml). Its presence makes the task
+/// ship (push + pull request) after the last stage instead of completing locally.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Github {
+    /// `owner/name`; None = derived from the remote's URL at run time.
+    pub repo: Option<String>,
+    pub remote: String,
+    /// PR base branch; None = the repository's default branch.
+    pub base: Option<String>,
+    pub draft: bool,
+    pub labels: Vec<String>,
+    pub poll_interval: Duration,
+    /// Human gate before pushing (pushing / opening a PR is visible to others).
+    pub ship_gate: Option<String>,
+    /// Stage that addresses PR feedback (changes requested, failed CI).
+    pub rework_stage: String,
+    /// Create tasks from open issues carrying this label.
+    pub issues: Option<Issues>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Issues {
+    pub label: String,
+    /// Comment on the issue when a task is created from it.
+    pub comment: bool,
+}
+
+pub const DEFAULT_ISSUE_LABEL: &str = "workhub";
+const DEFAULT_POLL_INTERVAL_SEC: u64 = 60;
+
 #[derive(Debug, Clone)]
 pub struct Factory {
     /// Canonical path of factory.yaml.
@@ -345,6 +407,7 @@ pub struct Factory {
     pub agents: BTreeMap<String, Agent>,
     pub scorers: Vec<Scorer>,
     pub improvement: Option<Improvement>,
+    pub github: Option<Github>,
 }
 
 impl Factory {
@@ -454,6 +517,11 @@ impl Factory {
                 for t in &im.triggers {
                     let m = t.metric.as_str();
                     let subject = match t.metric {
+                        TriggerMetric::PrChangesRequestedRate => {
+                            ensure!(t.stage.is_none() && t.scorer.is_none(), "trigger {m}: takes no `stage` or `scorer`");
+                            ensure!(file.github.is_some(), "trigger {m}: needs a `github:` section");
+                            PR_SUBJECT.to_owned()
+                        }
                         TriggerMetric::ScorerFailRate => {
                             ensure!(t.stage.is_none(), "trigger {m}: use `scorer`, not `stage`");
                             let id = t.scorer.clone().with_context(|| format!("trigger {m}: `scorer` is required"))?;
@@ -487,6 +555,55 @@ impl Factory {
             }
         };
 
+        let github = match &file.github {
+            None => None,
+            Some(g) => {
+                if let Some(r) = &g.repo {
+                    let parts: Vec<&str> = r.split('/').collect();
+                    ensure!(
+                        parts.len() == 2 && parts.iter().all(|p| !p.trim().is_empty()),
+                        "github: repo must be owner/name, got '{r}'"
+                    );
+                }
+                let poll = g.poll_interval_sec.unwrap_or(DEFAULT_POLL_INTERVAL_SEC);
+                ensure!(poll >= 5, "github: poll_interval_sec must be >= 5");
+                if matches!(&g.ship_gate, Some(n) if n.trim().is_empty()) {
+                    bail!("github: ship_gate name is empty");
+                }
+                // Default: the stage review sends rework to, else the first stage.
+                let rework_stage = match &g.rework_stage {
+                    Some(st) => {
+                        ensure!(ids.contains(st.as_str()), "github: rework_stage '{st}' is not a stage");
+                        st.clone()
+                    }
+                    None => file
+                        .stages
+                        .iter()
+                        .find_map(|s| s.on_reject.clone())
+                        .unwrap_or_else(|| file.stages[0].id.clone()),
+                };
+                ensure!(
+                    !ids.contains(wh_core::task::SHIP_STAGE),
+                    "stage id '{}' is reserved when `github:` is set",
+                    wh_core::task::SHIP_STAGE
+                );
+                Some(Github {
+                    repo: g.repo.clone(),
+                    remote: g.remote.clone().unwrap_or_else(|| "origin".into()),
+                    base: g.base.clone(),
+                    draft: g.draft,
+                    labels: g.labels.clone(),
+                    poll_interval: Duration::from_secs(poll),
+                    ship_gate: g.ship_gate.clone(),
+                    rework_stage,
+                    issues: g.issues.as_ref().map(|i| Issues {
+                        label: i.label.clone().unwrap_or_else(|| DEFAULT_ISSUE_LABEL.into()),
+                        comment: i.comment,
+                    }),
+                })
+            }
+        };
+
         let repo_path = base.join(&file.repo);
         let repo = std::fs::canonicalize(&repo_path)
             .with_context(|| format!("repo {} not found", repo_path.display()))?;
@@ -507,6 +624,7 @@ impl Factory {
             agents,
             scorers,
             improvement,
+            github,
         })
     }
 
@@ -625,6 +743,26 @@ improvement:
         assert!(d.copy_credentials);
         assert_eq!(f.agents["b"].sandbox, Sandbox::Worktree);
         assert_eq!(f.agents["a"].sandbox.label(), "docker:workhub-agent:latest");
+    }
+
+    #[test]
+    fn github_block() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Factory::load(&write(dir.path(), OK)).unwrap().github.is_none());
+        let yaml = format!("{OK}github: {{ repo: acme/demo, ship_gate: ship-review, issues: {{}} }}\n");
+        let g = Factory::load(&write(dir.path(), &yaml)).unwrap().github.unwrap();
+        assert_eq!((g.repo.as_deref(), g.remote.as_str(), g.base.as_deref()), (Some("acme/demo"), "origin", None));
+        assert_eq!((g.rework_stage.as_str(), g.ship_gate.as_deref()), ("impl", Some("ship-review")));
+        assert_eq!(g.poll_interval, Duration::from_secs(60));
+        assert_eq!(g.issues, Some(Issues { label: "workhub".into(), comment: false }));
+        for (needle, extra) in [
+            ("owner/name", "github: { repo: nope }"),
+            ("not a stage", "github: { rework_stage: zz }"),
+            ("unknown field", "github: { repoo: a/b }"),
+        ] {
+            let err = format!("{:#}", Factory::load(&write(dir.path(), &format!("{OK}{extra}\n"))).unwrap_err());
+            assert!(err.contains(needle), "expected '{needle}' in: {err}");
+        }
     }
 
     #[test]

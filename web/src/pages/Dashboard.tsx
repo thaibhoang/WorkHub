@@ -59,6 +59,7 @@ export default function Dashboard() {
       ) : (
         <div className="grid gap-4">
           <Kpis d={dash.data} />
+          {dash.data.cycle.shipped ? <PrCycle d={dash.data} /> : null}
           <div className="grid gap-4 lg:grid-cols-2">
             <Card>
               <CardHeader>
@@ -121,6 +122,39 @@ export default function Dashboard() {
         </div>
       )}
     </>
+  )
+}
+
+/** Pull request cycle times (only shown once a task has shipped to GitHub). */
+function PrCycle({ d }: { d: DashboardData }) {
+  const c = d.cycle
+  const pct = (n: number) => `${((n / c.shipped) * 100).toFixed(0)}%`
+  const tiles = [
+    { label: 'Kickoff → PR', p50: c.kickoff_to_pr_p50_ms, p95: c.kickoff_to_pr_p95_ms },
+    { label: 'PR → first review', p50: c.pr_to_first_review_p50_ms, p95: c.pr_to_first_review_p95_ms },
+    { label: 'First review → merge', p50: c.review_to_merge_p50_ms, p95: c.review_to_merge_p95_ms },
+    { label: 'Kickoff → merge', p50: c.kickoff_to_merge_p50_ms, p95: c.kickoff_to_merge_p95_ms },
+  ]
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Pull requests</CardTitle>
+        <CardDescription>
+          {c.shipped} shipped · {c.merged} merged · {c.open} open · changes requested on {pct(c.changes_requested_tasks)} ·
+          CI failed on {pct(c.ci_failed_tasks)} · {c.avg_pr_rework == null ? '–' : c.avg_pr_rework.toFixed(2)} PR rework
+          loops / PR
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        {tiles.map((t) => (
+          <div key={t.label} className="rounded-lg border p-3">
+            <div className="text-xs text-muted-foreground">{t.label} p50</div>
+            <div className="mt-1 text-xl font-semibold tabular-nums">{fmtMs(t.p50)}</div>
+            <div className="mt-0.5 text-xs text-muted-foreground tabular-nums">p95 {fmtMs(t.p95)}</div>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
   )
 }
 

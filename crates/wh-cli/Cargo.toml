@@ -19,6 +19,7 @@ wh-api.workspace = true
 wh-scorer.workspace = true
 wh-improver.workspace = true
 wh-bench.workspace = true
+wh-github.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dotenvy.workspace = true

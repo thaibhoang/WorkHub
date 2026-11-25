@@ -1,0 +1,22 @@
+[package]
+name = "wh-github"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+wh-core.workspace = true
+wh-eventstore.workspace = true
+wh-factory.workspace = true
+wh-metrics.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

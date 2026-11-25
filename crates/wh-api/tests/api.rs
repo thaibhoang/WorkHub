@@ -376,6 +376,7 @@ async fn sse_replays_after_cursor_and_filters_by_task(pool: PgPool) {
         source: wh_core::task::TaskSource::Cli,
         factory: None,
         benchmark: None,
+        external_ref: None,
     };
     task_ev(&store, a, created("a")).await;
     task_ev(&store, b, created("b")).await;

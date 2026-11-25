@@ -83,6 +83,46 @@ export default function FactoryPage() {
             </Card>
           </li>
         ))}
+        {data.github ? (
+          <li>
+            <Card className="gap-3">
+              <CardHeader>
+                <CardTitle className="flex flex-wrap items-center gap-2">
+                  <span className="text-muted-foreground tabular-nums">{data.stages.length + 1}.</span>
+                  <span className="font-mono">ship</span>
+                  <span className="text-sm font-normal text-muted-foreground">WorkHub, no agent</span>
+                  {data.github.ship_gate ? (
+                    <span className="rounded border border-warn/50 px-1.5 text-xs font-normal text-warn">
+                      gate: {data.github.ship_gate}
+                    </span>
+                  ) : null}
+                  <span className="rounded border px-1.5 text-xs font-normal text-muted-foreground">
+                    PR feedback → {data.github.rework_stage}
+                  </span>
+                </CardTitle>
+                <CardDescription>
+                  Push the task branch to <span className="font-mono">{data.github.remote}</span> and open a{' '}
+                  {data.github.draft ? 'draft ' : ''}pull request on{' '}
+                  <span className="font-mono">{data.github.repo ?? '(repo from the remote)'}</span>
+                  {data.github.base ? (
+                    <>
+                      {' '}
+                      into <span className="font-mono">{data.github.base}</span>
+                    </>
+                  ) : null}
+                  . Reviews, CI and merges are polled every {data.github.poll_interval_sec}s; changes requested or failed CI
+                  sends the task back.
+                  {data.github.issue_label ? (
+                    <>
+                      {' '}
+                      Open issues labelled <span className="font-mono">{data.github.issue_label}</span> become tasks.
+                    </>
+                  ) : null}
+                </CardDescription>
+              </CardHeader>
+            </Card>
+          </li>
+        ) : null}
       </ol>
       {data.scorers.length ? (
         <>
