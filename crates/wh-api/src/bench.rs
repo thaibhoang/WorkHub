@@ -15,7 +15,7 @@ use wh_bench::{CaseRepo, Request, commands::CommandError as BenchError, suite};
 use wh_core::{BenchmarkRunId, ProposalId};
 use wh_metrics::benchmarks;
 
-use crate::{ApiError, ApiResult, AppState, commands::local_user, dto::EventDto, parse_id};
+use crate::{ApiError, ApiResult, AppState, auth::CurrentUser, dto::EventDto, parse_id};
 
 impl From<BenchError> for ApiError {
     fn from(e: BenchError) -> Self {
@@ -143,7 +143,11 @@ fn suite_file(s: &AppState, key: &str) -> Result<PathBuf, ApiError> {
         .ok_or_else(|| ApiError::not_found(format!("suite '{key}'")))
 }
 
-pub async fn request(State(s): State<AppState>, Json(b): Json<RunBody>) -> Result<(StatusCode, Json<Queued>), ApiError> {
+pub async fn request(
+    State(s): State<AppState>,
+    axum::Extension(user): axum::Extension<CurrentUser>,
+    Json(b): Json<RunBody>,
+) -> Result<(StatusCode, Json<Queued>), ApiError> {
     let file = suite_file(&s, &b.suite)?;
     let repeat = b.repeat.unwrap_or(1);
     if !(1..=20).contains(&repeat) {
@@ -152,12 +156,12 @@ pub async fn request(State(s): State<AppState>, Json(b): Json<RunBody>) -> Resul
     let git_ref = b.git_ref.filter(|r| !r.trim().is_empty());
     let run_ids = match (b.proposal, git_ref) {
         (Some(p), None) => {
-            let (a, c) = wh_bench::commands::request_proposal(&s.store, local_user(), file, p, repeat, b.cases).await?;
+            let (a, c) = wh_bench::commands::request_proposal(&s.store, user.actor(), file, p, repeat, b.cases).await?;
             vec![a, c]
         }
         (proposal, git_ref) => {
             let req = Request { suite_file: file, git_ref, proposal, label: b.label, repeat, cases: b.cases };
-            vec![wh_bench::commands::request(&s.store, local_user(), &req).await?]
+            vec![wh_bench::commands::request(&s.store, user.actor(), &req).await?]
         }
     };
     let message = "benchmark queued; it runs in `wh serve --foreman`, `wh foreman` or `wh bench worker`".to_owned();

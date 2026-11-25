@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { ClipboardCheck, Factory as FactoryIcon, Gauge, Inbox as InboxIcon, LayoutDashboard, ListTodo, Moon, Sparkles, Sun } from 'lucide-react'
 import { lazy, Suspense, useState } from 'react'
 import { NavLink, Route, Routes } from 'react-router'
+import { UserMenu } from '@/components/AuthGate'
 import { Button } from '@/components/ui/button'
 import { api } from '@/lib/api'
 import { useLive } from '@/lib/live'
@@ -88,9 +89,12 @@ function Sidebar() {
           </NavLink>
         ))}
       </nav>
-      <div className="flex items-center gap-1 md:mt-auto md:justify-between md:px-1">
-        <LiveDot />
-        <ThemeToggle />
+      <div className="flex items-center gap-1 md:mt-auto md:flex-col md:items-stretch md:gap-2">
+        <UserMenu />
+        <div className="flex items-center gap-1 md:justify-between md:px-1">
+          <LiveDot />
+          <ThemeToggle />
+        </div>
       </div>
     </aside>
   )

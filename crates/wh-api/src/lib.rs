@@ -3,6 +3,7 @@
 //! command); reads come from projections, except task/session event timelines
 //! which are read straight from their streams.
 
+pub mod auth;
 mod bench;
 pub mod commands;
 pub mod dto;
@@ -11,13 +12,14 @@ mod live;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{KeepAlive, Sse},
     },
+    middleware::from_fn_with_state,
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -31,7 +33,8 @@ use wh_metrics::{proposals, queries, scores, sessions::SessionFactsProjection};
 
 pub use live::Live;
 
-use commands::{CommandError, NewTask, local_user};
+use auth::CurrentUser;
+use commands::{CommandError, NewTask};
 use dto::*;
 
 #[derive(Clone)]
@@ -42,6 +45,8 @@ pub struct AppState {
     pub live: Live,
     /// Directory of benchmark suites runnable from the UI.
     pub bench_dir: PathBuf,
+    /// Login settings (`wh serve --auth`); disabled by default.
+    pub auth: auth::AuthConfig,
 }
 
 impl AppState {
@@ -52,8 +57,12 @@ impl AppState {
 
 /// All `/api` routes.
 pub fn api(state: AppState) -> Router {
-    Router::new()
+    let public = Router::new()
         .route("/health", get(|| async { Json(serde_json::json!({ "ok": true })) }))
+        .route("/auth/me", get(auth::me))
+        .route("/auth/login", post(auth::login))
+        .route("/auth/logout", post(auth::logout));
+    let protected = Router::new()
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/gate", post(decide_gate))
@@ -78,7 +87,8 @@ pub fn api(state: AppState) -> Router {
         .route("/factory", get(factory))
         .route("/events", get(list_events))
         .route("/events/stream", get(stream_events))
-        .with_state(state)
+        .route_layer(from_fn_with_state(state.clone(), auth::require_user));
+    public.merge(protected).layer(from_fn_with_state(state.clone(), auth::check_origin)).with_state(state)
 }
 
 /// The full app: `/api/*` plus, if given, the built UI (SPA fallback to index.html).
@@ -105,7 +115,8 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("api listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, app(state, web_dir)).with_graceful_shutdown(shutdown).await?;
+    let app = app(state, web_dir).into_make_service_with_connect_info::<SocketAddr>();
+    axum::serve(listener, app).with_graceful_shutdown(shutdown).await?;
     Ok(())
 }
 
@@ -195,6 +206,7 @@ struct Created {
 
 async fn create_task(
     State(s): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
     Json(b): Json<CreateTaskBody>,
 ) -> Result<(StatusCode, Json<Created>), ApiError> {
     let factory = match (b.pipeline.unwrap_or(true), &s.factory) {
@@ -205,7 +217,7 @@ async fn create_task(
         _ => None,
     };
     let t = NewTask { title: b.title, body: b.body, source: TaskSource::Web, factory: factory.clone() };
-    let task_id = commands::create_task(&s.store, local_user(), t).await?;
+    let task_id = commands::create_task(&s.store, user.actor(), t).await?;
     Ok((StatusCode::CREATED, Json(Created { task_id, factory })))
 }
 
@@ -232,19 +244,34 @@ fn ok(message: impl Into<String>) -> Json<Ok_> {
     Json(Ok_ { ok: true, message: message.into() })
 }
 
-async fn decide_gate(State(s): State<AppState>, Path(id): Path<String>, Json(b): Json<GateBody>) -> ApiResult<Ok_> {
+async fn decide_gate(
+    State(s): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(b): Json<GateBody>,
+) -> ApiResult<Ok_> {
     let task = parse_id(&id, "task")?;
-    let gate = commands::decide_gate(&s.store, local_user(), task, b.approved, b.comment).await?;
+    let gate = commands::decide_gate(&s.store, user.actor(), task, b.approved, b.comment).await?;
     Ok(ok(format!("gate '{gate}' {}", if b.approved { "approved" } else { "rejected" })))
 }
 
-async fn resume_task(State(s): State<AppState>, Path(id): Path<String>, Json(b): Json<ResumeBody>) -> ApiResult<Ok_> {
-    commands::resume(&s.store, local_user(), parse_id(&id, "task")?, b.stage, b.comment).await?;
+async fn resume_task(
+    State(s): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(b): Json<ResumeBody>,
+) -> ApiResult<Ok_> {
+    commands::resume(&s.store, user.actor(), parse_id(&id, "task")?, b.stage, b.comment).await?;
     Ok(ok("resumed"))
 }
 
-async fn cancel_task(State(s): State<AppState>, Path(id): Path<String>, Json(b): Json<CancelBody>) -> ApiResult<Ok_> {
-    commands::cancel(&s.store, local_user(), parse_id(&id, "task")?, b.reason).await?;
+async fn cancel_task(
+    State(s): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(b): Json<CancelBody>,
+) -> ApiResult<Ok_> {
+    commands::cancel(&s.store, user.actor(), parse_id(&id, "task")?, b.reason).await?;
     Ok(ok("cancelled"))
 }
 
@@ -375,13 +402,14 @@ struct Requested {
 
 async fn request_improvement(
     State(s): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
     Json(b): Json<ImproveBody>,
 ) -> Result<(StatusCode, Json<Requested>), ApiError> {
     let f = s.factory.as_deref().ok_or_else(|| ApiError::bad_request("the server was started without a factory"))?;
     if f.improvement.is_none() {
         return Err(ApiError::bad_request(format!("factory '{}' has no `improvement:` section", f.name)));
     }
-    let proposal_id = wh_improver::commands::request(&s.store, local_user(), &f.name, b.focus).await?;
+    let proposal_id = wh_improver::commands::request(&s.store, user.actor(), &f.name, b.focus).await?;
     let message = "improver run requested; it runs in `wh serve --foreman` or `wh improver`".to_owned();
     Ok((StatusCode::ACCEPTED, Json(Requested { proposal_id, message })))
 }
@@ -415,14 +443,23 @@ async fn get_proposal(State(s): State<AppState>, Path(id): Path<String>) -> ApiR
     Ok(Json(ProposalDetail { proposal, events: events.iter().map(EventDto::from).collect(), evidence, before, after }))
 }
 
-async fn decide_proposal(State(s): State<AppState>, Path(id): Path<String>, Json(b): Json<GateBody>) -> ApiResult<Ok_> {
+async fn decide_proposal(
+    State(s): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(b): Json<GateBody>,
+) -> ApiResult<Ok_> {
     let pid = parse_id(&id, "proposal")?;
-    wh_improver::commands::decide(&s.store, local_user(), pid, b.approved, b.comment).await?;
+    wh_improver::commands::decide(&s.store, user.actor(), pid, b.approved, b.comment).await?;
     Ok(ok(if b.approved { "proposal approved" } else { "proposal rejected" }))
 }
 
-async fn apply_proposal(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Ok_> {
-    let version = wh_improver::commands::apply(&s.store, local_user(), parse_id(&id, "proposal")?).await?;
+async fn apply_proposal(
+    State(s): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> ApiResult<Ok_> {
+    let version = wh_improver::commands::apply(&s.store, user.actor(), parse_id(&id, "proposal")?).await?;
     Ok(ok(format!("rolled out as factory version {version}; restart the foreman to use it")))
 }
 

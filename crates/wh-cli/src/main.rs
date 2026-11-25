@@ -142,6 +142,21 @@ enum Cmd {
         /// Built UI to serve at / (skipped if missing)
         #[arg(long, env = "WH_WEB_DIR", default_value = "web/dist")]
         web_dir: PathBuf,
+        /// Require a login (users from `wh user add`); needed to bind a non-loopback address
+        #[arg(long, env = "WH_AUTH", value_parser = clap::builder::BoolishValueParser::new())]
+        auth: bool,
+        /// Public origin, e.g. https://workhub.example.com: refuses cross-origin writes and,
+        /// for https, marks the session cookie Secure
+        #[arg(long, env = "WH_PUBLIC_URL")]
+        public_url: Option<String>,
+        /// Behind a reverse proxy on this host: read the client IP from X-Real-IP
+        #[arg(long, env = "WH_TRUST_PROXY", value_parser = clap::builder::BoolishValueParser::new())]
+        trust_proxy: bool,
+    },
+    /// Manage login users for `wh serve --auth`
+    User {
+        #[command(subcommand)]
+        cmd: UserCmd,
     },
     /// Run the self-improvement agent once now (or --dry-run to print what it would see)
     Improve {
@@ -220,6 +235,27 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProjCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum UserCmd {
+    /// Add a user (prompts for the password)
+    Add {
+        username: String,
+        /// Read the password from the first line of stdin instead of prompting
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Change a user's password (logs them out everywhere)
+    Passwd {
+        username: String,
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Delete a user and their sessions
+    Remove { username: String },
+    /// List users
+    List,
 }
 
 #[derive(Subcommand)]
@@ -468,6 +504,35 @@ async fn main() -> Result<()> {
     let store = EventStore::new(pool.clone());
 
     match cli.cmd {
+        Cmd::User { cmd } => match cmd {
+            UserCmd::Add { username, password_stdin } => {
+                let pw = read_password(password_stdin)?;
+                wh_api::auth::add_user(&pool, &username, &pw).await?;
+                println!("user '{username}' added");
+            }
+            UserCmd::Passwd { username, password_stdin } => {
+                let pw = read_password(password_stdin)?;
+                wh_api::auth::set_password(&pool, &username, &pw).await?;
+                println!("password changed for '{username}' (existing sessions logged out)");
+            }
+            UserCmd::Remove { username } => {
+                wh_api::auth::remove_user(&pool, &username).await?;
+                println!("user '{username}' removed");
+            }
+            UserCmd::List => {
+                println!("{:<24}  {:<20}  {:>8}  last seen", "user", "created", "sessions");
+                for u in wh_api::auth::list_users(&pool).await? {
+                    let seen = u.last_seen_at.map(|t| t.format("%Y-%m-%d %H:%M").to_string());
+                    println!(
+                        "{:<24}  {:<20}  {:>8}  {}",
+                        u.username,
+                        u.created_at.format("%Y-%m-%d %H:%M"),
+                        u.sessions,
+                        seen.as_deref().unwrap_or("-")
+                    );
+                }
+            }
+        },
         Cmd::Db { cmd: DbCmd::Migrate } => {
             wh_eventstore::MIGRATOR.run(&pool).await?;
             println!("migrations applied");
@@ -751,7 +816,19 @@ async fn main() -> Result<()> {
             gh_bin,
             bench_dir,
             web_dir,
+            auth,
+            public_url,
+            trust_proxy,
         } => {
+            if !auth && !addr.ip().is_loopback() {
+                anyhow::bail!("refusing to serve on {addr} without --auth (anyone who can reach it could run agents)");
+            }
+            if auth {
+                match wh_api::auth::user_count(&pool).await? {
+                    0 => eprintln!("warning: --auth but no users yet; add one with `wh user add <name>`"),
+                    n => println!("login required ({n} user(s))"),
+                }
+            }
             let f = match Factory::load(&factory) {
                 Ok(f) => Some(f),
                 Err(e) if !foreman => {
@@ -770,6 +847,7 @@ async fn main() -> Result<()> {
                 factory: f.clone().map(std::sync::Arc::new),
                 live: wh_api::Live::start(store.clone()).await?,
                 bench_dir: std::fs::canonicalize(&bench_dir).unwrap_or(bench_dir),
+                auth: wh_api::auth::AuthConfig::new(auth, public_url, trust_proxy),
             };
             println!("WorkHub on http://{addr}  (Ctrl+C to stop)");
             let api = wh_api::serve(addr, state, web_dir, ctrl_c());
@@ -1243,4 +1321,18 @@ fn print_event(e: &RecordedEvent) {
         e.event_type,
         e.payload
     );
+}
+
+/// A new password: the first line of stdin, or prompted twice on the terminal.
+fn read_password(from_stdin: bool) -> Result<String> {
+    if from_stdin {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        return Ok(line.trim_end_matches(['\r', '\n']).to_owned());
+    }
+    let pw = rpassword::prompt_password("password: ")?;
+    if rpassword::prompt_password("repeat password: ")? != pw {
+        anyhow::bail!("passwords do not match");
+    }
+    Ok(pw)
 }
