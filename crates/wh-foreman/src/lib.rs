@@ -6,6 +6,7 @@
 //! `ExpectedVersion::Exact(state.version)`, so redelivered events never cause a
 //! second dispatch.
 
+pub mod cleanup;
 mod decide;
 mod prompt;
 
@@ -13,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use wh_core::{
     Actor, BenchmarkRunId, EventMeta, FailureClass, NewEvent, RecordedEvent, Sandbox, SessionId, TaskId,
     session::SessionEvent,
@@ -52,6 +53,8 @@ pub struct Foreman<R> {
     scope: Scope,
     name: String,
     gh: wh_github::Gh,
+    /// Woken when a task finishes, so [`cleanup::run_janitor`] sweeps right away.
+    janitor: Option<Arc<Notify>>,
 }
 
 /// Reviewer recorded on gates a benchmark foreman approves.
@@ -68,7 +71,14 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             scope: Scope::Live,
             name,
             gh: wh_github::Gh::default(),
+            janitor: None,
         }
+    }
+
+    /// Notify `wake` whenever one of this foreman's tasks is done or cancelled.
+    pub fn with_janitor(mut self, wake: Arc<Notify>) -> Self {
+        self.janitor = Some(wake);
+        self
     }
 
     /// Use another `gh` binary for shipping (tests use a fake one).
@@ -88,6 +98,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             scope: Scope::Benchmark(run),
             name,
             gh: wh_github::Gh::default(),
+            janitor: None,
         }
     }
 
@@ -191,6 +202,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             factory_version: Some(f.version.clone()),
             benchmark: bench.map(|b| b.run),
             sandbox: agent.sandbox.clone(),
+            env: agent.env.clone(),
         }
     }
 
@@ -310,6 +322,11 @@ impl<R: AgentRuntime + 'static> EventHandler for Foreman<R> {
         // events are superseded.
         if ev.stream_version != state.version || !self.owns(&state) {
             return Ok(());
+        }
+        if let Some(wake) = &self.janitor
+            && matches!(state.status, wh_core::task::TaskStatus::Done | wh_core::task::TaskStatus::Cancelled)
+        {
+            wake.notify_one();
         }
         let Some(action) = decide(&state, &self.factory) else {
             return Ok(());

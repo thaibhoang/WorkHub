@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use anyhow::Context;
 use tokio::sync::mpsc;
@@ -59,6 +59,8 @@ pub struct RunSpec {
     pub benchmark: Option<BenchmarkRunId>,
     /// Where the agent runs: directly in the worktree, or in a container over it.
     pub sandbox: Sandbox,
+    /// Extra environment for the agent process.
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +213,7 @@ impl<R: AgentRuntime> Runner<R> {
             timeout: spec.timeout,
             tools: None,
             container,
+            env: spec.env.clone(),
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();

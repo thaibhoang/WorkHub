@@ -272,6 +272,7 @@ async fn smoke_session(d: &DockerSandbox) -> Result<()> {
         timeout: Duration::from_secs(180),
         tools: None,
         container: Some(container),
+        env: Default::default(),
     };
     println!("smoke: running Claude Code (Haiku) in {} ...", d.image);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

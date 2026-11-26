@@ -14,7 +14,10 @@ use wh_core::{
 };
 use wh_eventstore::{EventStore, Subscription};
 use wh_factory::Factory;
-use wh_foreman::{Dispatch, Foreman};
+use wh_foreman::{
+    Dispatch, Foreman,
+    cleanup::{self, CleanupConfig},
+};
 use wh_core::{BenchmarkRunId, ProposalId, SessionId};
 use wh_improver::{ImproverConfig, ImproverService, RunResult};
 use wh_metrics::{
@@ -81,6 +84,22 @@ enum Cmd {
         no_github: bool,
         #[arg(long, env = "WH_GH_BIN", default_value = "gh")]
         gh_bin: PathBuf,
+    },
+    /// Free disk: worktrees and sandbox homes of finished sessions, scorer/benchmark
+    /// leftovers, branches of merged or cancelled tasks, oversized build caches.
+    /// `wh foreman` does this by itself after each finished task and every 30 min.
+    Cleanup {
+        #[arg(long, env = "WH_FACTORY", default_value = "factory/factory.yaml")]
+        factory: PathBuf,
+        /// Only list what would be removed
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep finished work younger than this many hours (merged task branches go right away)
+        #[arg(long, env = "WH_CLEANUP_GRACE_HOURS", default_value_t = 24)]
+        grace_hours: u64,
+        /// Wipe a shared build cache (an agent's CARGO_TARGET_DIR) bigger than this many GB
+        #[arg(long, env = "WH_CACHE_MAX_GB", default_value_t = CleanupConfig::DEFAULT_CACHE_MAX_GB)]
+        cache_max_gb: u64,
     },
     /// Grade finished agent sessions with the factory's scorers (LLM-as-judge) until Ctrl+C
     Scorer {
@@ -661,6 +680,26 @@ async fn main() -> Result<()> {
             );
             a.and(b).and(c).and(d).and(e).and(g)?;
         }
+        Cmd::Cleanup { factory, dry_run, grace_hours, cache_max_gb } => {
+            let f = Factory::load(&factory)?;
+            let mut cfg =
+                CleanupConfig::for_factory(&f, data_dir(), Duration::from_secs(grace_hours * 3600), cache_max_gb << 30);
+            cfg.dry_run = dry_run;
+            let r = cleanup::sweep(&store, &cfg).await?;
+            for x in &r.removed {
+                let size = if x.bytes > 0 { format!("  ({})", cleanup::human_bytes(x.bytes)) } else { String::new() };
+                println!("{} {:<12} {}{size}", if dry_run { "would remove" } else { "removed" }, x.kind, x.what);
+            }
+            for e in &r.errors {
+                println!("error: {e}");
+            }
+            println!(
+                "{} item(s), {} {}",
+                r.removed.len(),
+                cleanup::human_bytes(r.bytes()),
+                if dry_run { "would be freed" } else { "freed" }
+            );
+        }
         Cmd::Bench { cmd } => bench_cmd(&store, cmd).await?,
         Cmd::Github { cmd } => github_cmd(&store, cmd).await?,
         Cmd::Improver { factory, claude_bin } => {
@@ -979,11 +1018,44 @@ pub(crate) async fn ctrl_c() {
 async fn run_foreman(store: &EventStore, f: Factory, max_parallel: usize, claude_bin: PathBuf, gh_bin: PathBuf) -> Result<()> {
     let runner = Runner::new(store.clone(), ClaudeCode::new(claude_bin), RunnerConfig { data_dir: data_dir() });
     let dispatch = Dispatch::Spawn(std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel)));
+    let cleanup = cleanup_config(&f)?;
+    let wake = std::sync::Arc::new(tokio::sync::Notify::new());
     let mut foreman = Foreman::new(store.clone(), f, runner, dispatch).with_gh(wh_github::Gh::new(gh_bin));
+    if cleanup.is_some() {
+        foreman = foreman.with_janitor(wake.clone());
+    }
     for task in foreman.recover_interrupted().await? {
         println!("task {task} was interrupted mid-stage → blocked. Restart it with: wh task resume {task}");
     }
-    Subscription::new(store.clone()).run(&mut foreman, ctrl_c()).await
+    // Sweeps at startup, after every finished task and every 30 minutes.
+    let janitor = cleanup
+        .map(|cfg| tokio::spawn(cleanup::run_janitor(store.clone(), cfg, wake, Duration::from_secs(30 * 60))));
+    let r = Subscription::new(store.clone()).run(&mut foreman, ctrl_c()).await;
+    if let Some(j) = janitor {
+        j.abort();
+    }
+    r
+}
+
+/// Cleanup settings for the foreman's janitor from the environment
+/// (`WH_NO_CLEANUP=1` turns it off; see `wh cleanup --help` for the others).
+fn cleanup_config(f: &Factory) -> Result<Option<CleanupConfig>> {
+    if std::env::var("WH_NO_CLEANUP").is_ok_and(|v| v == "1" || v == "true") {
+        return Ok(None);
+    }
+    let num = |name: &str, default: u64| -> Result<u64> {
+        match std::env::var(name) {
+            Ok(v) => v.parse().with_context(|| format!("{name}={v} is not a number")),
+            Err(_) => Ok(default),
+        }
+    };
+    let grace = Duration::from_secs(num("WH_CLEANUP_GRACE_HOURS", 24)? * 3600);
+    let max = num("WH_CACHE_MAX_GB", CleanupConfig::DEFAULT_CACHE_MAX_GB)? << 30;
+    let cfg = CleanupConfig::for_factory(f, data_dir(), grace, max);
+    for (path, _) in &cfg.caches {
+        println!("cleanup: build cache {} is wiped above {}", path.display(), cleanup::human_bytes(max));
+    }
+    Ok(Some(cfg))
 }
 
 /// Scorer consumer until Ctrl+C. New consumers start at the head of the log, so
@@ -1251,6 +1323,7 @@ async fn run_agent(store: &EventStore, a: RunArgs) -> Result<()> {
         } else {
             wh_core::Sandbox::Worktree
         },
+        env: Default::default(),
     };
     println!("task {task_id}");
     let runner = Runner::new(store.clone(), ClaudeCode::new(a.claude_bin), RunnerConfig { data_dir: data_dir() });

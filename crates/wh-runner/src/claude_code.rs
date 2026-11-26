@@ -91,12 +91,19 @@ impl ClaudeCode {
             Some(container) => {
                 let mut inner: Vec<OsString> = vec![self.container_bin.clone().into()];
                 inner.extend(Self::args(req));
+                let mut container = container.clone();
+                for name in req.env.keys() {
+                    if !container.config.env.contains(name) {
+                        container.config.env.push(name.clone());
+                    }
+                }
                 let mut c = Command::new(&self.docker_bin);
-                c.args(docker::run_args(container, &inner));
+                c.args(docker::run_args(&container, &inner));
                 c
             }
         };
-        cmd.env_remove("CLAUDECODE")
+        cmd.envs(&req.env)
+            .env_remove("CLAUDECODE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -295,7 +302,50 @@ fn tail(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, ffi::OsStr};
+
+    use wh_core::{DockerSandbox, SessionId};
+
     use super::*;
+    use crate::docker::Container;
+
+    #[test]
+    fn env_reaches_the_agent_and_its_container_by_name() {
+        let mut req = AgentRequest {
+            prompt: "p".into(),
+            workdir: "/w".into(),
+            transcript_path: "/t".into(),
+            model: None,
+            budget_usd: None,
+            permission_mode: None,
+            allowed_tools: vec![],
+            with_user_mcp: false,
+            timeout: Duration::from_secs(1),
+            tools: None,
+            container: None,
+            env: BTreeMap::from([("CARGO_TARGET_DIR".to_string(), "/cache/target".to_string())]),
+        };
+        let cc = ClaudeCode::new("claude");
+        let has_env = |cmd: &Command| {
+            cmd.as_std().get_envs().any(|(k, v)| k == OsStr::new("CARGO_TARGET_DIR") && v == Some(OsStr::new("/cache/target")))
+        };
+        assert!(has_env(&cc.command(&req)));
+
+        req.container = Some(Container {
+            name: "wh-x".into(),
+            session: SessionId::new(),
+            config: DockerSandbox::new("img"),
+            workdir: "/w".into(),
+            mounts: vec![],
+            user: None,
+            home_dir: "/h".into(),
+        });
+        let cmd = cc.command(&req);
+        assert!(has_env(&cmd), "docker copies the value from its own environment");
+        let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(2).any(|w| w == ["--env", "CARGO_TARGET_DIR"]), "{args:?}");
+        assert!(!args.iter().any(|a| a.contains("/cache/target")), "values stay off the command line");
+    }
 
     const STREAM: &[&str] = &[
         r#"{"type":"system","subtype":"init","session_id":"abc","model":"claude-haiku-5-5","tools":["Bash"]}"#,

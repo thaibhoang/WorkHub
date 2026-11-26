@@ -1,4 +1,4 @@
-use std::{future::Future, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, future::Future, path::PathBuf, time::Duration};
 
 use tokio::sync::mpsc::UnboundedSender;
 use wh_core::{FailureClass, session::TokenUsage};
@@ -23,6 +23,9 @@ pub struct AgentRequest {
     pub tools: Option<Vec<String>>,
     /// Run the agent inside this container instead of directly on the host.
     pub container: Option<Container>,
+    /// Extra environment for the agent process. With a container, each variable is
+    /// also passed in by name (values never appear on the docker command line).
+    pub env: BTreeMap<String, String>,
 }
 
 /// Live progress reported while the session runs.

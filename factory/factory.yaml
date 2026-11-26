@@ -11,14 +11,20 @@ defaults:
   timeout_min: 30
   max_retries: 2
   permission_mode: acceptEdits
+  # No `cargo fmt`: the codebase is not rustfmt-formatted, so it would rewrite
+  # whole files and bury the real change in the diff.
   allowed_tools:
     - "Bash(cargo build:*)"
     - "Bash(cargo test:*)"
     - "Bash(cargo clippy:*)"
-    - "Bash(cargo fmt:*)"
     - "Bash(git status:*)"
     - "Bash(git diff:*)"
     - "Bash(git log:*)"
+  # Every session gets a fresh worktree; one shared target dir keeps the compiled
+  # dependencies between sessions instead of rebuilding the workspace from scratch
+  # each stage. `wh cleanup` / the foreman wipe it above WH_CACHE_MAX_GB (30).
+  env:
+    CARGO_TARGET_DIR: ~/.cache/workhub/cargo-target
 
 stages:
   - { id: triage, agent: triage }
@@ -65,6 +71,16 @@ scorers:
     prompt: scorers/review-evidence.md
     description: Review verdicts are consistent, evidenced with file:line, and actionable
     pass_threshold: 0.6
+
+# Ship to GitHub (phase 8): after verify, a human approves the push (ship-review),
+# then WorkHub pushes wh/task/<id> and opens a PR. Failed CI or requested changes
+# send the task back to implement. Issues labelled `workhub` become tasks.
+github:
+  repo: thaibhoang/WorkHub
+  base: main
+  ship_gate: ship-review
+  labels: [workhub]
+  issues: { label: workhub, comment: true }
 
 # Self-improvement (phase 5). The improver reads the metrics above, edits this
 # directory on a `wh/proposal/<id>` branch and waits for a human in the Inbox.

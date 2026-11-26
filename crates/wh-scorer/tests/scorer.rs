@@ -146,6 +146,7 @@ async fn run_stage(store: &EventStore, factory: &Factory, data: &Path, task: Tas
         factory_version: Some(factory.version.clone()),
         benchmark: None,
         sandbox: Default::default(),
+        env: Default::default(),
     };
     runner.run(spec, |_| {}).await.unwrap().last().session_id
 }

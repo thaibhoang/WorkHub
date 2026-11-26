@@ -66,6 +66,7 @@ fn spec(repo: &Path, task: TaskId, base_ref: &str) -> RunSpec {
         factory_version: None,
         benchmark: None,
         sandbox: Default::default(),
+        env: Default::default(),
     }
 }
 
