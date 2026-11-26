@@ -2285,6 +2285,7 @@ dependencies = [
  "rpassword",
  "serde_json",
  "sqlx",
+ "tempfile",
  "tokio",
  "tracing-subscriber",
  "wh-api",
