@@ -643,7 +643,7 @@ async fn main() -> Result<()> {
             }
             if let Some(g) = &f.github {
                 println!(
-                    "\ngithub: {} via {}  base {}  rework → {}  poll {}s{}{}{}",
+                    "\ngithub: {} via {}  base {}  rework → {}  poll {}s{}{}{}{}",
                     g.repo.as_deref().unwrap_or("(repo from remote)"),
                     g.remote,
                     g.base.as_deref().unwrap_or("(default branch)"),
@@ -651,6 +651,7 @@ async fn main() -> Result<()> {
                     g.poll_interval.as_secs(),
                     if g.draft { "  draft" } else { "" },
                     g.ship_gate.as_ref().map(|s| format!("  ship gate: {s}")).unwrap_or_default(),
+                    g.conflict_gate.as_ref().map(|s| format!("  conflict gate: {s}")).unwrap_or_default(),
                     g.issues.as_ref().map(|i| format!("  issues labelled '{}'", i.label)).unwrap_or_default(),
                 );
             }
@@ -1259,6 +1260,9 @@ async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {
                 let names: Vec<_> = failed.iter().map(|c| c.name.as_str()).collect();
                 if names.is_empty() { conclusion } else { format!("{conclusion}: {}", names.join(", ")) }
             }
+            TaskEvent::PrConflicted { base, commit } => {
+                format!("with {base} at {}", commit.chars().take(10).collect::<String>())
+            }
             TaskEvent::PrMerged { merged_by, .. } => merged_by.map(|b| format!("by {b}")).unwrap_or_default(),
             _ => String::new(),
         };
@@ -1330,6 +1334,7 @@ async fn run_agent(store: &EventStore, a: RunArgs) -> Result<()> {
             wh_core::Sandbox::Worktree
         },
         env: Default::default(),
+        merge: None,
     };
     println!("task {task_id}");
     let runner = Runner::new(store.clone(), ClaudeCode::new(a.claude_bin), RunnerConfig { data_dir: data_dir() });

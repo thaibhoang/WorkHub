@@ -301,6 +301,7 @@ export interface GithubDef {
   labels: string[]
   poll_interval_sec: number
   ship_gate: string | null
+  conflict_gate: string | null
   rework_stage: string
   issue_label: string | null
 }

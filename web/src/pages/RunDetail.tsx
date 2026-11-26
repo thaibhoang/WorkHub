@@ -212,13 +212,19 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
 
   if (state.status === 'awaiting_gate') {
     const output =
-      state.stage === 'ship' ? state.results.at(-1) : [...state.results].reverse().find((r) => r.stage === state.stage)
+      state.stage === 'ship' || state.stage === 'conflict' ? state.results.at(-1) : [...state.results].reverse().find((r) => r.stage === state.stage)
     return (
       <Card className="border-warn/50">
         <CardHeader>
           <CardTitle>Review required: {state.gate}</CardTitle>
           <CardDescription>
-            {state.stage === 'ship' ? (
+            {state.stage === 'conflict' ? (
+              <>
+                The pull request conflicts with its base branch. Approve to let WorkHub merge the base and have{' '}
+                <span className="font-mono">{factory?.github?.rework_stage ?? 'the agent'}</span> resolve the conflicts,
+                or reject to block the task.
+              </>
+            ) : state.stage === 'ship' ? (
               <>
                 Every stage passed. Approve to push the branch and open a pull request on GitHub, or reject to send it
                 back to <span className="font-mono">{factory?.github?.rework_stage ?? 'the agent'}</span> with your
@@ -359,6 +365,12 @@ function prEventText(e: WhEvent) {
           <span className="text-fail">CI failed</span>
           {p.failed?.length ? `: ${p.failed.map((c: { name: string }) => c.name).join(', ')}` : null}
         </>
+      )
+    case 'PrConflicted':
+      return (
+        <span className="text-warn">
+          Conflicts with {p.base} at <span className="font-mono text-xs">{String(p.commit).slice(0, 10)}</span>
+        </span>
       )
     case 'PrMerged':
       return <span className="text-ok">Merged{p.merged_by ? ` by ${p.merged_by}` : ''}</span>
