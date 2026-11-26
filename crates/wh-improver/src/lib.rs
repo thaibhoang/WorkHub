@@ -399,6 +399,7 @@ impl<R: AgentRuntime> Inner<R> {
             timeout: im.timeout,
             tools: None,
             container: None,
+            env: Default::default(),
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let o = self.runtime.run(&req, tx).await;

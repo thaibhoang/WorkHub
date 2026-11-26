@@ -131,6 +131,9 @@ struct Settings {
     permission_mode: Option<String>,
     allowed_tools: Option<Vec<String>>,
     sandbox: Option<SandboxFile>,
+    /// Environment variables set for the agent process (merged by key: an agent's
+    /// entries override the defaults'). A leading `~/` in a value is `$HOME/`.
+    env: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -183,15 +186,35 @@ impl SandboxFile {
         d.memory = self.memory.clone();
         d.pids_limit = self.pids_limit;
         for name in self.env.iter().flatten() {
-            let valid = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-            ensure!(valid, "env: '{name}' is not a variable name (values are passed through from the host)");
+            ensure!(is_var_name(name), "env: '{name}' is not a variable name (values are passed through from the host)");
         }
         d.env = self.env.clone().unwrap_or_default();
         d.volumes = self.volumes.iter().flatten().map(|v| resolve_volume(v, base)).collect::<anyhow::Result<_>>()?;
         d.copy_credentials = self.copy_credentials.unwrap_or(true);
         Ok(Sandbox::Docker(d))
     }
+}
+
+fn is_var_name(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Merge `env:` maps in order (later entries win) and expand a leading `~/`.
+fn resolve_env<'a>(entries: impl Iterator<Item = (&'a String, &'a String)>) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+    for (name, value) in entries {
+        ensure!(is_var_name(name), "'{name}' is not a variable name");
+        let value = match value.strip_prefix("~/") {
+            Some(rest) => {
+                let home = std::env::var_os("HOME").context("value uses ~ but HOME is not set")?;
+                PathBuf::from(home).join(rest).to_str().context("value is not UTF-8")?.to_owned()
+            }
+            None => value.clone(),
+        };
+        env.insert(name.clone(), value);
+    }
+    Ok(env)
 }
 
 /// `host:container[:ro|rw]` with the host path made absolute (`~/` = $HOME,
@@ -274,6 +297,8 @@ pub struct Agent {
     pub allowed_tools: Vec<String>,
     /// Where the agent's sessions run (worktree on the host, or a container).
     pub sandbox: Sandbox,
+    /// Extra environment for the agent process (also passed into its container).
+    pub env: BTreeMap<String, String>,
 }
 
 /// LLM-as-judge definition: grades sessions of `target` agent with `prompt`.
@@ -435,6 +460,8 @@ impl Factory {
             };
             let budget_usd = s.budget_usd.or(d.budget_usd).unwrap_or(DEFAULT_BUDGET_USD);
             ensure!(budget_usd > 0.0, "agent '{name}': budget_usd must be > 0");
+            let env = resolve_env(d.env.iter().flatten().chain(s.env.iter().flatten()))
+                .with_context(|| format!("agent '{name}': env"))?;
             agents.insert(name.clone(), Agent {
                 name: name.clone(),
                 description: a.description.clone(),
@@ -450,6 +477,7 @@ impl Factory {
                     .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.into()),
                 allowed_tools: s.allowed_tools.clone().or_else(|| d.allowed_tools.clone()).unwrap_or_default(),
                 sandbox,
+                env,
             });
         }
 
@@ -743,6 +771,23 @@ improvement:
         assert!(d.copy_credentials);
         assert_eq!(f.agents["b"].sandbox, Sandbox::Worktree);
         assert_eq!(f.agents["a"].sandbox.label(), "docker:workhub-agent:latest");
+    }
+
+    #[test]
+    fn env_merges_defaults_and_expands_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = OK
+            .replace("max_retries: 1 }", "max_retries: 1, env: { A: \"~/x\", B: one } }")
+            .replace("model: claude-haiku-5-5 }", "model: claude-haiku-5-5, env: { B: two } }");
+        let f = Factory::load(&write(dir.path(), &yaml)).unwrap();
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(f.agents["a"].env.get("A"), Some(&format!("{home}/x")));
+        assert_eq!(f.agents["a"].env.get("B").map(String::as_str), Some("one"));
+        assert_eq!(f.agents["b"].env.get("B").map(String::as_str), Some("two"));
+        assert_eq!(f.agents["b"].env.len(), 2);
+        let bad = OK.replace("max_retries: 1 }", "max_retries: 1, env: { \"A-B\": x } }");
+        let err = format!("{:#}", Factory::load(&write(dir.path(), &bad)).unwrap_err());
+        assert!(err.contains("not a variable name"), "{err}");
     }
 
     #[test]

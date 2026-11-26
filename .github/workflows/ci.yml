@@ -1,0 +1,58 @@
+# Checks every pull request (including the ones WorkHub's agents open): a failed
+# run is fed back to the implement stage as rework.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: workhub
+          POSTGRES_PASSWORD: workhub
+          POSTGRES_DB: workhub
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U workhub"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgres://workhub:workhub@localhost:5432/workhub
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: git identity (tests make commits)
+        run: git config --global user.name ci && git config --global user.email ci@localhost && git config --global init.defaultBranch main
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test --workspace --locked
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: build (type check + bundle)
+        run: npm run build
