@@ -446,6 +446,7 @@ impl Factory {
         hasher.update(&raw);
 
         let d = &file.defaults;
+        ensure!(d.timeout_min != Some(0), "defaults: timeout_min must be > 0");
         let mut agents = BTreeMap::new();
         for (name, a) in &file.agents {
             let prompt_path = base.join(&a.prompt);
@@ -460,6 +461,7 @@ impl Factory {
             };
             let budget_usd = s.budget_usd.or(d.budget_usd).unwrap_or(DEFAULT_BUDGET_USD);
             ensure!(budget_usd > 0.0, "agent '{name}': budget_usd must be > 0");
+            ensure!(s.timeout_min != Some(0), "agent '{name}': timeout_min must be > 0");
             let env = resolve_env(d.env.iter().flatten().chain(s.env.iter().flatten()))
                 .with_context(|| format!("agent '{name}': env"))?;
             agents.insert(name.clone(), Agent {
@@ -514,6 +516,7 @@ impl Factory {
             ensure!((0.0..=1.0).contains(&pass_threshold), "scorer '{id}': pass_threshold must be within 0..=1");
             ensure!((0.0..=1.0).contains(&sampling_rate), "scorer '{id}': sampling_rate must be within 0..=1");
             ensure!(budget_usd > 0.0, "scorer '{id}': budget_usd must be > 0");
+            ensure!(sc.timeout_min != Some(0), "scorer '{id}': timeout_min must be > 0");
             scorers.push(Scorer {
                 id: id.clone(),
                 target: sc.target.clone(),
@@ -538,6 +541,7 @@ impl Factory {
                 hasher.update(prompt.as_bytes());
                 let budget_usd = im.budget_usd.unwrap_or(DEFAULT_IMPROVER_BUDGET_USD);
                 ensure!(budget_usd > 0.0, "improvement: budget_usd must be > 0");
+                ensure!(im.timeout_min != Some(0), "improvement: timeout_min must be > 0");
                 ensure!(im.interval_hours != Some(0), "improvement: interval_hours must be > 0");
                 let window_days = im.window_days.unwrap_or(DEFAULT_WINDOW_DAYS);
                 ensure!(window_days > 0, "improvement: window_days must be > 0");
@@ -738,11 +742,13 @@ improvement:
         let sc = f.scorer("s1").unwrap();
         assert_eq!((sc.prompt.as_str(), sc.sampling_rate, sc.pass_threshold), ("rubric", 0.5, 0.7));
         assert_eq!(sc.model, "claude-haiku-5-5");
+        assert_eq!(sc.timeout, Duration::from_secs(5 * 60));
         assert_eq!(f.scorers_for("a").count(), 1);
         assert_eq!(f.scorers_for("b").count(), 0);
         let im = f.improvement.as_ref().unwrap();
         assert_eq!((im.window_days, im.min_sessions, im.interval_hours), (14, 5, Some(24)));
         assert_eq!(im.model, "claude-sonnet-5-5");
+        assert_eq!(im.timeout, Duration::from_secs(20 * 60));
         assert_eq!(im.triggers[0].key(), "stage_failure_rate:impl>0.25");
         assert_eq!(im.triggers[1].subject, "s1");
         assert!(f.path.is_absolute());
@@ -841,6 +847,17 @@ improvement:
             ("container path must be absolute", OK.replace("max_retries: 1 }", "max_retries: 1, sandbox: { kind: docker, volumes: [\"a:b\"] } }")),
             ("not a variable name", OK.replace("max_retries: 1 }", "max_retries: 1, sandbox: { kind: docker, env: [\"A=1\"] } }")),
             ("unknown field", OK.replace("max_retries: 1 }", "max_retries: 1, sandbox: { kind: docker, img: x } }")),
+            ("defaults: timeout_min must be > 0", OK.replace("max_retries: 1 }", "max_retries: 1, timeout_min: 0 }")),
+            ("agent 'a': timeout_min must be > 0", OK.replace("agents/a.md }", "agents/a.md, timeout_min: 0 }")),
+            ("scorer 's1': timeout_min must be > 0", OK.replace("sampling_rate: 0.5", "sampling_rate: 0.5, timeout_min: 0")),
+            ("improvement: timeout_min must be > 0", OK.replace("interval_hours: 24", "interval_hours: 24\n  timeout_min: 0")),
+            // Rejected even when every agent overrides the default.
+            (
+                "defaults: timeout_min must be > 0",
+                OK.replace("max_retries: 1 }", "max_retries: 1, timeout_min: 0 }")
+                    .replace("agents/a.md }", "agents/a.md, timeout_min: 1 }")
+                    .replace("model: claude-haiku-5-5 }", "model: claude-haiku-5-5, timeout_min: 1 }"),
+            ),
         ];
         for (needle, yaml) in cases {
             let dir = tempfile::tempdir().unwrap();
