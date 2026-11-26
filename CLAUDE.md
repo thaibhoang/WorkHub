@@ -19,13 +19,12 @@ cargo build
 cargo test                         # integration tests need the Postgres above running
 cargo test -p wh-eventstore concurrent_appends   # single test (crate + name filter)
 cargo run --bin wh -- db migrate
-cargo run --bin wh -- task create --title "..." [--body "..."]
+cargo run --bin wh -- task create --title "..." [--body "..."] [--factory F | --no-factory]   # factory: $WH_FACTORY, else factory/factory.yaml; --no-factory = manual task
 cargo run --bin wh -- task list
 cargo run --bin wh -- run --repo <git repo> [--model claude-haiku-5-5] [--budget 2.0] [--docker [--image I]] "<prompt>"
 cargo run --bin wh -- sandbox build | check [--factory F] [--smoke] | ps | prune   # docker agent image + setup check (--smoke ≈ $0.002)
 cargo run --bin wh -- sessions | stats   # per-session rows / per-agent cost, fail%, p50/p95
 cargo run --bin wh -- factory [--file factory/factory.yaml]          # validate + show stages, factory_version
-cargo run --bin wh -- task create --title "..." --factory factory/factory.yaml
 cargo run --bin wh -- foreman [--factory ...] [--max-parallel 2] [--no-scorers] [--no-improver] [--no-bench] [--no-github]  # daemon: pipeline + scorers + improver + bench worker + GitHub poller + projections
 cargo run --bin wh -- scorer [--factory ...]                         # scorers only (LLM-as-judge daemon)
 cargo run --bin wh -- score session <session> [--scorer id]          # grade one session now (manual, ignores sampling)

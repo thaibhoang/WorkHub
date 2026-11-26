@@ -2,7 +2,10 @@ mod bench;
 mod github;
 mod sandbox;
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -292,8 +295,11 @@ enum TaskCmd {
         #[arg(long)]
         body: Option<String>,
         /// Factory file whose pipeline should run this task (picked up by `wh foreman`)
+        #[arg(long, env = "WH_FACTORY", default_value = "factory/factory.yaml")]
+        factory: PathBuf,
+        /// Create a manual task that no foreman drives (ignores --factory and WH_FACTORY)
         #[arg(long)]
-        factory: Option<PathBuf>,
+        no_factory: bool,
     },
     /// List tasks from the tasks_view read model
     List,
@@ -557,8 +563,8 @@ async fn main() -> Result<()> {
             println!("migrations applied");
         }
         Cmd::Task { cmd } => match cmd {
-            TaskCmd::Create { title, body, factory } => {
-                let factory = factory.map(|p| Factory::load(&p)).transpose()?.map(|f| f.name);
+            TaskCmd::Create { title, body, factory, no_factory } => {
+                let factory = task_factory(no_factory, &factory)?;
                 let t = NewTask { title, body, source: TaskSource::Cli, factory };
                 println!("{}", commands::create_task(&store, local_user(), t).await?);
             }
@@ -1384,6 +1390,16 @@ fn fmt_ms(ms: f64) -> String {
     if s < 60.0 { format!("{s:.1}s") } else { format!("{}m{:02}s", (s / 60.0) as u64, (s % 60.0) as u64) }
 }
 
+/// The factory name a new task belongs to: `None` for a manual task (the file is not read).
+fn task_factory(no_factory: bool, path: &Path) -> Result<Option<String>> {
+    if no_factory {
+        return Ok(None);
+    }
+    // Not every validation error of `Factory::load` names the factory file.
+    let factory = Factory::load(path).with_context(|| format!("load factory {}", path.display()))?;
+    Ok(Some(factory.name))
+}
+
 fn print_event(e: &RecordedEvent) {
     println!(
         "#{:<6} {}  {}@{}  {}  {}",
@@ -1408,4 +1424,59 @@ fn read_password(from_stdin: bool) -> Result<String> {
         anyhow::bail!("passwords do not match");
     }
     Ok(pw)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    const OK: &str = "name: demo\nstages: [{ id: impl, agent: a }]\nagents: { a: { prompt: a.md } }\n";
+
+    /// A temp dir with a factory file and its agent prompt; returns the dir and the file.
+    fn factory_dir(yaml: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "do the work").unwrap();
+        let path = dir.path().join("factory.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn task_factory_returns_the_factory_name() {
+        let (_dir, path) = factory_dir(OK);
+        assert_eq!(task_factory(false, &path).unwrap().as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn task_factory_rejects_a_missing_or_invalid_file() {
+        let (dir, invalid) = factory_dir("name: [");
+        // Parses, but a stage names an agent that does not exist.
+        let unknown_agent = dir.path().join("unknown-agent.yaml");
+        std::fs::write(&unknown_agent, OK.replace("agent: a }", "agent: nobody }")).unwrap();
+
+        for path in [dir.path().join("missing.yaml"), invalid, unknown_agent] {
+            let err = format!("{:#}", task_factory(false, &path).unwrap_err());
+            assert!(err.contains(&path.display().to_string()), "{err}");
+        }
+    }
+
+    #[test]
+    fn no_factory_does_not_read_the_file() {
+        assert_eq!(task_factory(true, Path::new("/nonexistent/factory.yaml")).unwrap(), None);
+    }
+
+    #[test]
+    fn task_create_factory_arguments() {
+        let cmd = Cli::command();
+        let create = cmd.find_subcommand("task").and_then(|t| t.find_subcommand("create")).unwrap();
+        let factory = create.get_arguments().find(|a| a.get_id() == "factory").unwrap();
+        assert_eq!(factory.get_env().and_then(|v| v.to_str()), Some("WH_FACTORY"));
+        assert_eq!(factory.get_default_values(), ["factory/factory.yaml"]);
+
+        let args = ["wh", "task", "create", "--title", "x", "--factory", "f.yaml", "--no-factory"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Task { cmd: TaskCmd::Create { no_factory: true, .. } }));
+    }
 }
