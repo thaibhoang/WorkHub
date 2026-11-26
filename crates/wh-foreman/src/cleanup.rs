@@ -25,8 +25,7 @@
 //! Everything here is idempotent and only touches finished work.
 
 use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    collections::{HashMap, HashSet},    path::{Path, PathBuf},
     process::{Output, Stdio},
     sync::Arc,
     time::{Duration, SystemTime},
@@ -123,9 +122,10 @@ fn session_finished(head: &str) -> bool {
 
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The task can no longer have a session running for it.
+/// The task can no longer have a session running for it. Not `PrClosed`: a PR can
+/// be closed while a rework stage for it is still running.
 fn task_over(head: &str) -> bool {
-    matches!(head, "TaskCancelled" | "TaskCompleted" | "PrMerged" | "PrClosed" | "TaskBlocked")
+    matches!(head, "TaskCancelled" | "TaskCompleted" | "PrMerged" | "TaskBlocked")
 }
 
 /// One pass over everything described in the module docs.
@@ -228,7 +228,8 @@ async fn delete_task_branches(store: &EventStore, cfg: &CleanupConfig, r: &mut C
             let Some(task) = TaskId::from_stream_id(&stream) else { continue };
             let branch = task_branch(task);
             let has_local = local.contains(branch.as_str());
-            let on_remote = remote.as_ref().filter(|(_, b)| b.contains(&branch)).map(|(name, _)| *name);
+            // (remote name, commit the branch points at there)
+            let on_remote = remote.as_ref().and_then(|(name, b)| Some((*name, b.get(&branch)?)));
             if !has_local && on_remote.is_none() {
                 continue;
             }
@@ -251,11 +252,11 @@ async fn delete_task_branches(store: &EventStore, cfg: &CleanupConfig, r: &mut C
                 }
             }
             if due.remote
-                && let Some(name) = on_remote
+                && let Some((name, oid)) = on_remote
             {
                 let res = match cfg.dry_run {
                     true => Ok(true),
-                    false => delete_remote_branch(&cfg.repo, name, &branch).await,
+                    false => delete_remote_branch(&cfg.repo, name, &branch, oid).await,
                 };
                 match res {
                     Ok(true) => r.removed.push(Removed { kind: "remote-branch", what: branch, bytes: 0 }),
@@ -302,26 +303,35 @@ async fn branches_due(store: &EventStore, stream: &str, head: &str, grace: Durat
     })
 }
 
-/// Names (`wh/task/<id>`) of the task branches on `remote`.
-async fn remote_task_branches(repo: &Path, remote: &str) -> anyhow::Result<HashSet<String>> {
+/// Task branches (`wh/task/<id>`) on `remote`, with the commit each points at.
+async fn remote_task_branches(repo: &Path, remote: &str) -> anyhow::Result<HashMap<String, String>> {
     let out = remote_git(repo, &["ls-remote", "--heads", remote, "refs/heads/wh/task/*"]).await?;
     Ok(out
         .lines()
-        .filter_map(|l| l.split_once('\t')?.1.strip_prefix("refs/heads/"))
-        .filter(|b| b.starts_with("wh/task/"))
-        .map(str::to_owned)
+        .filter_map(|l| {
+            let (oid, refname) = l.split_once('\t')?;
+            let branch = refname.strip_prefix("refs/heads/").filter(|b| b.starts_with("wh/task/"))?;
+            Some((branch.to_owned(), oid.to_owned()))
+        })
         .collect())
 }
 
-/// Delete `branch` on `remote`. `false` = it was already gone (GitHub can delete
-/// head branches by itself).
-async fn delete_remote_branch(repo: &Path, remote: &str, branch: &str) -> anyhow::Result<bool> {
+/// Delete `branch`, last seen at `oid`, on `remote`. `false` = it was already gone
+/// (GitHub can delete head branches by itself).
+async fn delete_remote_branch(repo: &Path, remote: &str, branch: &str, oid: &str) -> anyhow::Result<bool> {
     anyhow::ensure!(branch.starts_with("wh/task/"), "refusing to delete {branch}: not a task branch");
     let refname = format!("refs/heads/{branch}");
-    match remote_git(repo, &["push", "--quiet", remote, "--delete", &refname]).await {
+    // The lease makes the push fail when the ref is gone; a plain delete of a
+    // missing ref "succeeds". It also refuses if the branch moved since listing.
+    let lease = format!("--force-with-lease={refname}:{oid}");
+    let delete = format!(":{refname}");
+    match remote_git(repo, &["push", "--quiet", &lease, remote, &delete]).await {
         Ok(_) => Ok(true),
-        Err(e) if e.to_string().contains("remote ref does not exist") => Ok(false),
-        Err(e) => Err(e),
+        // Ask the remote why, rather than match git's error text.
+        Err(e) => match remote_git(repo, &["ls-remote", remote, &refname]).await {
+            Ok(out) if out.trim().is_empty() => Ok(false),
+            _ => Err(e),
+        },
     }
 }
 
@@ -459,5 +469,26 @@ mod tests {
         assert_eq!(worktree_repo(dir.path()), Some(PathBuf::from("/src/repo/.git")));
         std::fs::write(dir.path().join(".git"), "gitdir: /elsewhere/x\n").unwrap();
         assert_eq!(worktree_repo(dir.path()), None);
+    }
+
+    /// The race with GitHub's auto-delete: listed by `ls-remote`, gone before the push.
+    #[tokio::test]
+    async fn deleting_a_missing_remote_branch_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, bare) = (dir.path().join("repo"), dir.path().join("origin.git"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&bare).unwrap();
+        git(&bare, &["init", "-q", "--bare"]).await.unwrap();
+        git(&repo, &["init", "-q"]).await.unwrap();
+        git(&repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"])
+            .await
+            .unwrap();
+        git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]).await.unwrap();
+        git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/wh/task/x"]).await.unwrap();
+
+        let oid = remote_task_branches(&repo, "origin").await.unwrap().remove("wh/task/x").unwrap();
+        assert!(delete_remote_branch(&repo, "origin", "wh/task/x", &oid).await.unwrap());
+        assert!(!delete_remote_branch(&repo, "origin", "wh/task/x", &oid).await.unwrap());
+        assert!(delete_remote_branch(&repo, "origin", "main", &oid).await.is_err());
     }
 }

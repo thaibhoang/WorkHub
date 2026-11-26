@@ -171,6 +171,41 @@ async fn sweeps_finished_work_and_keeps_the_rest(pool: PgPool) {
     assert!(sweep(&store, &cfg).await.unwrap().removed.is_empty());
 }
 
+/// Closing a PR does not stop a rework that is running: its session is no orphan.
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn keeps_a_running_session_when_its_pr_is_closed(pool: PgPool) {
+    let store = EventStore::new(pool);
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, _) = repo_with_remote(dir.path());
+    let data = dir.path().join("data");
+
+    let rework = TaskEvent::StageEntered { stage: "implement".into(), feedback: Some("fix CI".into()) };
+    let t = task(&store, Some(rework)).await;
+    let running = session(&store, t, false).await;
+    append(&store, &t.stream_id(), t, TaskEvent::PrClosed { closed_at: None }).await;
+
+    let worktree = data.join("worktrees").join(running.to_string());
+    let home = data.join("sandbox-home").join(running.to_string());
+    let cache = dir.path().join("cargo-target");
+    for d in [&worktree, &home, &cache] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(cache.join("big"), vec![0u8; 4096]).unwrap();
+
+    let cfg = CleanupConfig {
+        data_dir: data,
+        repo,
+        remote: Some("origin".into()),
+        grace: Duration::ZERO,
+        caches: vec![(cache.clone(), 1024)],
+        dry_run: false,
+    };
+    let r = sweep(&store, &cfg).await.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert!(r.removed.is_empty(), "{:?}", r.removed);
+    assert!(worktree.exists() && home.exists() && cache.exists());
+}
+
 /// A repo with one commit whose `origin` is a local bare repo.
 fn repo_with_remote(dir: &Path) -> (PathBuf, PathBuf) {
     let (repo, bare) = (dir.join("repo"), dir.join("origin.git"));

@@ -28,11 +28,11 @@ No new events, projections or migrations. Read-only on the event store.
   - a branch already gone is simply not listed;
   - existing leftovers (`wh/task/2881a80a1bb6`, `wh/task/b303d971477a`) get cleaned up.
 - A listed branch is matched to a task by `task_branch(id)`. Unknown names and anything outside `refs/heads/wh/task/` are never deleted.
-- Delete with `git push <remote> --delete refs/heads/wh/task/<id>`. A "remote ref does not exist" failure (race with GitHub's auto-delete) counts as success and is not reported as removed.
+- Delete with `git push --force-with-lease=<ref>:<listed oid> <remote> :refs/heads/wh/task/<id>`. A plain delete of a missing ref succeeds, so the lease is what detects the race with GitHub's auto-delete: if the push fails and `ls-remote` no longer lists the ref, it counts as success and is not reported as removed. A branch that moved since it was listed is kept until the next sweep.
 - After the pass (not in dry run): `git remote prune <remote>`. This also drops tracking refs of branches GitHub deleted itself.
 - Network git commands run with `GIT_TERMINAL_PROMPT=0` and a 60 s timeout, so the janitor cannot hang. `ls-remote`, delete and prune failures go to `CleanupReport.errors`; the rest of the sweep continues.
 - Report: `Removed { kind: "remote-branch", what: "wh/task/<id>", bytes: 0 }`. Dry run lists these without pushing or pruning.
-- `task_over` includes `PrClosed`. Update the module docs and the `Removed.kind` comment.
+- `task_over` (orphaned sessions) does **not** include `PrClosed`: a PR can be closed while a rework stage is still running. Update the module docs and the `Removed.kind` comment.
 - Docs: the **Cleanup** paragraph in `CLAUDE.md`, and the "Dọn dẹp" bullet in `docs/architecture.md` (in Vietnamese).
 
 ## For the reviewer to decide
