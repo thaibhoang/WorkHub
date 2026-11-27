@@ -14,9 +14,10 @@ anyhow.workspace = true
 chrono.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 wh-metrics.workspace = true
-sqlx.workspace = true
 tempfile = "3"
 serde_json.workspace = true

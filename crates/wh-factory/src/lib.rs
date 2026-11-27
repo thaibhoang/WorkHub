@@ -45,6 +45,17 @@ struct FactoryFile {
     scorers: Vec<ScorerFile>,
     improvement: Option<ImprovementFile>,
     github: Option<GithubFile>,
+    task_database: Option<TaskDatabase>,
+}
+
+/// `task_database:`: every task gets its own database on this server, and its
+/// sessions get `DATABASE_URL` pointing at it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDatabase {
+    /// Variable of the WorkHub process holding a URL that may `CREATE DATABASE`.
+    /// Must start with [`wh_core::AGENT_DB_ENV_PREFIX`], so agents never inherit it.
+    pub admin_url_env: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -433,6 +444,7 @@ pub struct Factory {
     pub scorers: Vec<Scorer>,
     pub improvement: Option<Improvement>,
     pub github: Option<Github>,
+    pub task_database: Option<TaskDatabase>,
 }
 
 impl Factory {
@@ -441,6 +453,15 @@ impl Factory {
         let file: FactoryFile =
             serde_yaml_ng::from_slice(&raw).with_context(|| format!("parse {}", path.display()))?;
         let base = path.parent().unwrap_or(Path::new("."));
+
+        if let Some(db) = &file.task_database {
+            let name = &db.admin_url_env;
+            ensure!(
+                is_var_name(name) && name.starts_with(wh_core::AGENT_DB_ENV_PREFIX),
+                "task_database: admin_url_env must be a variable name starting with {}, got '{name}'",
+                wh_core::AGENT_DB_ENV_PREFIX
+            );
+        }
 
         let mut hasher = Sha256::new();
         hasher.update(&raw);
@@ -657,6 +678,7 @@ impl Factory {
             scorers,
             improvement,
             github,
+            task_database: file.task_database,
         })
     }
 
@@ -794,6 +816,24 @@ improvement:
         let bad = OK.replace("max_retries: 1 }", "max_retries: 1, env: { \"A-B\": x } }");
         let err = format!("{:#}", Factory::load(&write(dir.path(), &bad)).unwrap_err());
         assert!(err.contains("not a variable name"), "{err}");
+    }
+
+    #[test]
+    fn task_database_block() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Factory::load(&write(dir.path(), OK)).unwrap().task_database.is_none());
+        let yaml = format!("{OK}task_database: {{ admin_url_env: WH_AGENT_DB_ADMIN_URL }}\n");
+        let db = Factory::load(&write(dir.path(), &yaml)).unwrap().task_database.unwrap();
+        assert_eq!(db.admin_url_env, "WH_AGENT_DB_ADMIN_URL");
+        for bad in [
+            "{ admin_url_env: DATABASE_URL }",
+            "{ admin_url_env: WH_AGENT_DB_-x }",
+            "{ admin_url_env: WH_AGENT_DB_A, x: 1 }",
+            "{}",
+        ] {
+            let yaml = format!("{OK}task_database: {bad}\n");
+            assert!(Factory::load(&write(dir.path(), &yaml)).is_err(), "{bad}");
+        }
     }
 
     #[test]

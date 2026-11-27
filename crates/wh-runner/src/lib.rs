@@ -9,5 +9,6 @@ mod runner;
 mod runtime;
 pub mod worktree;
 
+pub use claude_code::strip_live_env;
 pub use runner::{RunReport, RunSpec, Runner, RunnerConfig, SessionReport};
 pub use runtime::{AgentRequest, AgentRuntime, Outcome, OutcomeStatus, Signal};

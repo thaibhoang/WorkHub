@@ -5,6 +5,12 @@ repo: ..
 base_ref: main
 max_rework_loops: 3
 
+# Every task gets its own migrated database (`wh_task_*`) as DATABASE_URL, so agents
+# can run tests and `wh` without touching the live one. The variable must be set for
+# the WorkHub process (.env), or tasks block.
+task_database:
+  admin_url_env: WH_AGENT_DB_ADMIN_URL
+
 defaults:
   model: claude-sonnet-5-5
   budget_usd: 2.0
@@ -17,6 +23,8 @@ defaults:
     - "Bash(cargo build:*)"
     - "Bash(cargo test:*)"
     - "Bash(cargo clippy:*)"
+    # Safe against the task's own database only (see task_database).
+    - "Bash(cargo run --bin wh:*)"
     - "Bash(git status:*)"
     - "Bash(git diff:*)"
     - "Bash(git log:*)"

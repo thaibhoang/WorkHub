@@ -53,6 +53,8 @@ Mặc định `WH_FOREMAN=0`: chỉ có UI/API (xem, tạo task, duyệt). Muố
    `WH_FACTORY=/repos/<repo>/factory/factory.yaml`.
 4. `WH_FOREMAN=1`, `WH_MAX_PARALLEL=1`, rồi `docker compose up -d`.
 
+Agent không bao giờ nhận `DATABASE_URL` của app. Factory có `task_database: { admin_url_env: WH_AGENT_DB_ADMIN_URL }` thì mỗi task có database riêng `wh_task_*` trên Postgres của compose (biến này đã đặt sẵn trong `docker-compose.yml`).
+
 Lưu ý: agent chạy ngay trong container app (sandbox `worktree`); `sandbox: { kind: docker }` không dùng được ở đây. Server chỉ có khoảng 600 MB RAM trống và không có swap, mỗi phiên Claude Code tốn vài trăm MB. Nên giữ `WH_MAX_PARALLEL=1`, thêm swap (cần sudo) hoặc nâng server trước khi chạy nhiều. Factory dogfood (`factory/factory.yaml`) chạy `cargo build/test`, server này không kham nổi.
 
 ## Vận hành

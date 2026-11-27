@@ -14,6 +14,10 @@
 //!   the remote) or whose task was cancelled (after the grace period). Branches of
 //!   tasks completed locally, blocked or still open are never touched;
 //!
+//! on the factory's `task_database` server:
+//! - `wh_task_*` databases created by this event store whose task is done or merged,
+//!   cancelled (after the grace period) or no longer exists;
+//!
 //! and build caches (`CARGO_TARGET_DIR` shared by the factory's agents) that grew
 //! past their size limit, wiped only while no session is running.
 //!
@@ -27,10 +31,30 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use anyhow::Context;
+use sqlx::{Connection, PgConnection};
 use tokio::{process::Command, sync::Notify};
 use wh_core::{BenchmarkRunId, SessionId, TaskId, session::SessionEvent, task::task_branch};
 use wh_eventstore::EventStore;
 use wh_factory::Factory;
+
+use crate::task_db;
+
+/// The server holding the per-task databases.
+#[derive(Clone)]
+pub struct TaskDbAdmin {
+    /// Variable the URL comes from.
+    pub env: String,
+    /// `None` when that variable is not set.
+    pub url: Option<String>,
+}
+
+impl std::fmt::Debug for TaskDbAdmin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The URL holds a password.
+        f.debug_struct("TaskDbAdmin").field("env", &self.env).field("set", &self.url.is_some()).finish()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CleanupConfig {
@@ -43,6 +67,8 @@ pub struct CleanupConfig {
     pub caches: Vec<(PathBuf, u64)>,
     /// Report what would be removed without removing anything.
     pub dry_run: bool,
+    /// Set when the factory has `task_database:`.
+    pub task_db: Option<TaskDbAdmin>,
 }
 
 impl CleanupConfig {
@@ -61,13 +87,17 @@ impl CleanupConfig {
             grace,
             caches: caches.into_iter().map(|p| (p, cache_max_bytes)).collect(),
             dry_run: false,
+            task_db: f.task_database.as_ref().map(|db| TaskDbAdmin {
+                env: db.admin_url_env.clone(),
+                url: std::env::var(&db.admin_url_env).ok().filter(|v| !v.is_empty()),
+            }),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Removed {
-    /// `worktree`, `sandbox-home`, `scorer-work`, `bench`, `branch` or `cache`.
+    /// `worktree`, `sandbox-home`, `scorer-work`, `bench`, `branch`, `database` or `cache`.
     pub kind: &'static str,
     pub what: String,
     pub bytes: u64,
@@ -176,6 +206,17 @@ pub async fn sweep(store: &EventStore, cfg: &CleanupConfig) -> anyhow::Result<Cl
 
     delete_task_branches(store, cfg, &mut r).await?;
 
+    if let Some(admin) = &cfg.task_db {
+        match &admin.url {
+            None => r.errors.push(format!("task databases not cleaned up: {} is not set", admin.env)),
+            Some(url) => {
+                if let Err(e) = drop_task_databases(store, url, cfg, &mut r).await {
+                    r.errors.push(format!("clean up task databases: {e:#}"));
+                }
+            }
+        }
+    }
+
     if running == 0 {
         for (path, max) in &cfg.caches {
             let size = dir_size(path.clone()).await;
@@ -208,10 +249,7 @@ async fn delete_task_branches(store: &EventStore, cfg: &CleanupConfig, r: &mut C
         }
         let due = match head.as_str() {
             "PrMerged" => true,
-            "TaskCancelled" => {
-                let last = store.read_stream(&stream).await?.pop();
-                last.is_some_and(|e| (chrono::Utc::now() - e.recorded_at).to_std().unwrap_or_default() >= cfg.grace)
-            }
+            "TaskCancelled" => past_grace(store, &stream, cfg).await?,
             _ => false,
         };
         if !due {
@@ -226,6 +264,65 @@ async fn delete_task_branches(store: &EventStore, cfg: &CleanupConfig, r: &mut C
         }
         r.removed.push(Removed { kind: "branch", what: branch, bytes: 0 });
     }
+    Ok(())
+}
+
+/// Whether the stream's last event is older than the grace period.
+async fn past_grace(store: &EventStore, stream: &str, cfg: &CleanupConfig) -> anyhow::Result<bool> {
+    let last = store.read_stream(stream).await?.pop();
+    Ok(last.is_some_and(|e| (chrono::Utc::now() - e.recorded_at).to_std().unwrap_or_default() >= cfg.grace))
+}
+
+/// Drop the task databases that are due. Only names [`task_db::db_name`] produces
+/// and only databases this event store created (by their comment).
+async fn drop_task_databases(
+    store: &EventStore,
+    admin_url: &str,
+    cfg: &CleanupConfig,
+    r: &mut CleanupReport,
+) -> anyhow::Result<()> {
+    let owner = task_db::owner_comment(store.instance_id().await?);
+    let ready = format!("{owner} ready");
+    let mut admin = PgConnection::connect(admin_url).await.context("connect to the task database server")?;
+    // List the databases before the tasks: a task exists before its database does,
+    // so one created meanwhile is never taken for an orphan.
+    let databases: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT datname::text, shobj_description(oid, 'pg_database') FROM pg_database ORDER BY datname")
+            .fetch_all(&mut admin)
+            .await?;
+    let mut tasks: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (stream, _, head) in store.stream_heads(&format!("{}-", TaskId::STREAM_PREFIX)).await? {
+        if let Some(task) = TaskId::from_stream_id(&stream) {
+            tasks.entry(task_db::db_name(task)).or_default().push((stream, head));
+        }
+    }
+    for (name, comment) in databases {
+        let ours = comment.is_some_and(|c| c == owner || c == ready);
+        if !ours || !task_db::is_task_db_name(&name) {
+            continue;
+        }
+        // Without a task it is due; otherwise every task of that name must be over.
+        let mut due = true;
+        for (stream, head) in tasks.get(&name).into_iter().flatten() {
+            due &= match head.as_str() {
+                "TaskCompleted" | "PrMerged" => true,
+                "TaskCancelled" => past_grace(store, stream, cfg).await?,
+                _ => false,
+            };
+        }
+        if !due {
+            continue;
+        }
+        // `name` passed `is_task_db_name`, so it is safe to splice into DDL.
+        if !cfg.dry_run
+            && let Err(e) = sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).execute(&mut admin).await
+        {
+            r.errors.push(format!("drop database {name}: {e}"));
+            continue;
+        }
+        r.removed.push(Removed { kind: "database", what: name, bytes: 0 });
+    }
+    admin.close().await?;
     Ok(())
 }
 

@@ -427,7 +427,15 @@ impl<R: AgentRuntime + 'static> Inner<R> {
                 let repo = repo.clone().unwrap_or_else(|| p.factory.repo.clone());
                 let dir = self.run_dir(id).join("check").join(&slot);
                 let suite_dir = p.suite.path.parent().unwrap_or(Path::new("/"));
-                let env = [("WH_BENCH_SUITE_DIR", suite_dir.as_os_str()), ("WH_BENCH_CASE", case.id.as_ref())];
+                let mut env = vec![("WH_BENCH_SUITE_DIR", suite_dir.as_os_str()), ("WH_BENCH_CASE", case.id.as_ref())];
+                // The check runs agent-written code: it gets the case task's database, never ours.
+                let database = foreman.task_database_url(task).await.unwrap_or_else(|e| {
+                    tracing::warn!(%task, "task database for the check: {e:#}");
+                    None
+                });
+                if let Some(url) = &database {
+                    env.push(("DATABASE_URL", url.as_ref()));
+                }
                 let c = run_check(&repo, &Foreman::<R>::task_branch(task), &dir, cmd, &env, case.check_timeout).await;
                 if !c.passed {
                     message = Some(match c.exit_code {
@@ -535,7 +543,9 @@ async fn run_check(
         Err(e) => return fail(format!("cannot check out {branch}: {e:#}")),
     };
     let result = async {
-        let mut child = match tokio::process::Command::new("sh")
+        let mut sh = tokio::process::Command::new("sh");
+        wh_runner::strip_live_env(&mut sh);
+        let mut child = match sh
             .arg("-c")
             .arg(cmd)
             .envs(env.iter().copied())

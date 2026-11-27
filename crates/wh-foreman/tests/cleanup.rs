@@ -113,6 +113,7 @@ async fn sweeps_finished_work_and_keeps_the_rest(pool: PgPool) {
         grace: Duration::from_secs(3600),
         caches: vec![(cache.clone(), 1024)],
         dry_run: true,
+        task_db: None,
     };
     let kinds = |r: &wh_foreman::cleanup::CleanupReport| {
         let mut v: Vec<String> = r.removed.iter().map(|x| format!("{}:{}", x.kind, x.what.rsplit('/').next().unwrap())).collect();

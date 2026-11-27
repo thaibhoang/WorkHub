@@ -15,3 +15,7 @@ pub use event::{Actor, DomainEvent, EventMeta, NewEvent, RecordedEvent};
 pub use failure::FailureClass;
 pub use sandbox::{DockerSandbox, Sandbox};
 pub use ids::{BenchmarkRunId, FactoryId, ProposalId, RunId, ScoreId, SessionId, TaskId};
+
+/// Environment variables with this prefix hold WorkHub's credentials for creating
+/// agents' databases (`task_database.admin_url_env`). Agents never inherit them.
+pub const AGENT_DB_ENV_PREFIX: &str = "WH_AGENT_DB_";
