@@ -222,6 +222,7 @@ pub struct GithubDto {
     pub labels: Vec<String>,
     pub poll_interval_sec: u64,
     pub ship_gate: Option<String>,
+    pub conflict_gate: Option<String>,
     pub rework_stage: String,
     pub issue_label: Option<String>,
 }
@@ -236,6 +237,7 @@ impl From<&wh_factory::Github> for GithubDto {
             labels: g.labels.clone(),
             poll_interval_sec: g.poll_interval.as_secs(),
             ship_gate: g.ship_gate.clone(),
+            conflict_gate: g.conflict_gate.clone(),
             rework_stage: g.rework_stage.clone(),
             issue_label: g.issues.as_ref().map(|i| i.label.clone()),
         }

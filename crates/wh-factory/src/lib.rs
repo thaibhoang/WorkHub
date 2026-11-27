@@ -59,6 +59,7 @@ struct GithubFile {
     labels: Vec<String>,
     poll_interval_sec: Option<u64>,
     ship_gate: Option<String>,
+    conflict_gate: Option<String>,
     rework_stage: Option<String>,
     issues: Option<IssuesFile>,
 }
@@ -402,7 +403,9 @@ pub struct Github {
     pub poll_interval: Duration,
     /// Human gate before pushing (pushing / opening a PR is visible to others).
     pub ship_gate: Option<String>,
-    /// Stage that addresses PR feedback (changes requested, failed CI).
+    /// Human gate before WorkHub merges the base into a conflicting PR.
+    pub conflict_gate: Option<String>,
+    /// Stage that addresses PR feedback (changes requested, failed CI, conflicts).
     pub rework_stage: String,
     /// Create tasks from open issues carrying this label.
     pub issues: Option<Issues>,
@@ -602,6 +605,9 @@ impl Factory {
                 if matches!(&g.ship_gate, Some(n) if n.trim().is_empty()) {
                     bail!("github: ship_gate name is empty");
                 }
+                if matches!(&g.conflict_gate, Some(n) if n.trim().is_empty()) {
+                    bail!("github: conflict_gate name is empty");
+                }
                 // Default: the stage review sends rework to, else the first stage.
                 let rework_stage = match &g.rework_stage {
                     Some(st) => {
@@ -619,6 +625,11 @@ impl Factory {
                     "stage id '{}' is reserved when `github:` is set",
                     wh_core::task::SHIP_STAGE
                 );
+                ensure!(
+                    !ids.contains(wh_core::task::CONFLICT_STAGE),
+                    "stage id '{}' is reserved when `github:` is set",
+                    wh_core::task::CONFLICT_STAGE
+                );
                 Some(Github {
                     repo: g.repo.clone(),
                     remote: g.remote.clone().unwrap_or_else(|| "origin".into()),
@@ -627,6 +638,7 @@ impl Factory {
                     labels: g.labels.clone(),
                     poll_interval: Duration::from_secs(poll),
                     ship_gate: g.ship_gate.clone(),
+                    conflict_gate: g.conflict_gate.clone(),
                     rework_stage,
                     issues: g.issues.as_ref().map(|i| Issues {
                         label: i.label.clone().unwrap_or_else(|| DEFAULT_ISSUE_LABEL.into()),
@@ -805,10 +817,18 @@ improvement:
         assert_eq!((g.repo.as_deref(), g.remote.as_str(), g.base.as_deref()), (Some("acme/demo"), "origin", None));
         assert_eq!((g.rework_stage.as_str(), g.ship_gate.as_deref()), ("impl", Some("ship-review")));
         assert_eq!(g.poll_interval, Duration::from_secs(60));
+        assert_eq!(g.conflict_gate, None);
+        let with_gate = write(dir.path(), &format!("{OK}github: {{ conflict_gate: conflict-review }}\n"));
+        let gate = Factory::load(&with_gate).unwrap().github.unwrap().conflict_gate;
+        assert_eq!(gate.as_deref(), Some("conflict-review"));
+        let reserved = format!("{}github: {{}}\n", OK.replace("impl", "conflict"));
+        let err = format!("{:#}", Factory::load(&write(dir.path(), &reserved)).unwrap_err());
+        assert!(err.contains("reserved"), "{err}");
         assert_eq!(g.issues, Some(Issues { label: "workhub".into(), comment: false }));
         for (needle, extra) in [
             ("owner/name", "github: { repo: nope }"),
             ("not a stage", "github: { rework_stage: zz }"),
+            ("conflict_gate name is empty", "github: { conflict_gate: ' ' }"),
             ("unknown field", "github: { repoo: a/b }"),
         ] {
             let err = format!("{:#}", Factory::load(&write(dir.path(), &format!("{OK}{extra}\n"))).unwrap_err());

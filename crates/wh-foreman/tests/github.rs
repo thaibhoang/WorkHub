@@ -35,7 +35,14 @@ impl AgentRuntime for Fake {
         "fake"
     }
     async fn run(&self, req: &AgentRequest, _tx: UnboundedSender<Signal>) -> Outcome {
-        if req.prompt.starts_with("ROLE: implement") {
+        if req.prompt.starts_with("ROLE: implement") && req.prompt.contains("## Merge conflicts") {
+            let f = req.workdir.join("impl.txt");
+            let text = std::fs::read_to_string(&f).unwrap();
+            assert!(text.contains("<<<<<<< ") && text.contains("from main"), "{text}");
+            std::fs::write(req.workdir.join("feedback.txt"), &req.prompt).unwrap();
+            std::fs::write(f, "v1\nfrom main\n").unwrap();
+            ok("resolved the conflict")
+        } else if req.prompt.starts_with("ROLE: implement") {
             let f = req.workdir.join("impl.txt");
             let mut text = std::fs::read_to_string(&f).unwrap_or_default();
             text.push_str(if req.prompt.contains("Feedback you must address") { "fixed\n" } else { "v1\n" });
@@ -291,6 +298,142 @@ async fn ship_gate_then_failed_ship_blocks_and_resume_retries(pool: PgPool) {
     assert_eq!(state.status, TaskStatus::Shipped);
     let t = types(&store, task).await;
     assert_eq!(t.iter().filter(|e| *e == "StageEntered").count(), 2, "resuming at ship does not re-run stages: {t:?}");
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn conflicting_pr_is_gated_merged_resolved_and_pushed_to_the_same_pr(pool: PgPool) {
+    let env = setup("github: { repo: acme/demo, conflict_gate: conflict-review }");
+    let store = EventStore::new(pool.clone());
+    let task = TaskId::new();
+    let created = TaskEvent::TaskCreated {
+        title: "t".into(),
+        body: None,
+        source: TaskSource::Cli,
+        factory: Some("gh-test".into()),
+        benchmark: None,
+        external_ref: None,
+    };
+    let meta = || EventMeta::new(task.0, Actor::Human { user: "tester".into() });
+    store.append(&task.stream_id(), ExpectedVersion::NoStream, vec![NewEvent::from_domain(&created, meta()).unwrap()]).await.unwrap();
+    let mut fm = foreman(&store, &env);
+    let state = fm.drive(task).await.unwrap();
+    assert_eq!(state.status, TaskStatus::Shipped);
+    let pushed = state.pr.unwrap().commit;
+
+    // Someone else adds the same file on main.
+    let other = env._dir.path().join("other");
+    git(env._dir.path(), &["clone", "-q", env.remote.to_str().unwrap(), other.to_str().unwrap()]);
+    std::fs::write(other.join("impl.txt"), "from main\n").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "main moves"]);
+    git(&other, &["push", "-q", "origin", "main"]);
+    let main = git(&env.remote, &["rev-parse", "main"]);
+
+    env.write("pr_view.json", serde_json::json!({
+        "state": "OPEN", "headRefOid": pushed, "baseRefName": "main",
+        "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"
+    }));
+    let svc = GithubService::new(store.clone(), env.factory.clone(), env.gh()).unwrap();
+    assert_eq!(svc.sync_once().await.unwrap().recorded, vec![(task, vec!["PrConflicted"])]);
+    assert!(svc.sync_once().await.unwrap().recorded.is_empty(), "once per head commit");
+
+    let state = fm.drive(task).await.unwrap();
+    let gate = TaskStatus::AwaitingGate { gate: "conflict-review".into(), stage: "conflict".into() };
+    assert_eq!(state.status, gate);
+    let approved = TaskEvent::GateDecided {
+        gate: "conflict-review".into(),
+        stage: "conflict".into(),
+        approved: true,
+        reviewer: "tester".into(),
+        comment: None,
+    };
+    store
+        .append(&task.stream_id(), ExpectedVersion::Exact(state.version), vec![NewEvent::from_domain(&approved, meta()).unwrap()])
+        .await
+        .unwrap();
+
+    let state = fm.drive(task).await.unwrap();
+    assert_eq!((state.status.clone(), state.pr_rework_loops, state.rework_loops), (TaskStatus::Shipped, 1, 0));
+    assert!(state.conflict.is_none());
+    let resolved = state.pr.unwrap().commit;
+    let branch = wh_core::task::task_branch(task);
+    assert_eq!(git(&env.remote, &["rev-parse", &branch]), resolved, "pushed to the same branch");
+    // Both the old push and main are ancestors: a merge, no history rewritten.
+    git(&env.remote, &["merge-base", "--is-ancestor", &pushed, &resolved]);
+    git(&env.remote, &["merge-base", "--is-ancestor", &main, &resolved]);
+    assert_eq!(git(&env.remote, &["show", &format!("{branch}:impl.txt")]), "v1\nfrom main");
+    assert!(git(&env.remote, &["show", &format!("{branch}:feedback.txt")]).contains("impl.txt (both added)"));
+    assert_eq!(env.calls().matches("pr create").count(), 1);
+    let stages = state.results.iter().map(|r| r.stage.as_str()).collect::<Vec<_>>();
+    assert_eq!(stages, ["implement", "review", "implement", "review"]);
+
+    env.write("pr_view.json", serde_json::json!({"state": "MERGED", "headRefOid": resolved}));
+    svc.sync_once().await.unwrap();
+    assert_eq!(fm.drive(task).await.unwrap().status, TaskStatus::Done);
+    wh_metrics::catch_up_all(&store).await.unwrap();
+    let loops: (i32, i32) = sqlx::query_as("SELECT pr_rework_loops, rework_loops FROM tasks_view WHERE task_id = $1")
+        .bind(task.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(loops, (1, 0));
+}
+
+/// A task driven until it waits on its PR, with the pushed commit.
+async fn shipped_task(store: &EventStore, env: &Env) -> (TaskId, String) {
+    let task = TaskId::new();
+    let created = TaskEvent::TaskCreated {
+        title: "t".into(),
+        body: None,
+        source: TaskSource::Cli,
+        factory: Some("gh-test".into()),
+        benchmark: None,
+        external_ref: None,
+    };
+    let meta = EventMeta::new(task.0, Actor::Human { user: "tester".into() });
+    store.append(&task.stream_id(), ExpectedVersion::NoStream, vec![NewEvent::from_domain(&created, meta).unwrap()]).await.unwrap();
+    let state = foreman(store, env).drive(task).await.unwrap();
+    assert_eq!(state.status, TaskStatus::Shipped);
+    (task, state.pr.unwrap().commit)
+}
+
+fn conflicting_view(head: &str) -> serde_json::Value {
+    serde_json::json!({"state": "OPEN", "headRefOid": head, "baseRefName": "main", "mergeable": "CONFLICTING"})
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn conflict_on_another_head_is_not_recorded(pool: PgPool) {
+    let env = setup("github: { repo: acme/demo }");
+    let store = EventStore::new(pool);
+    let (task, pushed) = shipped_task(&store, &env).await;
+    let svc = GithubService::new(store.clone(), env.factory.clone(), env.gh()).unwrap();
+
+    env.write("pr_view.json", conflicting_view("someone-elses-commit"));
+    assert!(svc.sync_once().await.unwrap().recorded.is_empty());
+    assert!(!types(&store, task).await.contains(&"PrConflicted".to_owned()));
+
+    env.write("pr_view.json", conflicting_view(&pushed));
+    assert_eq!(svc.sync_once().await.unwrap().recorded, vec![(task, vec!["PrConflicted"])]);
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn conflict_while_the_task_is_not_shipped_is_not_recorded(pool: PgPool) {
+    let env = setup("github: { repo: acme/demo }");
+    let store = EventStore::new(pool);
+    let (task, pushed) = shipped_task(&store, &env).await;
+    let svc = GithubService::new(store.clone(), env.factory.clone(), env.gh()).unwrap();
+
+    let version = store.read_stream(&task.stream_id()).await.unwrap().last().unwrap().stream_version;
+    let entered = TaskEvent::StageEntered { stage: "implement".into(), feedback: None };
+    let meta = EventMeta::new(task.0, Actor::Human { user: "tester".into() });
+    store
+        .append(&task.stream_id(), ExpectedVersion::Exact(version), vec![NewEvent::from_domain(&entered, meta).unwrap()])
+        .await
+        .unwrap();
+
+    env.write("pr_view.json", conflicting_view(&pushed));
+    assert!(svc.sync_once().await.unwrap().recorded.is_empty());
+    assert!(!types(&store, task).await.contains(&"PrConflicted".to_owned()));
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]

@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Duration};
 use serde::Deserialize;
 use wh_core::{
     Actor, EventMeta, NewEvent, TaskId,
-    task::{CHANGES_REQUESTED, ExternalRef, FailedCheck, PrComment, TaskEvent, TaskSource, TaskState},
+    task::{CHANGES_REQUESTED, ExternalRef, FailedCheck, PrComment, TaskEvent, TaskSource, TaskState, TaskStatus},
 };
 use wh_eventstore::{EventStore, ExpectedVersion, StoreError};
 use wh_factory::Factory;
@@ -195,6 +195,13 @@ impl GithubService {
             self.gh.json(None, &["pr", "view", &n, "--repo", &pr.repo, "--json", PR_VIEW_FIELDS]).await?;
         let mut new = Vec::new();
         for o in poll::observe(&seen, &view) {
+            // Recording marks the commit as seen, so only record a conflict the task
+            // can act on: waiting on its PR, about the commit it pushed.
+            if let Observed::Conflict { commit, .. } = &o
+                && (state.status != TaskStatus::Shipped || *commit != pr.commit)
+            {
+                continue;
+            }
             new.push(match o {
                 Observed::Review { id, reviewer, state: review, body, submitted_at } => {
                     let comments = if review == CHANGES_REQUESTED {
@@ -216,6 +223,7 @@ impl GithubService {
                     let conclusion = if passed { "success" } else { "failure" }.to_owned();
                     TaskEvent::PrChecksCompleted { commit, conclusion, failed: out }
                 }
+                Observed::Conflict { base, commit } => TaskEvent::PrConflicted { base, commit },
                 Observed::Merged { at, by } => TaskEvent::PrMerged { merged_at: at, merged_by: by },
                 Observed::Closed { at } => TaskEvent::PrClosed { closed_at: at },
             });
