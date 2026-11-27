@@ -47,6 +47,11 @@ impl EventStore {
         &self.pool
     }
 
+    /// Random id of this event store, fixed when it was migrated.
+    pub async fn instance_id(&self) -> Result<uuid::Uuid, sqlx::Error> {
+        sqlx::query_scalar("SELECT id FROM instance").fetch_one(&self.pool).await
+    }
+
     /// Atomically append `events` to `stream_id` if its current version matches `expected`.
     pub async fn append(
         &self,

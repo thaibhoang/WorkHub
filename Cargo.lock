@@ -2349,6 +2349,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
  "wh-core",
  "wh-eventstore",
  "wh-factory",

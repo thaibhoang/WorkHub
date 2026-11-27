@@ -82,6 +82,11 @@ impl ClaudeCode {
     }
 
     fn command(&self, req: &AgentRequest) -> Command {
+        self.command_inheriting(req, std::env::vars_os().map(|(name, _)| name))
+    }
+
+    /// `inherited` names the variables the child would get from this process.
+    fn command_inheriting(&self, req: &AgentRequest, inherited: impl IntoIterator<Item = OsString>) -> Command {
         let mut cmd = match &req.container {
             None => {
                 let mut c = Command::new(&self.bin);
@@ -102,6 +107,8 @@ impl ClaudeCode {
                 c
             }
         };
+        // Before `envs`, so a factory `env:` can still set DATABASE_URL explicitly.
+        strip_names(&mut cmd, inherited);
         cmd.envs(&req.env)
             .env_remove("CLAUDECODE")
             .stdin(Stdio::null())
@@ -113,6 +120,30 @@ impl ClaudeCode {
 
     fn launcher(&self, req: &AgentRequest) -> &Path {
         if req.container.is_some() { &self.docker_bin } else { &self.bin }
+    }
+}
+
+/// Whether an inherited variable must never reach agents or agent-written code:
+/// `DATABASE_URL` is the database the running WorkHub uses, `WH_AGENT_DB_*` can
+/// create and drop databases on that server.
+fn is_withheld(name: &str) -> bool {
+    name == "DATABASE_URL" || name.starts_with(wh_core::AGENT_DB_ENV_PREFIX)
+}
+
+/// Remove the withheld variables from what `cmd` inherits from this process. Call
+/// it before setting the command's own variables.
+pub fn strip_live_env(cmd: &mut Command) {
+    strip_names(cmd, std::env::vars_os().map(|(name, _)| name));
+}
+
+fn strip_names(cmd: &mut Command, inherited: impl IntoIterator<Item = OsString>) {
+    cmd.env_remove("DATABASE_URL");
+    for name in inherited {
+        if let Some(name) = name.to_str()
+            && is_withheld(name)
+        {
+            cmd.env_remove(name);
+        }
     }
 }
 
@@ -366,6 +397,52 @@ mod tests {
         "not json",
         r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":4200,"num_turns":3,"total_cost_usd":0.0123,"result":"done","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":300,"cache_creation_input_tokens":40}}"#,
     ];
+
+    #[test]
+    fn the_agent_never_inherits_the_live_database_url() {
+        let mut req = AgentRequest {
+            prompt: "p".into(),
+            workdir: "/w".into(),
+            transcript_path: "/t".into(),
+            model: None,
+            budget_usd: None,
+            permission_mode: None,
+            allowed_tools: vec![],
+            with_user_mcp: false,
+            timeout: Duration::from_secs(1),
+            tools: None,
+            container: None,
+            env: BTreeMap::new(),
+        };
+        let cc = ClaudeCode::new("claude");
+        // `Some(None)` = removed from the inherited environment, `None` = inherited as is.
+        let var = |cmd: &Command, name: &str| {
+            cmd.as_std().get_envs().find(|(k, _)| *k == OsStr::new(name)).map(|(_, v)| v.map(OsStr::to_owned))
+        };
+        let database_url = |cmd: &Command| var(cmd, "DATABASE_URL");
+        // Passed in rather than set on this process, which other tests share.
+        let admin_url_is_stripped = |req: &AgentRequest| {
+            let cmd = cc.command_inheriting(req, ["WH_AGENT_DB_ADMIN_URL", "PATH"].map(OsString::from));
+            assert_eq!(var(&cmd, "WH_AGENT_DB_ADMIN_URL"), Some(None));
+            assert_eq!(var(&cmd, "PATH"), None);
+        };
+        assert_eq!(database_url(&cc.command(&req)), Some(None));
+        admin_url_is_stripped(&req);
+        req.container = Some(Container {
+            name: "wh-x".into(),
+            session: SessionId::new(),
+            config: DockerSandbox::new("img"),
+            workdir: "/w".into(),
+            mounts: vec![],
+            user: None,
+            home_dir: "/h".into(),
+        });
+        assert_eq!(database_url(&cc.command(&req)), Some(None), "docker copies from the client's environment");
+        admin_url_is_stripped(&req);
+
+        req.env.insert("DATABASE_URL".into(), "postgres://task".into());
+        assert_eq!(database_url(&cc.command(&req)), Some(Some("postgres://task".into())));
+    }
 
     #[test]
     fn parses_signals_and_outcome() {

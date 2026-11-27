@@ -9,6 +9,7 @@
 pub mod cleanup;
 mod decide;
 mod prompt;
+pub mod task_db;
 
 use std::sync::Arc;
 
@@ -55,6 +56,8 @@ pub struct Foreman<R> {
     gh: wh_github::Gh,
     /// Woken when a task finishes, so [`cleanup::run_janitor`] sweeps right away.
     janitor: Option<Arc<Notify>>,
+    /// Server for per-task databases: the value of `task_database.admin_url_env`.
+    task_db_admin: Option<String>,
 }
 
 /// Reviewer recorded on gates a benchmark foreman approves.
@@ -64,6 +67,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
     pub fn new(store: EventStore, factory: Factory, runner: Runner<R>, dispatch: Dispatch) -> Self {
         let name = format!("foreman:{}", factory.name);
         Self {
+            task_db_admin: task_db_admin(&factory),
             store,
             factory: Arc::new(factory),
             runner: Arc::new(runner),
@@ -81,6 +85,18 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
         self
     }
 
+    /// Use this server for per-task databases instead of the variable the factory
+    /// names (tests).
+    pub fn with_task_db_admin(mut self, url: impl Into<String>) -> Self {
+        self.task_db_admin = Some(url.into());
+        self
+    }
+
+    /// The task's own database, created if needed. `None` without `task_database:`.
+    pub async fn task_database_url(&self, task: TaskId) -> anyhow::Result<Option<String>> {
+        provision_for(&self.store, &self.factory, self.task_db_admin.as_deref(), task).await
+    }
+
     /// Use another `gh` binary for shipping (tests use a fake one).
     pub fn with_gh(mut self, gh: wh_github::Gh) -> Self {
         self.gh = gh;
@@ -91,6 +107,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
     pub fn for_benchmark(store: EventStore, factory: Factory, runner: Runner<R>, run: BenchmarkRunId) -> Self {
         let name = format!("foreman:{}:bench-{run}", factory.name);
         Self {
+            task_db_admin: task_db_admin(&factory),
             store,
             factory: Arc::new(factory),
             runner: Arc::new(runner),
@@ -208,11 +225,34 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
         }
     }
 
-    async fn run_stage(&self, spec: RunSpec) -> anyhow::Result<()> {
+    async fn run_stage(&self, mut spec: RunSpec) -> anyhow::Result<()> {
         let (task, stage) = (spec.task_id, spec.stage.clone());
         tracing::info!(%task, stage, "dispatching stage");
         let runner = self.runner.clone();
+        let (store, factory, admin) = (self.store.clone(), self.factory.clone(), self.task_db_admin.clone());
+        let meta = self.meta(task, None);
         let run = async move {
+            match provision_for(&store, &factory, admin.as_deref(), task).await {
+                Ok(None) => {}
+                Ok(Some(url)) => {
+                    // The factory's own `env:` wins.
+                    spec.env.entry("DATABASE_URL".into()).or_insert(url);
+                    // A `wh` run by the agent against its database knows none of our
+                    // sessions: it must not clean up the live data directory.
+                    let data = std::env::temp_dir().join(format!("wh-agent-{}", task_db::db_name(task)));
+                    spec.env.entry("WH_DATA_DIR".into()).or_insert_with(|| data.display().to_string());
+                }
+                Err(e) => {
+                    tracing::warn!(%task, stage, "task database: {e:#}");
+                    let ev = TaskEvent::TaskBlocked { stage: Some(stage), reason: format!("task database: {e:#}") };
+                    let expected = spec.task_expected_version.map_or(ExpectedVersion::Any, ExpectedVersion::Exact);
+                    let events = vec![NewEvent::from_domain(&ev, meta)?];
+                    return match store.append(&task.stream_id(), expected, events).await {
+                        Ok(_) | Err(StoreError::Conflict { .. }) => Ok(()),
+                        Err(e) => Err(e.into()),
+                    };
+                }
+            }
             match runner.run(spec, |_| {}).await {
                 Ok(r) => {
                     tracing::info!(%task, stage, outcome = r.stage_outcome.as_str(), cost = r.total_cost_usd(), "stage finished");
@@ -236,6 +276,22 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             }
         }
     }
+}
+
+fn task_db_admin(factory: &Factory) -> Option<String> {
+    let env = &factory.task_database.as_ref()?.admin_url_env;
+    std::env::var(env).ok().filter(|v| !v.is_empty())
+}
+
+async fn provision_for(
+    store: &EventStore,
+    factory: &Factory,
+    admin: Option<&str>,
+    task: TaskId,
+) -> anyhow::Result<Option<String>> {
+    let Some(config) = &factory.task_database else { return Ok(None) };
+    let admin = admin.with_context(|| format!("{} is not set", config.admin_url_env))?;
+    task_db::provision(store, admin, task).await.map(Some)
 }
 
 /// Block every task matching `owned` whose stream ends at `StageEntered` (its runner
