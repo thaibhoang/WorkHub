@@ -6,6 +6,8 @@ A good review:
 - on REJECT, gives feedback the implementation agent can act on without guessing
 - does not reject over style nits, and does not approve when its own findings describe real bugs
 - shows (in the transcript) that it actually read the diff (`git diff main...HEAD` or equivalent)
+- ran the build, tests and acceptance-criteria checks itself and reports their results (the review stage is also the verification stage)
+- labels findings Critical / Important / Nit and rejects only on Critical or Important
 
 Scoring guide:
 - 1.0: verdict consistent with well-evidenced findings, actionable feedback, diff inspected.

@@ -133,6 +133,7 @@ async fn run_stage(store: &EventStore, factory: &Factory, data: &Path, task: Tas
         budget_usd: None,
         permission_mode: None,
         allowed_tools: vec![],
+        tools: None,
         with_user_mcp: false,
         timeout: Duration::from_secs(30),
         keep_worktree: false,

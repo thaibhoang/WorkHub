@@ -195,10 +195,21 @@ impl AgentRuntime for ClaudeCode {
                 status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()),
                 tail(&stderr, 2000)
             );
+            if is_usage_limit(&stderr) {
+                return Outcome::failed(FailureClass::UsageLimit, msg, false, started.elapsed());
+            }
             // Usually transient (API overload, crashed process): worth a retry.
             Outcome::failed(FailureClass::Unknown, msg, true, started.elapsed())
         })
     }
+}
+
+/// Claude Code's message when the account's usage window is exhausted, e.g.
+/// "You've hit your 5-hour limit · resets 12:40am". Retrying right away only
+/// burns attempts, so these failures are not retryable.
+pub fn is_usage_limit(message: &str) -> bool {
+    let m = message.to_lowercase();
+    (m.contains("hit your") && m.contains("limit")) || m.contains("usage limit")
 }
 
 /// Incremental parser for Claude Code's `stream-json` output. Pure, so it can be
@@ -266,10 +277,11 @@ impl StreamParser {
                 retryable: false,
             }
         } else {
-            OutcomeStatus::Failed {
-                class: FailureClass::Unknown,
-                message: summary.clone().unwrap_or_else(|| subtype.to_owned()),
-                retryable: true,
+            let message = summary.clone().unwrap_or_else(|| subtype.to_owned());
+            if is_usage_limit(&message) {
+                OutcomeStatus::Failed { class: FailureClass::UsageLimit, message, retryable: false }
+            } else {
+                OutcomeStatus::Failed { class: FailureClass::Unknown, message, retryable: true }
             }
         };
         Some(Outcome {
@@ -389,6 +401,17 @@ mod tests {
             p.outcome().unwrap().status,
             OutcomeStatus::Failed { class: FailureClass::BudgetExceeded, .. }
         ));
+    }
+
+    #[test]
+    fn usage_limit_is_not_retried() {
+        let mut p = StreamParser::default();
+        p.feed(r#"{"type":"result","subtype":"success","is_error":true,"result":"You've hit your 5-hour limit · resets 12:40am (Asia/Ho_Chi_Minh)","total_cost_usd":0}"#);
+        assert!(matches!(
+            p.outcome().unwrap().status,
+            OutcomeStatus::Failed { class: FailureClass::UsageLimit, retryable: false, .. }
+        ));
+        assert!(!is_usage_limit("error: test failed"));
     }
 
     #[test]

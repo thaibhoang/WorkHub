@@ -1,16 +1,29 @@
 # WorkHub's own factory (dogfooding). Edit prompts/policies here; every change
 # produces a new factory_version so before/after metrics can be compared.
+#
+# Pipeline (after Addy Osmani's agent-skills, trimmed to three sessions):
+#   spec (Define + Plan, human gate) -> implement (Build) -> code_review
+#   (Review + Verify, rework loop) -> ship gate -> PR.
+# Every session costs ~30k context tokens before it does anything, and every
+# stage re-reads the code it needs, so the pipeline stays at three stages: the
+# old triage and verify stages were folded into spec and code_review.
 name: workhub-dev
 repo: ..
 base_ref: main
-max_rework_loops: 3
+max_rework_loops: 2
 
 defaults:
   model: claude-sonnet-5-5
-  budget_usd: 2.0
+  budget_usd: 1.0
   timeout_min: 30
-  max_retries: 2
+  # A retry re-runs a whole session from scratch; one is enough for a timeout.
+  # Usage-limit failures are never retried.
+  max_retries: 1
   permission_mode: acceptEdits
+  # Only the built-in tools the stages use. Each tool definition is resent on
+  # every turn; the default set (subagents, cron, web, notebooks, ...) costs
+  # thousands of tokens per turn and lets an agent fan out into subagents.
+  tools: [Bash, Read, Edit, Write]
   # No `cargo fmt`: the codebase is not rustfmt-formatted, so it would rewrite
   # whole files and bury the real change in the diff.
   allowed_tools:
@@ -27,32 +40,25 @@ defaults:
     CARGO_TARGET_DIR: ~/.cache/workhub/cargo-target
 
 stages:
-  - { id: triage, agent: triage }
   - { id: spec, agent: spec, gate: spec-review }
   - { id: implement, agent: implementation }
   - { id: code_review, agent: code-review, on_reject: implement }
-  - { id: verify, agent: verify, on_reject: implement }
 
 agents:
-  triage:
-    prompt: agents/triage.md
-    model: claude-haiku-5-5
-    budget_usd: 0.3
-    timeout_min: 5
   spec:
     prompt: agents/spec.md
-    budget_usd: 1.0
+    budget_usd: 0.75
+    timeout_min: 15
   implementation:
     prompt: agents/implementation.md
-    budget_usd: 3.0
+    budget_usd: 2.5
     timeout_min: 45
   code-review:
     prompt: agents/code-review.md
     budget_usd: 1.0
-  verify:
-    prompt: agents/verify.md
-    budget_usd: 0.5
-    timeout_min: 15
+    timeout_min: 25
+    # Reads and runs checks only.
+    tools: [Bash, Read]
 
 # LLM-as-judge quality checks (phase 4). Each grades finished sessions of its
 # target agent with a cheap model and no tools; results feed /scorers and the
@@ -72,7 +78,7 @@ scorers:
     description: Review verdicts are consistent, evidenced with file:line, and actionable
     pass_threshold: 0.6
 
-# Ship to GitHub (phase 8): after verify, a human approves the push (ship-review),
+# Ship to GitHub (phase 8): after code_review, a human approves the push (ship-review),
 # then WorkHub pushes wh/task/<id> and opens a PR. Failed CI or requested changes
 # send the task back to implement. Issues labelled `workhub` become tasks.
 github:

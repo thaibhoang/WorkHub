@@ -223,7 +223,7 @@ async fn sessions_stats_and_dashboard(pool: PgPool) {
 
     let (_, f) = call(&app, "GET", "/api/factory", None).await;
     assert_eq!(f["name"], "workhub-dev");
-    assert_eq!(f["stages"][1]["gate"], "spec-review");
+    assert_eq!(f["stages"][0]["gate"], "spec-review");
     assert_eq!(f["scorers"][0]["target"], "implementation");
 
     // A scorer graded the session: it shows up on the session, the task, /scores and /scorers.

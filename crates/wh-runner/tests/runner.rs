@@ -53,6 +53,7 @@ fn spec(repo: &Path, task: TaskId, base_ref: &str) -> RunSpec {
         budget_usd: Some(1.0),
         permission_mode: None,
         allowed_tools: vec![],
+        tools: None,
         with_user_mcp: false,
         timeout: Duration::from_secs(60),
         keep_worktree: false,

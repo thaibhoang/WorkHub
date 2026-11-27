@@ -16,6 +16,10 @@ pub enum FailureClass {
     EnvSetup,
     AgentGaveUp,
     Infra,
+    /// The account's usage/rate limit was hit (e.g. the 5-hour subscription
+    /// window). Not the agent's fault and not worth retrying until it resets;
+    /// excluded from failure rates so the improver does not "fix" it.
+    UsageLimit,
     Unknown,
 }
 
@@ -33,6 +37,7 @@ impl FailureClass {
             Self::EnvSetup => "env_setup",
             Self::AgentGaveUp => "agent_gave_up",
             Self::Infra => "infra",
+            Self::UsageLimit => "usage_limit",
             Self::Unknown => "unknown",
         }
     }
@@ -44,7 +49,7 @@ mod tests {
 
     #[test]
     fn as_str_matches_serde() {
-        for c in [FailureClass::BudgetExceeded, FailureClass::EnvSetup, FailureClass::AgentGaveUp] {
+        for c in [FailureClass::BudgetExceeded, FailureClass::EnvSetup, FailureClass::AgentGaveUp, FailureClass::UsageLimit] {
             assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
         }
     }
