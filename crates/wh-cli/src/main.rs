@@ -89,7 +89,8 @@ enum Cmd {
         gh_bin: PathBuf,
     },
     /// Free disk: worktrees and sandbox homes of finished sessions, scorer/benchmark
-    /// leftovers, branches of merged or cancelled tasks, oversized build caches.
+    /// leftovers, branches of merged or cancelled tasks (with `github:`, also on the
+    /// remote, including those of closed PRs), oversized build caches.
     /// `wh foreman` does this by itself after each finished task and every 30 min.
     Cleanup {
         #[arg(long, env = "WH_FACTORY", default_value = "factory/factory.yaml")]

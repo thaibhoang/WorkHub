@@ -1,6 +1,11 @@
 //! `cleanup::sweep`: what gets removed, what is kept, and when.
 
-use std::{path::Path, process::Command, time::Duration};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 use sqlx::PgPool;
 use wh_core::{
@@ -9,7 +14,7 @@ use wh_core::{
     task::{TaskEvent, TaskSource, task_branch},
 };
 use wh_eventstore::{EventStore, ExpectedVersion};
-use wh_foreman::cleanup::{CleanupConfig, sweep};
+use wh_foreman::cleanup::{CleanupConfig, CleanupReport, sweep};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
@@ -110,6 +115,7 @@ async fn sweeps_finished_work_and_keeps_the_rest(pool: PgPool) {
     let mut cfg = CleanupConfig {
         data_dir: data.clone(),
         repo: repo.clone(),
+        remote: None,
         grace: Duration::from_secs(3600),
         caches: vec![(cache.clone(), 1024)],
         dry_run: true,
@@ -163,4 +169,192 @@ async fn sweeps_finished_work_and_keeps_the_rest(pool: PgPool) {
 
     // Idempotent.
     assert!(sweep(&store, &cfg).await.unwrap().removed.is_empty());
+}
+
+/// Closing a PR does not stop a rework that is running: its session is no orphan.
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn keeps_a_running_session_when_its_pr_is_closed(pool: PgPool) {
+    let store = EventStore::new(pool);
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, _) = repo_with_remote(dir.path());
+    let data = dir.path().join("data");
+
+    let rework = TaskEvent::StageEntered { stage: "implement".into(), feedback: Some("fix CI".into()) };
+    let t = task(&store, Some(rework)).await;
+    let running = session(&store, t, false).await;
+    append(&store, &t.stream_id(), t, TaskEvent::PrClosed { closed_at: None }).await;
+
+    let worktree = data.join("worktrees").join(running.to_string());
+    let home = data.join("sandbox-home").join(running.to_string());
+    let cache = dir.path().join("cargo-target");
+    for d in [&worktree, &home, &cache] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(cache.join("big"), vec![0u8; 4096]).unwrap();
+
+    let cfg = CleanupConfig {
+        data_dir: data,
+        repo,
+        remote: Some("origin".into()),
+        grace: Duration::ZERO,
+        caches: vec![(cache.clone(), 1024)],
+        dry_run: false,
+    };
+    let r = sweep(&store, &cfg).await.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert!(r.removed.is_empty(), "{:?}", r.removed);
+    assert!(worktree.exists() && home.exists() && cache.exists());
+}
+
+/// A repo with one commit whose `origin` is a local bare repo.
+fn repo_with_remote(dir: &Path) -> (PathBuf, PathBuf) {
+    let (repo, bare) = (dir.join("repo"), dir.join("origin.git"));
+    for d in [&repo, &bare] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    git(&bare, &["init", "-q", "--bare", "-b", "main"]);
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "hi").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
+    git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    (repo, bare)
+}
+
+/// Create `branch` locally and push it.
+fn publish(repo: &Path, branch: &str) {
+    git(repo, &["branch", branch, "main"]);
+    git(repo, &["push", "-q", "origin", branch]);
+}
+
+/// Ref names under `prefix`, without it.
+fn refs(dir: &Path, prefix: &str) -> BTreeSet<String> {
+    git(dir, &["for-each-ref", "--format=%(refname)", prefix])
+        .lines()
+        .map(|l| l.strip_prefix(prefix).unwrap().to_owned())
+        .collect()
+}
+
+/// `kind:wh/task/<id>` of everything removed, sorted.
+fn removed(r: &CleanupReport) -> Vec<String> {
+    sorted(r.removed.iter().map(|x| format!("{}:{}", x.kind, x.what)).collect())
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn deletes_remote_task_branches(pool: PgPool) {
+    let store = EventStore::new(pool);
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, bare) = repo_with_remote(dir.path());
+
+    let pr_merged = || TaskEvent::PrMerged { merged_at: None, merged_by: None };
+    let pr_closed = || TaskEvent::PrClosed { closed_at: None };
+    let cancel = || TaskEvent::TaskCancelled { reason: "no".into() };
+
+    let merged = task(&store, Some(pr_merged())).await;
+    let closed = task(&store, Some(pr_closed())).await;
+    let cancelled = task(&store, Some(cancel())).await;
+    // The poller saw the PR close after the task was cancelled.
+    let cancelled_closed = task(&store, Some(cancel())).await;
+    append(&store, &cancelled_closed.stream_id(), cancelled_closed, pr_closed()).await;
+    let completed = task(&store, Some(TaskEvent::TaskCompleted { branch: None })).await;
+    let blocked = task(&store, Some(TaskEvent::TaskBlocked { stage: None, reason: "x".into() })).await;
+    let open = task(&store, None).await;
+    let resumed = task(&store, Some(pr_closed())).await;
+    let resume = TaskEvent::TaskResumed { stage: None, comment: None };
+    append(&store, &resumed.stream_id(), resumed, resume).await;
+
+    for t in [merged, closed, cancelled, cancelled_closed, completed, blocked, open, resumed] {
+        publish(&repo, &task_branch(t));
+    }
+    publish(&repo, "wh/task/unknown");
+    publish(&repo, "feature");
+
+    let mut cfg = CleanupConfig {
+        data_dir: dir.path().join("data"),
+        repo: repo.clone(),
+        remote: Some("origin".into()),
+        grace: Duration::from_secs(3600),
+        caches: vec![],
+        dry_run: true,
+    };
+    let local = |t: TaskId| format!("branch:{}", task_branch(t));
+    let remote = |t: TaskId| format!("remote-branch:{}", task_branch(t));
+    let before = refs(&bare, "refs/heads/");
+    let tracking = refs(&repo, "refs/remotes/origin/");
+
+    // Dry run: lists the merged task's branches, changes nothing.
+    let r = sweep(&store, &cfg).await.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(removed(&r), sorted(vec![local(merged), remote(merged)]));
+    assert_eq!(refs(&bare, "refs/heads/"), before);
+    assert_eq!(refs(&repo, "refs/remotes/origin/"), tracking);
+
+    // Within the grace period only the merged task's branches go.
+    cfg.dry_run = false;
+    let r = sweep(&store, &cfg).await.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(removed(&r), sorted(vec![local(merged), remote(merged)]));
+    let mut want = before.clone();
+    want.remove(&task_branch(merged));
+    assert_eq!(refs(&bare, "refs/heads/"), want);
+    assert!(!refs(&repo, "refs/remotes/origin/").contains(&task_branch(merged)));
+
+    // Grace over: closed and cancelled go too. The closed task keeps its local branch.
+    cfg.grace = Duration::ZERO;
+    let r = sweep(&store, &cfg).await.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    let gone = [remote(closed), local(cancelled), remote(cancelled), local(cancelled_closed), remote(cancelled_closed)];
+    assert_eq!(removed(&r), sorted(gone.to_vec()));
+    for t in [closed, cancelled, cancelled_closed] {
+        want.remove(&task_branch(t));
+    }
+    assert_eq!(refs(&bare, "refs/heads/"), want);
+    assert!(want.contains("wh/task/unknown") && want.contains("feature"));
+    let kept = refs(&repo, "refs/heads/");
+    for t in [closed, completed, blocked, open, resumed] {
+        assert!(kept.contains(&task_branch(t)));
+    }
+    for t in [completed, blocked, open, resumed] {
+        assert!(want.contains(&task_branch(t)));
+    }
+
+    // Idempotent.
+    let r = sweep(&store, &cfg).await.unwrap();
+    assert!(r.removed.is_empty() && r.errors.is_empty(), "{:?} {:?}", r.removed, r.errors);
+
+    // GitHub deleted the head branch itself: no error, the stale tracking ref is pruned.
+    let auto = task(&store, Some(pr_merged())).await;
+    publish(&repo, &task_branch(auto));
+    git(&bare, &["branch", "-D", &task_branch(auto)]);
+    assert!(refs(&repo, "refs/remotes/origin/").contains(&task_branch(auto)));
+    let r = sweep(&store, &cfg).await.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(removed(&r), vec![local(auto)]);
+    assert!(!refs(&repo, "refs/remotes/origin/").contains(&task_branch(auto)));
+
+    // A rejected delete is reported and retried, although the local branch is gone by then.
+    let refused = task(&store, Some(pr_merged())).await;
+    publish(&repo, &task_branch(refused));
+    git(&bare, &["config", "receive.denyDeletes", "true"]);
+    let r = sweep(&store, &cfg).await.unwrap();
+    assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+    assert_eq!(removed(&r), vec![local(refused)]);
+    git(&bare, &["config", "receive.denyDeletes", "false"]);
+    let r = sweep(&store, &cfg).await.unwrap();
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(removed(&r), vec![remote(refused)]);
+
+    // Unreachable remote: reported, local cleanup still happens.
+    let offline = task(&store, Some(pr_merged())).await;
+    publish(&repo, &task_branch(offline));
+    git(&repo, &["remote", "set-url", "origin", dir.path().join("nowhere").to_str().unwrap()]);
+    let r = sweep(&store, &cfg).await.unwrap();
+    assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+    assert_eq!(removed(&r), vec![local(offline)]);
 }

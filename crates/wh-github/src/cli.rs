@@ -48,7 +48,14 @@ async fn exec(bin: &Path, cwd: Option<&Path>, args: &[&str], stdin: Option<&str>
         _ => err(FailureClass::EnvSetup, format!("cannot run `{name}`: {e}")),
     })?;
     if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        pipe.write_all(input.as_bytes()).await.map_err(|e| err(FailureClass::Infra, format!("{name} stdin: {e}")))?;
+        // A broken pipe means the child stopped reading, usually because it
+        // already failed: its exit status and stderr say why.
+        match pipe.write_all(input.as_bytes()).await {
+            Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+                return Err(err(FailureClass::Infra, format!("{name} stdin: {e}")));
+            }
+            _ => {}
+        }
     }
     let out = tokio::time::timeout(TIMEOUT, child.wait_with_output())
         .await
@@ -113,4 +120,18 @@ pub async fn git(repo: &Path, args: &[&str]) -> CliResult<String> {
     let mut full = vec!["-C", repo.to_str().unwrap_or(".")];
     full.extend_from_slice(args);
     Ok(exec(Path::new("git"), None, &full, None).await?.trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_command_that_exits_without_reading_stdin_reports_its_own_error() {
+        // Larger than any pipe buffer, so the write always hits the closed pipe.
+        let input = "x".repeat(4 << 20);
+        let args = ["-c", "echo 'bad gateway' >&2; exit 1"];
+        let e = exec(Path::new("sh"), None, &args, Some(&input)).await.unwrap_err();
+        assert!(e.message.contains("bad gateway"), "{e}");
+    }
 }
