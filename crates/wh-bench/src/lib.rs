@@ -83,6 +83,7 @@ struct Inner<R> {
     make_runtime: Box<dyn Fn() -> R + Send + Sync>,
     config: BenchConfig,
     progress: Option<Progress>,
+    task_db_admin: Option<String>,
 }
 
 /// Writer position on a run's stream (the runner is its only writer once claimed).
@@ -109,8 +110,14 @@ impl<R: AgentRuntime + 'static> BenchService<R> {
         config: BenchConfig,
         dispatch: Dispatch,
     ) -> Self {
-        let inner = Inner { store, make_runtime: Box::new(make_runtime), config, progress: None };
+        let inner = Inner { store, make_runtime: Box::new(make_runtime), config, progress: None, task_db_admin: None };
         Self { inner: Arc::new(inner), dispatch }
+    }
+
+    /// Passed to [`Foreman::with_task_db_admin`] (tests).
+    pub fn with_task_db_admin(mut self, url: impl Into<String>) -> Self {
+        Arc::get_mut(&mut self.inner).expect("set the admin URL before cloning").task_db_admin = Some(url.into());
+        self
     }
 
     pub fn with_progress(mut self, progress: Progress) -> Self {
@@ -314,6 +321,9 @@ impl<R: AgentRuntime + 'static> Inner<R> {
         let mut log = RunLog { id, version: 2, cause }; // Requested + Started
         let runner = Runner::new(self.store.clone(), (self.make_runtime)(), RunnerConfig { data_dir: self.config.data_dir.clone() });
         let mut foreman = Foreman::for_benchmark(self.store.clone(), p.factory.clone(), runner, id);
+        if let Some(url) = &self.task_db_admin {
+            foreman = foreman.with_task_db_admin(url.clone());
+        }
         let (mut cases, mut passed, mut cost_usd, mut aborted) = (0u32, 0u32, 0.0f64, None);
 
         for (case, repeat) in &p.plan {

@@ -234,3 +234,49 @@ async fn recovery_fails_orphaned_runs_and_lists_pending(pool: PgPool) {
     assert_eq!((failed, waiting), (1, vec![pending]));
     assert!(matches!(bench_events(&store, orphan).await.last(), Some(BenchmarkEvent::BenchmarkFailed { .. })));
 }
+
+/// A suite with one case whose check is `check`.
+fn env_suite(root: &Path, check: &str) -> Request {
+    let suite = format!(
+        "name: env\nfactory: ../factory/factory.yaml\ncases:\n  - id: env\n    title: Answer\n    body: write the answer\n    fixture: fixtures/answer\n    check: |\n      {check}\n"
+    );
+    std::fs::write(root.join("benchmarks/env.yaml"), suite).unwrap();
+    Request { suite_file: root.join("benchmarks/env.yaml"), ..request(root, None, 1) }
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn checks_never_inherit_the_live_database_url(pool: PgPool) {
+    assert!(std::env::var_os("DATABASE_URL").is_some(), "this process must have something to leak");
+    let dir = setup();
+    let store = EventStore::new(pool);
+    let svc = service(&store, &dir.path().join("data"));
+
+    let req = env_suite(dir.path(), r#"test -z "$DATABASE_URL""#);
+    let (_, r) = svc.run_now(Actor::Human { user: "t".into() }, &req).await.unwrap();
+    assert!(matches!(r, RunResult::Completed { cases: 1, passed: 1, .. }), "{r:?}");
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn checks_get_the_case_task_database(pool: PgPool) {
+    let dir = setup();
+    let root = dir.path();
+    let factory = root.join("factory/factory.yaml");
+    let yaml = std::fs::read_to_string(&factory).unwrap();
+    std::fs::write(&factory, format!("{yaml}task_database: {{ admin_url_env: WH_AGENT_DB_TEST_UNSET }}\n")).unwrap();
+    git(root, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "task database"]);
+    let store = EventStore::new(pool.clone());
+    let admin = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let svc = service(&store, &root.join("data")).with_task_db_admin(admin);
+
+    let req = env_suite(root, r#"case "$DATABASE_URL" in */wh_task_*) ;; *) exit 1 ;; esac"#);
+    let (id, r) = svc.run_now(Actor::Human { user: "t".into() }, &req).await.unwrap();
+
+    // Drop before asserting, so a failure leaves nothing on the server.
+    for ev in bench_events(&store, id).await {
+        if let BenchmarkEvent::BenchmarkCaseStarted { task_id, .. } = ev {
+            let name = wh_foreman::task_db::db_name(task_id);
+            sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).execute(&pool).await.unwrap();
+        }
+    }
+    assert!(matches!(r, RunResult::Completed { cases: 1, passed: 1, .. }), "{r:?}");
+}

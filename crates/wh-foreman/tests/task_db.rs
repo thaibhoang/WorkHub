@@ -29,9 +29,12 @@ fn admin_url() -> String {
     std::env::var("DATABASE_URL").expect("DATABASE_URL")
 }
 
-/// Records the `DATABASE_URL` of each session.
+/// `DATABASE_URL` and `WH_DATA_DIR` of a session.
+type SessionEnv = (Option<String>, Option<String>);
+
+/// Records the environment of each session.
 #[derive(Default, Clone)]
-struct Fake(Arc<Mutex<Vec<Option<String>>>>);
+struct Fake(Arc<Mutex<Vec<SessionEnv>>>);
 
 impl AgentRuntime for Fake {
     fn name(&self) -> &str {
@@ -40,9 +43,10 @@ impl AgentRuntime for Fake {
     async fn run(&self, req: &AgentRequest, _tx: UnboundedSender<Signal>) -> Outcome {
         let url = req.env.get("DATABASE_URL").cloned();
         let first = self.0.lock().unwrap().is_empty();
-        self.0.lock().unwrap().push(url.clone());
-        if let Some(url) = &url {
-            let mut db = PgConnection::connect(url).await.unwrap();
+        self.0.lock().unwrap().push((url.clone(), req.env.get("WH_DATA_DIR").cloned()));
+        // Only a task database is ours to write to.
+        if let Some(url) = url.filter(|u| u.contains("/wh_task_")) {
+            let mut db = PgConnection::connect(&url).await.unwrap();
             if first {
                 // Stands for a migration the task branch added.
                 sqlx::query("CREATE TABLE marker (x int)").execute(&mut db).await.unwrap();
@@ -73,6 +77,10 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn setup() -> (tempfile::TempDir, Factory) {
+    setup_agent("{ prompt: a.md }")
+}
+
+fn setup_agent(agent: &str) -> (tempfile::TempDir, Factory) {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -81,14 +89,16 @@ fn setup() -> (tempfile::TempDir, Factory) {
     git(&repo, &["add", "."]);
     git(&repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]);
     std::fs::write(dir.path().join("a.md"), "agent").unwrap();
-    let yaml = "
+    let yaml = format!(
+        "
 name: test
 repo: repo
 base_ref: main
-task_database: { admin_url_env: WH_AGENT_DB_TEST_UNSET }
-stages: [{ id: one, agent: a }, { id: two, agent: a }]
-agents: { a: { prompt: a.md } }
-";
+task_database: {{ admin_url_env: WH_AGENT_DB_TEST_UNSET }}
+stages: [{{ id: one, agent: a }}, {{ id: two, agent: a }}]
+agents: {{ a: {agent} }}
+"
+    );
     std::fs::write(dir.path().join("factory.yaml"), yaml).unwrap();
     let factory = Factory::load(&dir.path().join("factory.yaml")).unwrap();
     (dir, factory)
@@ -146,12 +156,17 @@ async fn stages_of_a_task_share_a_database_and_tasks_do_not(pool: PgPool) {
         assert_eq!(state.status, TaskStatus::Done);
     }
 
-    let urls: Vec<String> = fake.0.lock().unwrap().iter().map(|u| u.clone().expect("DATABASE_URL set")).collect();
+    let envs = fake.0.lock().unwrap().clone();
+    let urls: Vec<String> = envs.iter().map(|(u, _)| u.clone().expect("DATABASE_URL set")).collect();
     assert_eq!(urls.len(), 4);
     assert_eq!(urls[0], urls[1], "two stages of a task");
     assert_ne!(urls[1], urls[2], "two tasks");
     assert_eq!(urls[2], urls[3]);
     assert!(urls[0].contains(&task_db::db_name(a)));
+    for ((_, data), t) in envs.iter().zip([a, a, b, b]) {
+        let data = data.as_deref().expect("WH_DATA_DIR set");
+        assert!(data.ends_with(&format!("wh-agent-{}", task_db::db_name(t))), "{data}");
+    }
 
     let mut db = PgConnection::connect(&urls[0]).await.unwrap();
     // Migrated, and not again for the second stage (the marker and branch row survive).
@@ -161,6 +176,22 @@ async fn stages_of_a_task_share_a_database_and_tasks_do_not(pool: PgPool) {
     for t in [a, b] {
         drop_database(&pool, &task_db::db_name(t)).await;
     }
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn factory_env_wins_over_the_task_database(pool: PgPool) {
+    let store = EventStore::new(pool.clone());
+    let (dir, factory) =
+        setup_agent("{ prompt: a.md, env: { DATABASE_URL: 'postgres://factory/db', WH_DATA_DIR: /factory/data } }");
+    let fake = Fake::default();
+    let mut foreman = foreman(&store, dir.path(), factory, fake.clone()).with_task_db_admin(admin_url());
+    let t = task(&store, None).await;
+    let state = foreman.drive(t).await.unwrap();
+    drop_database(&pool, &task_db::db_name(t)).await;
+    assert_eq!(state.status, TaskStatus::Done);
+
+    let from_factory = (Some("postgres://factory/db".to_string()), Some("/factory/data".to_string()));
+    assert_eq!(*fake.0.lock().unwrap(), [from_factory.clone(), from_factory]);
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]

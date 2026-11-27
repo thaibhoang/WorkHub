@@ -82,6 +82,11 @@ impl ClaudeCode {
     }
 
     fn command(&self, req: &AgentRequest) -> Command {
+        self.command_inheriting(req, std::env::vars_os().map(|(name, _)| name))
+    }
+
+    /// `inherited` names the variables the child would get from this process.
+    fn command_inheriting(&self, req: &AgentRequest, inherited: impl IntoIterator<Item = OsString>) -> Command {
         let mut cmd = match &req.container {
             None => {
                 let mut c = Command::new(&self.bin);
@@ -103,7 +108,7 @@ impl ClaudeCode {
             }
         };
         // Before `envs`, so a factory `env:` can still set DATABASE_URL explicitly.
-        strip_live_env(&mut cmd);
+        strip_names(&mut cmd, inherited);
         cmd.envs(&req.env)
             .env_remove("CLAUDECODE")
             .stdin(Stdio::null())
@@ -128,8 +133,12 @@ fn is_withheld(name: &str) -> bool {
 /// Remove the withheld variables from what `cmd` inherits from this process. Call
 /// it before setting the command's own variables.
 pub fn strip_live_env(cmd: &mut Command) {
+    strip_names(cmd, std::env::vars_os().map(|(name, _)| name));
+}
+
+fn strip_names(cmd: &mut Command, inherited: impl IntoIterator<Item = OsString>) {
     cmd.env_remove("DATABASE_URL");
-    for (name, _) in std::env::vars_os() {
+    for name in inherited {
         if let Some(name) = name.to_str()
             && is_withheld(name)
         {
@@ -394,11 +403,19 @@ mod tests {
             env: BTreeMap::new(),
         };
         let cc = ClaudeCode::new("claude");
-        // `Some(None)` = removed from the inherited environment.
-        let database_url = |cmd: &Command| {
-            cmd.as_std().get_envs().find(|(k, _)| *k == OsStr::new("DATABASE_URL")).map(|(_, v)| v.map(OsStr::to_owned))
+        // `Some(None)` = removed from the inherited environment, `None` = inherited as is.
+        let var = |cmd: &Command, name: &str| {
+            cmd.as_std().get_envs().find(|(k, _)| *k == OsStr::new(name)).map(|(_, v)| v.map(OsStr::to_owned))
+        };
+        let database_url = |cmd: &Command| var(cmd, "DATABASE_URL");
+        // Passed in rather than set on this process, which other tests share.
+        let admin_url_is_stripped = |req: &AgentRequest| {
+            let cmd = cc.command_inheriting(req, ["WH_AGENT_DB_ADMIN_URL", "PATH"].map(OsString::from));
+            assert_eq!(var(&cmd, "WH_AGENT_DB_ADMIN_URL"), Some(None));
+            assert_eq!(var(&cmd, "PATH"), None);
         };
         assert_eq!(database_url(&cc.command(&req)), Some(None));
+        admin_url_is_stripped(&req);
         req.container = Some(Container {
             name: "wh-x".into(),
             session: SessionId::new(),
@@ -409,12 +426,10 @@ mod tests {
             home_dir: "/h".into(),
         });
         assert_eq!(database_url(&cc.command(&req)), Some(None), "docker copies from the client's environment");
+        admin_url_is_stripped(&req);
 
         req.env.insert("DATABASE_URL".into(), "postgres://task".into());
         assert_eq!(database_url(&cc.command(&req)), Some(Some("postgres://task".into())));
-
-        assert!(is_withheld("DATABASE_URL") && is_withheld("WH_AGENT_DB_ADMIN_URL"));
-        assert!(!is_withheld("WH_DATA_DIR") && !is_withheld("PATH"));
     }
 
     #[test]
