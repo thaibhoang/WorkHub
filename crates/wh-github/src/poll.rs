@@ -8,7 +8,8 @@ use serde::Deserialize;
 use wh_core::task::TaskEvent;
 
 /// Fields requested from `gh pr view --json`.
-pub const PR_VIEW_FIELDS: &str = "state,mergedAt,mergedBy,closedAt,headRefOid,reviews,statusCheckRollup";
+pub const PR_VIEW_FIELDS: &str = 
+    "state,mergedAt,mergedBy,closedAt,headRefOid,reviews,statusCheckRollup,mergeable,mergeStateStatus,baseRefName";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +28,14 @@ pub struct PrView {
     pub reviews: Vec<Review>,
     #[serde(default)]
     pub status_check_rollup: Vec<Check>,
+    /// `MERGEABLE` | `CONFLICTING` | `UNKNOWN` (GitHub computes it lazily).
+    #[serde(default)]
+    pub mergeable: String,
+    /// `CLEAN` | `DIRTY` | `BLOCKED` | ... (informational).
+    #[serde(default)]
+    pub merge_state_status: String,
+    #[serde(default)]
+    pub base_ref_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,6 +117,8 @@ impl Check {
 pub struct Seen {
     pub reviews: HashSet<String>,
     pub checked_commits: HashSet<String>,
+    /// Head commits already recorded as conflicting.
+    pub conflicted_commits: HashSet<String>,
     pub closed: bool,
 }
 
@@ -121,6 +132,9 @@ impl Seen {
                 }
                 TaskEvent::PrChecksCompleted { commit, .. } => {
                     s.checked_commits.insert(commit.clone());
+                }
+                TaskEvent::PrConflicted { commit, .. } => {
+                    s.conflicted_commits.insert(commit.clone());
                 }
                 TaskEvent::PrMerged { .. } | TaskEvent::PrClosed { .. } => s.closed = true,
                 // A new PR (after a closed one) starts tracking again.
@@ -144,6 +158,7 @@ pub struct FailedCheckRef {
 pub enum Observed {
     Review { id: String, reviewer: String, state: String, body: String, submitted_at: Option<DateTime<Utc>> },
     Checks { commit: String, passed: bool, failed: Vec<FailedCheckRef> },
+    Conflict { base: String, commit: String },
     Merged { at: Option<DateTime<Utc>>, by: Option<String> },
     Closed { at: Option<DateTime<Utc>> },
 }
@@ -181,6 +196,14 @@ pub fn observe(seen: &Seen, view: &PrView) -> Vec<Observed> {
                 .collect();
             out.push(Observed::Checks { commit: commit.clone(), passed: failed.is_empty(), failed });
         }
+    }
+    if view.state.eq_ignore_ascii_case("OPEN")
+        && view.mergeable.eq_ignore_ascii_case("CONFLICTING")
+        && !commit.is_empty()
+        && !view.base_ref_name.is_empty()
+        && !seen.conflicted_commits.contains(commit)
+    {
+        out.push(Observed::Conflict { base: view.base_ref_name.clone(), commit: commit.clone() });
     }
     match view.state.to_ascii_uppercase().as_str() {
         "MERGED" => out.push(Observed::Merged { at: view.merged_at, by: view.merged_by.as_ref().map(|l| l.login.clone()) }),
@@ -274,12 +297,34 @@ mod tests {
             failed: vec![FailedCheckRef { name: "test".into(), url: Some("https://github.com/a/b/actions/runs/123/job/456".into()) }],
         });
 
-        let seen = Seen { reviews: ["R1".into(), "R2".into()].into(), checked_commits: ["abc".into()].into(), closed: false };
+        let seen = Seen { reviews: ["R1".into(), "R2".into()].into(), checked_commits: ["abc".into()].into(), ..Seen::default() };
         assert!(observe(&seen, &v).is_empty());
         let merged = PrView { state: "MERGED".into(), merged_by: Some(Login { login: "bob".into() }), ..v.clone() };
         assert!(matches!(observe(&seen, &merged)[..], [Observed::Merged { by: Some(ref b), .. }] if b == "bob"));
         assert!(observe(&Seen { closed: true, ..seen }, &merged).is_empty());
         assert_eq!(actions_run_id("https://github.com/a/b/actions/runs/123/job/456"), Some(123));
+    }
+
+    #[test]
+    fn conflicts_are_observed_once_per_head_commit() {
+        let v = |mergeable: &str, state: &str| {
+            view(serde_json::json!({
+                "state": state, "headRefOid": "abc", "baseRefName": "main",
+                "mergeable": mergeable, "mergeStateStatus": "DIRTY"
+            }))
+        };
+        let conflict = vec![Observed::Conflict { base: "main".into(), commit: "abc".into() }];
+        assert_eq!(observe(&Seen::default(), &v("CONFLICTING", "OPEN")), conflict);
+        for quiet in [v("MERGEABLE", "OPEN"), v("UNKNOWN", "OPEN"), v("", "OPEN")] {
+            assert!(observe(&Seen::default(), &quiet).is_empty());
+        }
+        assert!(matches!(observe(&Seen::default(), &v("CONFLICTING", "CLOSED"))[..], [Observed::Closed { .. }]));
+
+        let recorded = TaskEvent::PrConflicted { base: "main".into(), commit: "abc".into() };
+        let seen = Seen::fold([&recorded]);
+        assert!(observe(&seen, &v("CONFLICTING", "OPEN")).is_empty());
+        let pushed = PrView { head_ref_oid: "def".into(), ..v("CONFLICTING", "OPEN") };
+        assert_eq!(observe(&seen, &pushed).len(), 1);
     }
 
     #[test]

@@ -11,6 +11,10 @@ use crate::{
 /// pipeline stage. Gates and blocks at shipping time name this stage.
 pub const SHIP_STAGE: &str = "ship";
 
+/// Pseudo stage id of the human gate (and block) for a pull request that
+/// conflicts with its base branch.
+pub const CONFLICT_STAGE: &str = "conflict";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskSource {
@@ -128,6 +132,13 @@ pub enum TaskEvent {
         conclusion: String,
         #[serde(default)]
         failed: Vec<FailedCheck>,
+    },
+    /// The PR conflicts with its base (recorded once per head commit).
+    PrConflicted {
+        /// Base branch of the PR.
+        base: String,
+        /// Head commit of the PR that conflicts.
+        commit: String,
     },
     PrMerged {
         #[serde(default)]
@@ -260,6 +271,7 @@ impl DomainEvent for TaskEvent {
             Self::TaskShipped { .. } => "TaskShipped",
             Self::PrReviewed { .. } => "PrReviewed",
             Self::PrChecksCompleted { .. } => "PrChecksCompleted",
+            Self::PrConflicted { .. } => "PrConflicted",
             Self::PrMerged { .. } => "PrMerged",
             Self::PrClosed { .. } => "PrClosed",
         }
@@ -299,6 +311,15 @@ pub struct PullRequest {
     pub closed: bool,
 }
 
+/// A merge conflict with the base that has not been resolved yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub base: String,
+    pub commit: String,
+    /// Decision on the conflict gate (None = not decided, or no gate).
+    pub decision: Option<bool>,
+}
+
 /// Task aggregate state, folded from its event stream.
 #[derive(Debug, Clone, Default)]
 pub struct TaskState {
@@ -321,6 +342,8 @@ pub struct TaskState {
     /// PR feedback received while waiting on the PR and not yet handed to a stage
     /// (several reviews / a failed CI run can arrive in the same poll).
     pub pr_feedback: Vec<String>,
+    /// Kept until a stage succeeds, so a failed merge stage merges again on resume.
+    pub conflict: Option<Conflict>,
     pub last: Option<TaskEvent>,
 }
 
@@ -346,22 +369,30 @@ impl TaskState {
             }
             TaskEvent::StageEntered { stage, feedback } => {
                 self.pr_feedback.clear();
-                if self.status == TaskStatus::Shipped {
+                // After the conflict gate (or a failed merge) the status is no longer `Shipped`.
+                if self.status == TaskStatus::Shipped || self.conflict.is_some() {
                     self.pr_rework_loops += 1;
                 } else if feedback.is_some() {
                     self.rework_loops += 1;
                 }
                 self.status = TaskStatus::Running { stage: stage.clone() };
             }
-            TaskEvent::StageExited { stage, outcome, summary, .. } => self.results.push(StageResult {
-                stage: stage.clone(),
-                outcome: *outcome,
-                summary: summary.clone(),
-            }),
+            TaskEvent::StageExited { stage, outcome, summary, .. } => {
+                if *outcome == StageOutcome::Succeeded {
+                    self.conflict = None;
+                }
+                self.results.push(StageResult { stage: stage.clone(), outcome: *outcome, summary: summary.clone() });
+            }
             TaskEvent::GateRequested { gate, stage } => {
                 self.status = TaskStatus::AwaitingGate { gate: gate.clone(), stage: stage.clone() }
             }
-            TaskEvent::GateDecided { .. } => {}
+            TaskEvent::GateDecided { stage, approved, .. } => {
+                if stage == CONFLICT_STAGE
+                    && let Some(c) = &mut self.conflict
+                {
+                    c.decision = Some(*approved);
+                }
+            }
             TaskEvent::TaskBlocked { stage, reason } => {
                 self.blocked_stage = stage.clone();
                 self.status = TaskStatus::Blocked { reason: reason.clone() }
@@ -380,27 +411,36 @@ impl TaskState {
                 });
                 // Feedback that arrived during a rework was about the previous push.
                 self.pr_feedback.clear();
+                self.conflict = None;
                 self.status = TaskStatus::Shipped;
             }
             // Reviews and checks are facts; the foreman decides whether they cause rework.
             TaskEvent::PrReviewed { reviewer, state, body, comments, .. } => {
-                if state == CHANGES_REQUESTED && self.status == TaskStatus::Shipped {
+                if state == CHANGES_REQUESTED && self.collects_feedback() {
                     self.pr_feedback.push(review_feedback(reviewer, body, comments));
                 }
             }
             TaskEvent::PrChecksCompleted { commit, conclusion, failed } => {
                 let current = self.pr.as_ref().is_some_and(|pr| &pr.commit == commit);
-                if conclusion != "success" && current && self.status == TaskStatus::Shipped {
+                if conclusion != "success" && current && self.collects_feedback() {
                     self.pr_feedback.push(ci_feedback(failed));
                 }
             }
+            TaskEvent::PrConflicted { base, commit } => {
+                let current = self.pr.as_ref().is_some_and(|pr| &pr.commit == commit);
+                if current && self.status == TaskStatus::Shipped {
+                    self.conflict = Some(Conflict { base: base.clone(), commit: commit.clone(), decision: None });
+                }
+            }
             TaskEvent::PrMerged { .. } => {
+                self.conflict = None;
                 if let Some(pr) = &mut self.pr {
                     pr.closed = true;
                 }
                 self.status = TaskStatus::Done;
             }
             TaskEvent::PrClosed { .. } => {
+                self.conflict = None;
                 if let Some(pr) = &mut self.pr {
                     pr.closed = true;
                 }
@@ -411,6 +451,16 @@ impl TaskState {
             }
         }
         self.last = Some(ev);
+    }
+
+    /// Whether PR feedback is still to be handed to a stage: the task waits on
+    /// its PR, or on the conflict gate.
+    fn collects_feedback(&self) -> bool {
+        match &self.status {
+            TaskStatus::Shipped => true,
+            TaskStatus::AwaitingGate { stage, .. } => stage == CONFLICT_STAGE && self.conflict.is_some(),
+            _ => false,
+        }
     }
 
     /// Most recent stage that finished, if any.
@@ -512,6 +562,48 @@ mod tests {
         s.apply(9, TaskEvent::PrMerged { merged_at: None, merged_by: None });
         assert_eq!(s.status, TaskStatus::Done);
         assert!(s.pr.unwrap().closed);
+    }
+
+    #[test]
+    fn fold_tracks_merge_conflicts() {
+        let shipped = TaskEvent::TaskShipped {
+            repo: "a/b".into(),
+            pr_number: 1,
+            pr_url: "u".into(),
+            branch: "wh/task/x".into(),
+            commit: "c1".into(),
+            created: true,
+        };
+        let conflicted = |commit: &str| TaskEvent::PrConflicted { base: "main".into(), commit: commit.into() };
+        let entered = || TaskEvent::StageEntered { stage: "impl".into(), feedback: Some("merge".into()) };
+        let exited = |outcome| TaskEvent::StageExited { stage: "impl".into(), outcome, summary: None, session: None };
+
+        let mut s = TaskState::fold([(1, shipped.clone()), (2, conflicted("old"))]);
+        assert_eq!(s.conflict, None, "only the current push");
+        s.apply(3, entered());
+        s.apply(4, conflicted("c1"));
+        assert_eq!(s.conflict, None, "ignored during a rework");
+
+        let mut s = TaskState::fold([(1, shipped), (2, conflicted("c1"))]);
+        s.apply(3, TaskEvent::GateRequested { gate: "g".into(), stage: CONFLICT_STAGE.into() });
+        s.apply(4, TaskEvent::PrChecksCompleted { commit: "c1".into(), conclusion: "failure".into(), failed: vec![] });
+        assert_eq!(s.pr_feedback.len(), 1, "feedback during the gate is kept");
+        let decided = TaskEvent::GateDecided {
+            gate: "g".into(),
+            stage: CONFLICT_STAGE.into(),
+            approved: true,
+            reviewer: "r".into(),
+            comment: None,
+        };
+        s.apply(5, decided);
+        assert_eq!(s.conflict.as_ref().unwrap().decision, Some(true));
+        s.apply(6, entered());
+        assert_eq!((s.pr_rework_loops, s.rework_loops), (1, 0));
+        s.apply(7, exited(StageOutcome::Failed));
+        assert!(s.conflict.is_some(), "a failed merge stage keeps the conflict");
+        s.apply(8, entered());
+        s.apply(9, exited(StageOutcome::Succeeded));
+        assert_eq!((s.conflict, s.pr_rework_loops), (None, 2));
     }
 
     #[test]

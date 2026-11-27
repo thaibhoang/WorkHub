@@ -23,7 +23,7 @@ use wh_core::{
 };
 use wh_eventstore::{EventHandler, EventStore, ExpectedVersion, StoreError};
 use wh_factory::Factory;
-use wh_runner::{AgentRuntime, RunSpec, Runner};
+use wh_runner::{AgentRuntime, Merge, RunSpec, Runner};
 
 pub use decide::{Action, decide};
 pub use prompt::build_prompt;
@@ -220,6 +220,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             benchmark: bench.map(|b| b.run),
             sandbox: agent.sandbox.clone(),
             env: agent.env.clone(),
+            merge: None,
         }
     }
 
@@ -389,6 +390,14 @@ impl<R: AgentRuntime + 'static> EventHandler for Foreman<R> {
         };
         match action {
             Action::RunStage { stage, feedback } => self.run_stage(self.run_spec(task, &state, &stage, feedback)).await,
+            Action::ResolveConflict { stage, feedback } => {
+                let (Some(g), Some(c)) = (&self.factory.github, &state.conflict) else {
+                    return Ok(());
+                };
+                let mut spec = self.run_spec(task, &state, &stage, Some(feedback));
+                spec.merge = Some(Merge { remote: g.remote.clone(), base: c.base.clone() });
+                self.run_stage(spec).await
+            }
             Action::RequestGate { gate, stage } if matches!(self.scope, Scope::Benchmark(_)) => {
                 // Benchmarks measure the agents, not human latency: approve the gate
                 // right away (still recorded, so the pipeline shape is unchanged).

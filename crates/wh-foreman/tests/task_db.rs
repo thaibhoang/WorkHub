@@ -228,8 +228,11 @@ async fn sweep_drops_only_the_task_databases_that_are_due(pool: PgPool) {
         created: true,
     };
     let shipped = task(&store, Some(pr)).await;
+    // The poller saw the PR close after the task was cancelled.
+    let cancelled_closed = task(&store, Some(TaskEvent::TaskCancelled { reason: "x".into() })).await;
+    append(&store, cancelled_closed, TaskEvent::PrClosed { closed_at: None }).await;
     let orphan = TaskId::new();
-    let all = [done, merged, cancelled, blocked, open, shipped, orphan];
+    let all = [done, merged, cancelled, cancelled_closed, blocked, open, shipped, orphan];
     for t in all {
         task_db::provision(&store, &url, t).await.unwrap();
     }
@@ -254,6 +257,7 @@ async fn sweep_drops_only_the_task_databases_that_are_due(pool: PgPool) {
     let mut cfg = CleanupConfig {
         data_dir: dir.path().join("data"),
         repo: dir.path().to_owned(),
+        remote: None,
         grace: Duration::from_secs(3600),
         caches: vec![],
         dry_run: true,
@@ -283,13 +287,13 @@ async fn sweep_drops_only_the_task_databases_that_are_due(pool: PgPool) {
     for t in [done, merged, orphan] {
         assert!(!exists(&pool, &task_db::db_name(t)).await);
     }
-    for t in [cancelled, blocked, open, shipped] {
+    for t in [cancelled, cancelled_closed, blocked, open, shipped] {
         assert!(exists(&pool, &task_db::db_name(t)).await);
     }
 
     cfg.grace = Duration::ZERO;
     let r = sweep(&store, &cfg).await.unwrap();
-    assert_eq!(dropped(&r), names(&[cancelled]));
+    assert_eq!(dropped(&r), names(&[cancelled, cancelled_closed]));
 
     for name in [&unmarked, &foreign, &near_miss, &other] {
         assert!(exists(&pool, name).await, "{name} must be left alone");

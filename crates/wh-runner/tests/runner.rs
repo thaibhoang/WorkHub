@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use wh_core::{DockerSandbox, FailureClass, Sandbox, TaskId, session::{SessionEvent, TokenUsage}};
 use wh_eventstore::EventStore;
 use wh_metrics::sessions::SessionFactsProjection;
-use wh_runner::{AgentRequest, AgentRuntime, Outcome, OutcomeStatus, RunSpec, Runner, RunnerConfig, Signal};
+use wh_runner::{AgentRequest, AgentRuntime, Merge, Outcome, OutcomeStatus, RunSpec, Runner, RunnerConfig, Signal};
 
 /// Runtime double: checks it runs inside the worktree, emits scripted signals.
 struct Fake {
@@ -67,7 +67,124 @@ fn spec(repo: &Path, task: TaskId, base_ref: &str) -> RunSpec {
         benchmark: None,
         sandbox: Default::default(),
         env: Default::default(),
+        merge: None,
     }
+}
+
+/// Writes `shared.txt` (when given content), then succeeds.
+struct Resolver(Option<&'static str>);
+
+impl AgentRuntime for Resolver {
+    fn name(&self) -> &str {
+        "fake"
+    }
+    async fn run(&self, req: &AgentRequest, _tx: UnboundedSender<Signal>) -> Outcome {
+        assert!(req.prompt.contains("`main`"), "the prompt describes the merge: {}", req.prompt);
+        if let Some(text) = self.0 {
+            std::fs::write(req.workdir.join("shared.txt"), text).unwrap();
+        }
+        success()
+    }
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let id = ["-c", "user.email=t@t", "-c", "user.name=t"];
+    let out = Command::new("git").arg("-C").arg(dir).args(id).args(args).output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+fn commit_file(repo: &Path, name: &str, text: &str) {
+    std::fs::write(repo.join(name), text).unwrap();
+    git_out(repo, &["add", "."]);
+    git_out(repo, &["commit", "-qm", name]);
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn merges_the_base_before_the_agent_and_commits_only_resolved_merges(pool: PgPool) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git_repo(&repo);
+    // `task` and `main` change the same file; `clean` touches another one.
+    for (branch, file) in [("task", "shared.txt"), ("clean", "other.txt")] {
+        git_out(&repo, &["checkout", "-q", "-b", branch, "main"]);
+        commit_file(&repo, file, "ours\n");
+    }
+    git_out(&repo, &["checkout", "-q", "main"]);
+    commit_file(&repo, "shared.txt", "theirs\n");
+
+    let store = EventStore::new(pool);
+    let config = RunnerConfig { data_dir: dir.path().join("data") };
+    let run = |branch: &'static str, content: Option<&'static str>| {
+        let runner = Runner::new(store.clone(), Resolver(content), config.clone());
+        let mut s = spec(&repo, TaskId::new(), "main");
+        s.branch = Some(branch.into());
+        s.commit_on_success = true;
+        // The repo stands in as its own remote.
+        s.merge = Some(Merge { remote: ".".into(), base: "main".into() });
+        async move { runner.run(s, |_| {}).await.unwrap() }
+    };
+    let parents = |branch: &str| git_out(&repo, &["log", "-1", "--format=%P", branch]).split(' ').count();
+
+    let before = git_out(&repo, &["rev-parse", "task"]);
+    let report = run("task", None).await;
+    assert!(
+        matches!(&report.last().outcome.status, OutcomeStatus::Failed { message, retryable: false, .. } if message.contains("shared.txt")),
+        "{:?}",
+        report.last().outcome.status
+    );
+    assert_eq!(git_out(&repo, &["rev-parse", "task"]), before, "nothing committed with markers left");
+
+    // Resolving to exactly our side leaves no diff, but the merge is still committed.
+    let report = run("task", Some("ours\n")).await;
+    assert_eq!(report.last().outcome.status, OutcomeStatus::Succeeded);
+    assert_eq!(parents("task"), 2);
+    assert_eq!(git_out(&repo, &["show", "task:shared.txt"]), "ours");
+
+    run("clean", None).await;
+    assert_eq!(parents("clean"), 2);
+    assert_eq!(git_out(&repo, &["show", "clean:shared.txt"]), "theirs");
+}
+
+/// For setups that must fail before any agent runs.
+struct NeverRuns;
+
+impl AgentRuntime for NeverRuns {
+    fn name(&self) -> &str {
+        "fake"
+    }
+    async fn run(&self, _req: &AgentRequest, _tx: UnboundedSender<Signal>) -> Outcome {
+        panic!("the runtime must not be called")
+    }
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn failed_merge_setup_is_env_setup_and_not_retried(pool: PgPool) {
+    let repo = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    git_repo(repo.path());
+    git_out(repo.path(), &["branch", "task"]);
+    let before = git_out(repo.path(), &["rev-parse", "task"]);
+    let runner = Runner::new(EventStore::new(pool), NeverRuns, RunnerConfig { data_dir: data.path().into() });
+
+    let mut s = spec(repo.path(), TaskId::new(), "HEAD");
+    s.branch = Some("task".into());
+    s.commit_on_success = true;
+    s.merge = Some(Merge { remote: ".".into(), base: "no-such-branch".into() });
+    s.max_retries = 2;
+    let report = runner.run(s, |_| {}).await.unwrap();
+    assert_eq!(report.attempts.len(), 1, "env_setup is not retried");
+    match &report.last().outcome.status {
+        OutcomeStatus::Failed { class, message, retryable } => {
+            assert_eq!(*class, FailureClass::EnvSetup);
+            assert!(message.contains("no-such-branch"), "{message}");
+            assert!(!retryable);
+        }
+        other => panic!("expected failure, got {other:?}"),
+    }
+    assert!(std::fs::read_dir(data.path().join("worktrees")).unwrap().next().is_none(), "worktree cleaned up");
+    assert_eq!(git_out(repo.path(), &["rev-parse", "task"]), before, "the task branch has not moved");
 }
 
 fn success() -> Outcome {

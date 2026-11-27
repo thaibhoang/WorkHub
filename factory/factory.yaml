@@ -87,6 +87,8 @@ github:
   repo: thaibhoang/WorkHub
   base: main
   ship_gate: ship-review
+  # A PR that conflicts with main waits here; then WorkHub merges main and implement resolves.
+  conflict_gate: conflict-review
   labels: [workhub]
   issues: { label: workhub, comment: true }
 

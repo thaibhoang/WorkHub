@@ -22,6 +22,13 @@ pub struct RunnerConfig {
     pub data_dir: PathBuf,
 }
 
+/// A branch to merge into the work branch before the agent starts.
+#[derive(Debug, Clone)]
+pub struct Merge {
+    pub remote: String,
+    pub base: String,
+}
+
 /// What to run. Agent/stage are free-form until factory-as-code (phase 2) defines them.
 #[derive(Debug, Clone)]
 pub struct RunSpec {
@@ -61,6 +68,9 @@ pub struct RunSpec {
     pub sandbox: Sandbox,
     /// Extra environment for the agent process.
     pub env: BTreeMap<String, String>,
+    /// Fetch and merge this before the agent runs. The agent resolves conflicts and
+    /// WorkHub commits the merge, so it needs no network or git write access.
+    pub merge: Option<Merge>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,13 +156,38 @@ impl<R: AgentRuntime> Runner<R> {
         on_signal: &mut (impl FnMut(&Signal) + Send),
     ) -> anyhow::Result<SessionReport> {
         let session_id = s.session_id;
+        let branch = spec.branch.clone().unwrap_or_else(|| {
+            let suffix = &session_id.0.simple().to_string()[20..];
+            format!("wh/{}/{suffix}", spec.agent)
+        });
+        let path = self.config.data_dir.join("worktrees").join(session_id.to_string());
+        // The worktree and the merge come first, so that the prompt recorded on
+        // `AgentDispatched` (and sent to the agent) describes the merge result.
+        let mut prompt = spec.prompt.clone();
+        let mut conflicts = Vec::new();
+        let mut setup = Worktree::create(&spec.repo, &spec.base_ref, &path, &branch).await;
+        if let (Ok(w), Some(m)) = (&setup, &spec.merge) {
+            match w.merge(&m.remote, &m.base).await {
+                Ok(files) => {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&w.merge_note(&m.base, &files).await);
+                    conflicts = files;
+                }
+                Err(e) => {
+                    if let Err(e) = w.remove().await {
+                        tracing::warn!("failed to remove worktree {}: {e:#}", w.path.display());
+                    }
+                    setup = Err(e.context(format!("merging {}/{}", m.remote, m.base)));
+                }
+            }
+        }
         s.session(SessionEvent::AgentDispatched {
             task_id: spec.task_id,
             agent: spec.agent.clone(),
             stage: spec.stage.clone(),
             runtime: self.runtime.name().to_owned(),
             model: spec.model.clone(),
-            prompt: spec.prompt.clone(),
+            prompt: prompt.clone(),
             budget_usd: spec.budget_usd,
             timeout_secs: spec.timeout.as_secs(),
             attempt,
@@ -161,12 +196,7 @@ impl<R: AgentRuntime> Runner<R> {
         })
         .await?;
 
-        let branch = spec.branch.clone().unwrap_or_else(|| {
-            let suffix = &session_id.0.simple().to_string()[20..];
-            format!("wh/{}/{suffix}", spec.agent)
-        });
-        let path = self.config.data_dir.join("worktrees").join(session_id.to_string());
-        let worktree = match Worktree::create(&spec.repo, &spec.base_ref, &path, &branch).await {
+        let worktree = match setup {
             Ok(w) => w,
             Err(e) => {
                 let outcome = Outcome::failed(FailureClass::EnvSetup, format!("{e:#}"), false, Duration::ZERO);
@@ -202,7 +232,7 @@ impl<R: AgentRuntime> Runner<R> {
         tokio::fs::create_dir_all(&transcripts).await.context("create transcripts dir")?;
         let transcript_path = transcripts.join(format!("{session_id}.jsonl"));
         let req = AgentRequest {
-            prompt: spec.prompt.clone(),
+            prompt,
             workdir: worktree.path.clone(),
             transcript_path: transcript_path.clone(),
             model: spec.model.clone(),
@@ -239,6 +269,16 @@ impl<R: AgentRuntime> Runner<R> {
 
         let mut outcome = outcome;
         let mut commit = None;
+        if outcome.status == OutcomeStatus::Succeeded {
+            let left = worktree.with_markers(&conflicts).await;
+            if !left.is_empty() {
+                outcome.status = OutcomeStatus::Failed {
+                    class: FailureClass::AgentGaveUp,
+                    message: format!("conflict markers left in: {}", left.join(", ")),
+                    retryable: false,
+                };
+            }
+        }
         if spec.commit_on_success && outcome.status == OutcomeStatus::Succeeded {
             let msg = format!("wh({}): {} [session {session_id}]", spec.stage, spec.agent);
             match worktree.commit_all(&msg).await {

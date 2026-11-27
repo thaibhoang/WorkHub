@@ -90,9 +90,13 @@ impl EventHandler for TasksProjection {
                 .await?;
             }
             TaskEvent::StageEntered { stage, feedback } => {
+                // A PR rework starts while shipped, or after the conflict gate: no stage
+                // has run since the push (`current_stage` is empty) and the PR is open.
                 sqlx::query(&Self::guarded(
-                    "rework_loops = rework_loops + CASE WHEN status = 'shipped' THEN 0 ELSE $5 END, \
-                     pr_rework_loops = pr_rework_loops + CASE WHEN status = 'shipped' THEN 1 ELSE 0 END, \
+                    "rework_loops = rework_loops + CASE WHEN status = 'shipped' \
+                       OR (current_stage IS NULL AND pr_state = 'open') THEN 0 ELSE $5 END, \
+                     pr_rework_loops = pr_rework_loops + CASE WHEN status = 'shipped' \
+                       OR (current_stage IS NULL AND pr_state = 'open') THEN 1 ELSE 0 END, \
                      status = 'running', current_stage = $4, blocked_reason = NULL",
                 ))
                 .bind(id)
@@ -165,6 +169,7 @@ impl EventHandler for TasksProjection {
                     .execute(&self.pool)
                     .await?;
             }
+            TaskEvent::PrConflicted { .. } => self.exec(&Self::guarded("status = status"), id, ev).await?,
             TaskEvent::PrMerged { merged_at, .. } => {
                 let at = merged_at.unwrap_or(ev.meta.occurred_at);
                 sqlx::query(&Self::guarded(

@@ -99,6 +99,11 @@ export default function FactoryPage() {
                   <span className="rounded border px-1.5 text-xs font-normal text-muted-foreground">
                     PR feedback → {data.github.rework_stage}
                   </span>
+                  {data.github.conflict_gate ? (
+                    <span className="rounded border border-warn/50 px-1.5 text-xs font-normal text-warn">
+                      merge conflict gate: {data.github.conflict_gate}
+                    </span>
+                  ) : null}
                 </CardTitle>
                 <CardDescription>
                   Push the task branch to <span className="font-mono">{data.github.remote}</span> and open a{' '}

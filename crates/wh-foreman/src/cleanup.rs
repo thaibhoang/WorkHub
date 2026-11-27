@@ -9,10 +9,14 @@
 //! - `scorer-work/*` and `bench/<run>` (finished runs) left by a crash, after the
 //!   grace period;
 //!
-//! in the factory repo:
-//! - task branches `wh/task/<id>` whose PR was merged (right away: the work is on
-//!   the remote) or whose task was cancelled (after the grace period). Branches of
-//!   tasks completed locally, blocked or still open are never touched;
+//! in the factory repo, task branches `wh/task/<id>`:
+//! - of a merged PR: deleted right away (the work is on the base branch);
+//! - of a cancelled task: deleted after the grace period;
+//! - with `github:`, the same branches on the remote, plus (after the grace period)
+//!   the remote branch of a PR closed without merging. Its local branch is kept,
+//!   because the task is blocked and can be resumed. Stale remote-tracking refs
+//!   are pruned afterwards;
+//! - branches of tasks completed locally, blocked or still open are never touched;
 //!
 //! on the factory's `task_database` server:
 //! - `wh_task_*` databases created by this event store whose task is done or merged,
@@ -27,6 +31,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    process::{Output, Stdio},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -34,7 +39,11 @@ use std::{
 use anyhow::Context;
 use sqlx::{Connection, PgConnection};
 use tokio::{process::Command, sync::Notify};
-use wh_core::{BenchmarkRunId, SessionId, TaskId, session::SessionEvent, task::task_branch};
+use wh_core::{
+    BenchmarkRunId, SessionId, TaskId,
+    session::SessionEvent,
+    task::{TaskEvent, TaskState, TaskStatus, task_branch},
+};
 use wh_eventstore::EventStore;
 use wh_factory::Factory;
 
@@ -61,6 +70,9 @@ pub struct CleanupConfig {
     pub data_dir: PathBuf,
     /// Repository holding the task branches (the factory's repo).
     pub repo: PathBuf,
+    /// Remote of `repo` that task branches are pushed to (`github.remote`);
+    /// None = never touch a remote.
+    pub remote: Option<String>,
     /// Finished work younger than this is kept so it can still be looked at.
     pub grace: Duration,
     /// Directories (build caches) wiped when larger than the byte limit.
@@ -84,6 +96,7 @@ impl CleanupConfig {
         Self {
             data_dir,
             repo: f.repo.clone(),
+            remote: f.github.as_ref().map(|g| g.remote.clone()),
             grace,
             caches: caches.into_iter().map(|p| (p, cache_max_bytes)).collect(),
             dry_run: false,
@@ -97,7 +110,8 @@ impl CleanupConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Removed {
-    /// `worktree`, `sandbox-home`, `scorer-work`, `bench`, `branch`, `database` or `cache`.
+    /// `worktree`, `sandbox-home`, `scorer-work`, `bench`, `branch`, `remote-branch`,
+    /// `database` or `cache`.
     pub kind: &'static str,
     pub what: String,
     pub bytes: u64,
@@ -137,7 +151,10 @@ fn session_finished(head: &str) -> bool {
     matches!(head, "AgentSessionCompleted" | "AgentSessionFailed")
 }
 
-/// The task can no longer have a session running for it.
+const REMOTE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The task can no longer have a session running for it. Not `PrClosed`: a PR can
+/// be closed while a rework stage for it is still running.
 fn task_over(head: &str) -> bool {
     matches!(head, "TaskCancelled" | "TaskCompleted" | "PrMerged" | "TaskBlocked")
 }
@@ -230,47 +247,154 @@ pub async fn sweep(store: &EventStore, cfg: &CleanupConfig) -> anyhow::Result<Cl
 }
 
 async fn delete_task_branches(store: &EventStore, cfg: &CleanupConfig, r: &mut CleanupReport) -> anyhow::Result<()> {
-    let refs = match git(&cfg.repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads/wh/task/"]).await {
+    let local = match git(&cfg.repo, &["for-each-ref", "--format=%(refname:short)", "refs/heads/wh/task/"]).await {
         Ok(out) => out,
         Err(e) => {
             r.errors.push(format!("list task branches in {}: {e:#}", cfg.repo.display()));
             return Ok(());
         }
     };
-    let branches: HashSet<&str> = refs.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    if branches.is_empty() {
-        return Ok(());
+    let local: HashSet<&str> = local.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    // Asked of the remote itself, not derived from the local branches: a failed
+    // delete is retried by the next sweep even when the local branch is gone.
+    let mut remote = None;
+    if let Some(name) = &cfg.remote {
+        match remote_task_branches(&cfg.repo, name).await {
+            Ok(branches) => remote = Some((name.as_str(), branches)),
+            Err(e) => r.errors.push(format!("list task branches on {name}: {e:#}")),
+        }
     }
-    for (stream, _, head) in store.stream_heads(&format!("{}-", TaskId::STREAM_PREFIX)).await? {
-        let Some(task) = TaskId::from_stream_id(&stream) else { continue };
-        let branch = task_branch(task);
-        if !branches.contains(branch.as_str()) {
-            continue;
+
+    if !local.is_empty() || remote.as_ref().is_some_and(|(_, b)| !b.is_empty()) {
+        for (stream, _, head) in store.stream_heads(&format!("{}-", TaskId::STREAM_PREFIX)).await? {
+            let Some(task) = TaskId::from_stream_id(&stream) else { continue };
+            let branch = task_branch(task);
+            let has_local = local.contains(branch.as_str());
+            // (remote name, commit the branch points at there)
+            let on_remote = remote.as_ref().and_then(|(name, b)| Some((*name, b.get(&branch)?)));
+            if !has_local && on_remote.is_none() {
+                continue;
+            }
+            let due = match branches_due(store, &stream, &head, cfg.grace).await {
+                Ok(due) => due,
+                Err(e) => {
+                    r.errors.push(format!("read {stream}: {e:#}"));
+                    continue;
+                }
+            };
+            if due.local && has_local {
+                // Fails e.g. when checked out somewhere: leave it and say so.
+                let res = match cfg.dry_run {
+                    true => Ok(()),
+                    false => git(&cfg.repo, &["branch", "-D", &branch]).await.map(drop),
+                };
+                match res {
+                    Ok(()) => r.removed.push(Removed { kind: "branch", what: branch.clone(), bytes: 0 }),
+                    Err(e) => r.errors.push(format!("delete branch {branch}: {e:#}")),
+                }
+            }
+            if due.remote
+                && let Some((name, oid)) = on_remote
+            {
+                let res = match cfg.dry_run {
+                    true => Ok(true),
+                    false => delete_remote_branch(&cfg.repo, name, &branch, oid).await,
+                };
+                match res {
+                    Ok(true) => r.removed.push(Removed { kind: "remote-branch", what: branch, bytes: 0 }),
+                    Ok(false) => {}
+                    Err(e) => r.errors.push(format!("delete branch {branch} on {name}: {e:#}")),
+                }
+            }
         }
-        let due = match head.as_str() {
-            "PrMerged" => true,
-            "TaskCancelled" => past_grace(store, &stream, cfg).await?,
-            _ => false,
-        };
-        if !due {
-            continue;
-        }
-        if !cfg.dry_run
-            && let Err(e) = git(&cfg.repo, &["branch", "-D", &branch]).await
-        {
-            // e.g. checked out somewhere: leave it and say so.
-            r.errors.push(format!("delete branch {branch}: {e:#}"));
-            continue;
-        }
-        r.removed.push(Removed { kind: "branch", what: branch, bytes: 0 });
+    }
+
+    // Also drops the tracking refs of branches GitHub deleted by itself.
+    if let Some((name, _)) = &remote
+        && !cfg.dry_run
+        && let Err(e) = remote_git(&cfg.repo, &["remote", "prune", name]).await
+    {
+        r.errors.push(format!("prune {name}: {e:#}"));
     }
     Ok(())
 }
 
-/// Whether the stream's last event is older than the grace period.
-async fn past_grace(store: &EventStore, stream: &str, cfg: &CleanupConfig) -> anyhow::Result<bool> {
-    let last = store.read_stream(stream).await?.pop();
-    Ok(last.is_some_and(|e| (chrono::Utc::now() - e.recorded_at).to_std().unwrap_or_default() >= cfg.grace))
+/// Which copies of a task's branch may be deleted now.
+#[derive(Default)]
+struct Due {
+    local: bool,
+    remote: bool,
+}
+
+async fn branches_due(store: &EventStore, stream: &str, head: &str, grace: Duration) -> anyhow::Result<Due> {
+    if head == "PrMerged" {
+        return Ok(Due { local: true, remote: true });
+    }
+    let (status, aged) = task_status(store, stream, grace).await?;
+    Ok(match status {
+        // From the state, not the head: PR events can still arrive after the cancel.
+        TaskStatus::Cancelled => Due { local: aged, remote: aged },
+        // Resume continues on the local branch and ships (pushes) it again.
+        TaskStatus::Blocked { .. } if head == "PrClosed" => Due { local: false, remote: aged },
+        _ => Due::default(),
+    })
+}
+
+/// The folded status of a task, and whether its last event is older than `grace`.
+async fn task_status(store: &EventStore, stream: &str, grace: Duration) -> anyhow::Result<(TaskStatus, bool)> {
+    let events = store.read_stream(stream).await?;
+    let mut state = TaskState::default();
+    for e in &events {
+        state.apply(e.stream_version, e.decode::<TaskEvent>()?);
+    }
+    let aged = events.last().is_some_and(|e| (chrono::Utc::now() - e.recorded_at).to_std().unwrap_or_default() >= grace);
+    Ok((state.status, aged))
+}
+
+/// Task branches (`wh/task/<id>`) on `remote`, with the commit each points at.
+async fn remote_task_branches(repo: &Path, remote: &str) -> anyhow::Result<HashMap<String, String>> {
+    let out = remote_git(repo, &["ls-remote", "--heads", remote, "refs/heads/wh/task/*"]).await?;
+    Ok(out
+        .lines()
+        .filter_map(|l| {
+            let (oid, refname) = l.split_once('\t')?;
+            let branch = refname.strip_prefix("refs/heads/").filter(|b| b.starts_with("wh/task/"))?;
+            Some((branch.to_owned(), oid.to_owned()))
+        })
+        .collect())
+}
+
+/// Delete `branch`, last seen at `oid`, on `remote`. `false` = it was already gone
+/// (GitHub can delete head branches by itself).
+async fn delete_remote_branch(repo: &Path, remote: &str, branch: &str, oid: &str) -> anyhow::Result<bool> {
+    anyhow::ensure!(branch.starts_with("wh/task/"), "refusing to delete {branch}: not a task branch");
+    let refname = format!("refs/heads/{branch}");
+    // The lease makes the push fail when the ref is gone; a plain delete of a
+    // missing ref "succeeds". It also refuses if the branch moved since listing.
+    let lease = format!("--force-with-lease={refname}:{oid}");
+    let delete = format!(":{refname}");
+    match remote_git(repo, &["push", "--quiet", &lease, remote, &delete]).await {
+        Ok(_) => Ok(true),
+        // Ask the remote why, rather than match git's error text.
+        Err(e) => match remote_git(repo, &["ls-remote", remote, &refname]).await {
+            Ok(out) if out.trim().is_empty() => Ok(false),
+            _ => Err(e),
+        },
+    }
+}
+
+/// Whether a task's database may be dropped now.
+async fn database_due(store: &EventStore, stream: &str, head: &str, grace: Duration) -> anyhow::Result<bool> {
+    if head == "PrMerged" {
+        return Ok(true);
+    }
+    let (status, aged) = task_status(store, stream, grace).await?;
+    Ok(match status {
+        TaskStatus::Done => true,
+        // From the state, not the head: PR events can still arrive after the cancel.
+        TaskStatus::Cancelled => aged,
+        _ => false,
+    })
 }
 
 /// Drop the task databases that are due. Only names [`task_db::db_name`] produces
@@ -304,11 +428,7 @@ async fn drop_task_databases(
         // Without a task it is due; otherwise every task of that name must be over.
         let mut due = true;
         for (stream, head) in tasks.get(&name).into_iter().flatten() {
-            due &= match head.as_str() {
-                "TaskCompleted" | "PrMerged" => true,
-                "TaskCancelled" => past_grace(store, stream, cfg).await?,
-                _ => false,
-            };
+            due &= database_due(store, stream, head, cfg.grace).await?;
         }
         if !due {
             continue;
@@ -422,6 +542,22 @@ async fn remove_tree(path: &Path, kind: &'static str, cfg: &CleanupConfig, r: &m
 
 async fn git(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("git").arg("-C").arg(repo).args(args).output().await?;
+    stdout_of(args, out)
+}
+
+/// [`git`] for commands that talk to a remote: never prompts and never hangs
+/// the janitor.
+async fn remote_git(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo).args(args).env("GIT_TERMINAL_PROMPT", "0").env("LC_ALL", "C");
+    cmd.stdin(Stdio::null()).kill_on_drop(true);
+    let out = tokio::time::timeout(REMOTE_TIMEOUT, cmd.output())
+        .await
+        .with_context(|| format!("git {}: timed out after {}s", args.join(" "), REMOTE_TIMEOUT.as_secs()))??;
+    stdout_of(args, out)
+}
+
+fn stdout_of(args: &[&str], out: Output) -> anyhow::Result<String> {
     anyhow::ensure!(out.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -444,5 +580,26 @@ mod tests {
         assert_eq!(worktree_repo(dir.path()), Some(PathBuf::from("/src/repo/.git")));
         std::fs::write(dir.path().join(".git"), "gitdir: /elsewhere/x\n").unwrap();
         assert_eq!(worktree_repo(dir.path()), None);
+    }
+
+    /// The race with GitHub's auto-delete: listed by `ls-remote`, gone before the push.
+    #[tokio::test]
+    async fn deleting_a_missing_remote_branch_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, bare) = (dir.path().join("repo"), dir.path().join("origin.git"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&bare).unwrap();
+        git(&bare, &["init", "-q", "--bare"]).await.unwrap();
+        git(&repo, &["init", "-q"]).await.unwrap();
+        git(&repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"])
+            .await
+            .unwrap();
+        git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]).await.unwrap();
+        git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/wh/task/x"]).await.unwrap();
+
+        let oid = remote_task_branches(&repo, "origin").await.unwrap().remove("wh/task/x").unwrap();
+        assert!(delete_remote_branch(&repo, "origin", "wh/task/x", &oid).await.unwrap());
+        assert!(!delete_remote_branch(&repo, "origin", "wh/task/x", &oid).await.unwrap());
+        assert!(delete_remote_branch(&repo, "origin", "main", &oid).await.is_err());
     }
 }
