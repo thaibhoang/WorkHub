@@ -206,6 +206,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             budget_usd: Some(agent.budget_usd),
             permission_mode: Some(agent.permission_mode.clone()),
             allowed_tools: agent.allowed_tools.clone(),
+            tools: agent.tools.clone(),
             with_user_mcp: false,
             timeout: agent.timeout,
             keep_worktree: false,

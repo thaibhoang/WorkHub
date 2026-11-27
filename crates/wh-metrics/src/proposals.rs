@@ -296,6 +296,7 @@ pub async fn version_stats(pool: &PgPool, factory: Option<&str>) -> anyhow::Resu
         "WITH s AS ( \
            SELECT f.* FROM session_facts f LEFT JOIN tasks_view t ON t.task_id = f.task_id \
            WHERE f.factory_version IS NOT NULL AND f.status IN ('succeeded', 'failed') AND f.benchmark_run IS NULL \
+             AND f.failure_class IS DISTINCT FROM 'usage_limit' \
              AND ($1::text IS NULL OR t.factory = $1)), \
          sc AS ( \
            SELECT s.factory_version, count(*) AS scored, count(*) FILTER (WHERE r.pass) AS passed \

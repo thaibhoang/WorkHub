@@ -141,7 +141,8 @@ pub async fn gather(pool: &PgPool, factory: &str, version: &str, window_days: u3
     let since = Utc::now() - chrono::Duration::days(window_days as i64);
     // Finished sessions of this factory's tasks within the window.
     const S: &str = "SELECT f.* FROM session_facts f JOIN tasks_view t ON t.task_id = f.task_id \
-                     WHERE t.factory = $1 AND t.benchmark_run IS NULL AND f.dispatched_at >= $2 AND f.status IN ('succeeded', 'failed')";
+                     WHERE t.factory = $1 AND t.benchmark_run IS NULL AND f.dispatched_at >= $2 AND f.status IN ('succeeded', 'failed') \
+                       AND f.failure_class IS DISTINCT FROM 'usage_limit'";
 
     let stages: Vec<StageRow> = sqlx::query_as(&format!(
         "WITH s AS ({S}) SELECT COALESCE(factory_version, '-') AS factory_version, stage, min(agent) AS agent, \

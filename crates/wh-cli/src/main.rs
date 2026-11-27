@@ -1315,6 +1315,7 @@ async fn run_agent(store: &EventStore, a: RunArgs) -> Result<()> {
         budget_usd: Some(a.budget),
         permission_mode: Some(a.permission_mode),
         allowed_tools: a.allowed_tools,
+        tools: None,
         with_user_mcp: a.with_user_mcp,
         timeout: Duration::from_secs(a.timeout_min * 60),
         keep_worktree: !a.cleanup,

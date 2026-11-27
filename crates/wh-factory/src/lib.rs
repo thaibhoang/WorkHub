@@ -142,6 +142,10 @@ struct Settings {
     max_retries: Option<u32>,
     permission_mode: Option<String>,
     allowed_tools: Option<Vec<String>>,
+    /// Built-in tools the agent gets at all (Claude Code `--tools`). Unset = all
+    /// of them. Every tool definition is resent on every turn, so a short list
+    /// is the cheapest way to shrink each session's context.
+    tools: Option<Vec<String>>,
     sandbox: Option<SandboxFile>,
     /// Environment variables set for the agent process (merged by key: an agent's
     /// entries override the defaults'). A leading `~/` in a value is `$HOME/`.
@@ -307,6 +311,8 @@ pub struct Agent {
     pub max_retries: u32,
     pub permission_mode: String,
     pub allowed_tools: Vec<String>,
+    /// Built-in tool set (`None` = the runtime's default, all tools).
+    pub tools: Option<Vec<String>>,
     /// Where the agent's sessions run (worktree on the host, or a container).
     pub sandbox: Sandbox,
     /// Extra environment for the agent process (also passed into its container).
@@ -502,6 +508,7 @@ impl Factory {
                     .or_else(|| d.permission_mode.clone())
                     .unwrap_or_else(|| DEFAULT_PERMISSION_MODE.into()),
                 allowed_tools: s.allowed_tools.clone().or_else(|| d.allowed_tools.clone()).unwrap_or_default(),
+                tools: s.tools.clone().or_else(|| d.tools.clone()),
                 sandbox,
                 env,
             });
@@ -828,6 +835,18 @@ improvement:
         let bad = OK.replace("max_retries: 1 }", "max_retries: 1, env: { \"A-B\": x } }");
         let err = format!("{:#}", Factory::load(&write(dir.path(), &bad)).unwrap_err());
         assert!(err.contains("not a variable name"), "{err}");
+    }
+
+    #[test]
+    fn tools_default_to_all_and_agents_override() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(Factory::load(&write(dir.path(), OK)).unwrap().agents["a"].tools, None);
+        let yaml = OK
+            .replace("max_retries: 1 }", "max_retries: 1, tools: [Bash, Read] }")
+            .replace("model: claude-haiku-5-5 }", "model: claude-haiku-5-5, tools: [] }");
+        let f = Factory::load(&write(dir.path(), &yaml)).unwrap();
+        assert_eq!(f.agents["a"].tools, Some(vec!["Bash".to_string(), "Read".to_string()]));
+        assert_eq!(f.agents["b"].tools, Some(vec![]));
     }
 
     #[test]

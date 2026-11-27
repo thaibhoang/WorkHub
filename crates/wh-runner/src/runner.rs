@@ -42,6 +42,8 @@ pub struct RunSpec {
     pub budget_usd: Option<f64>,
     pub permission_mode: Option<String>,
     pub allowed_tools: Vec<String>,
+    /// Built-in tool set (`None` = the runtime's default).
+    pub tools: Option<Vec<String>>,
     pub with_user_mcp: bool,
     pub timeout: Duration,
     pub keep_worktree: bool,
@@ -241,7 +243,7 @@ impl<R: AgentRuntime> Runner<R> {
             allowed_tools: spec.allowed_tools.clone(),
             with_user_mcp: spec.with_user_mcp,
             timeout: spec.timeout,
-            tools: None,
+            tools: spec.tools.clone(),
             container,
             env: spec.env.clone(),
         };
