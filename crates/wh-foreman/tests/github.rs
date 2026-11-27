@@ -379,6 +379,63 @@ async fn conflicting_pr_is_gated_merged_resolved_and_pushed_to_the_same_pr(pool:
     assert_eq!(loops, (1, 0));
 }
 
+/// A task driven until it waits on its PR, with the pushed commit.
+async fn shipped_task(store: &EventStore, env: &Env) -> (TaskId, String) {
+    let task = TaskId::new();
+    let created = TaskEvent::TaskCreated {
+        title: "t".into(),
+        body: None,
+        source: TaskSource::Cli,
+        factory: Some("gh-test".into()),
+        benchmark: None,
+        external_ref: None,
+    };
+    let meta = EventMeta::new(task.0, Actor::Human { user: "tester".into() });
+    store.append(&task.stream_id(), ExpectedVersion::NoStream, vec![NewEvent::from_domain(&created, meta).unwrap()]).await.unwrap();
+    let state = foreman(store, env).drive(task).await.unwrap();
+    assert_eq!(state.status, TaskStatus::Shipped);
+    (task, state.pr.unwrap().commit)
+}
+
+fn conflicting_view(head: &str) -> serde_json::Value {
+    serde_json::json!({"state": "OPEN", "headRefOid": head, "baseRefName": "main", "mergeable": "CONFLICTING"})
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn conflict_on_another_head_is_not_recorded(pool: PgPool) {
+    let env = setup("github: { repo: acme/demo }");
+    let store = EventStore::new(pool);
+    let (task, pushed) = shipped_task(&store, &env).await;
+    let svc = GithubService::new(store.clone(), env.factory.clone(), env.gh()).unwrap();
+
+    env.write("pr_view.json", conflicting_view("someone-elses-commit"));
+    assert!(svc.sync_once().await.unwrap().recorded.is_empty());
+    assert!(!types(&store, task).await.contains(&"PrConflicted".to_owned()));
+
+    env.write("pr_view.json", conflicting_view(&pushed));
+    assert_eq!(svc.sync_once().await.unwrap().recorded, vec![(task, vec!["PrConflicted"])]);
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn conflict_while_the_task_is_not_shipped_is_not_recorded(pool: PgPool) {
+    let env = setup("github: { repo: acme/demo }");
+    let store = EventStore::new(pool);
+    let (task, pushed) = shipped_task(&store, &env).await;
+    let svc = GithubService::new(store.clone(), env.factory.clone(), env.gh()).unwrap();
+
+    let version = store.read_stream(&task.stream_id()).await.unwrap().last().unwrap().stream_version;
+    let entered = TaskEvent::StageEntered { stage: "implement".into(), feedback: None };
+    let meta = EventMeta::new(task.0, Actor::Human { user: "tester".into() });
+    store
+        .append(&task.stream_id(), ExpectedVersion::Exact(version), vec![NewEvent::from_domain(&entered, meta).unwrap()])
+        .await
+        .unwrap();
+
+    env.write("pr_view.json", conflicting_view(&pushed));
+    assert!(svc.sync_once().await.unwrap().recorded.is_empty());
+    assert!(!types(&store, task).await.contains(&"PrConflicted".to_owned()));
+}
+
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
 async fn closed_pr_blocks_the_task(pool: PgPool) {
     let env = setup("github: { repo: acme/demo }");

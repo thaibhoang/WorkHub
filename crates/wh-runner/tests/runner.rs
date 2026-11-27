@@ -147,6 +147,46 @@ async fn merges_the_base_before_the_agent_and_commits_only_resolved_merges(pool:
     assert_eq!(git_out(&repo, &["show", "clean:shared.txt"]), "theirs");
 }
 
+/// For setups that must fail before any agent runs.
+struct NeverRuns;
+
+impl AgentRuntime for NeverRuns {
+    fn name(&self) -> &str {
+        "fake"
+    }
+    async fn run(&self, _req: &AgentRequest, _tx: UnboundedSender<Signal>) -> Outcome {
+        panic!("the runtime must not be called")
+    }
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn failed_merge_setup_is_env_setup_and_not_retried(pool: PgPool) {
+    let repo = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    git_repo(repo.path());
+    git_out(repo.path(), &["branch", "task"]);
+    let before = git_out(repo.path(), &["rev-parse", "task"]);
+    let runner = Runner::new(EventStore::new(pool), NeverRuns, RunnerConfig { data_dir: data.path().into() });
+
+    let mut s = spec(repo.path(), TaskId::new(), "HEAD");
+    s.branch = Some("task".into());
+    s.commit_on_success = true;
+    s.merge = Some(Merge { remote: ".".into(), base: "no-such-branch".into() });
+    s.max_retries = 2;
+    let report = runner.run(s, |_| {}).await.unwrap();
+    assert_eq!(report.attempts.len(), 1, "env_setup is not retried");
+    match &report.last().outcome.status {
+        OutcomeStatus::Failed { class, message, retryable } => {
+            assert_eq!(*class, FailureClass::EnvSetup);
+            assert!(message.contains("no-such-branch"), "{message}");
+            assert!(!retryable);
+        }
+        other => panic!("expected failure, got {other:?}"),
+    }
+    assert!(std::fs::read_dir(data.path().join("worktrees")).unwrap().next().is_none(), "worktree cleaned up");
+    assert_eq!(git_out(repo.path(), &["rev-parse", "task"]), before, "the task branch has not moved");
+}
+
 fn success() -> Outcome {
     Outcome {
         status: OutcomeStatus::Succeeded,

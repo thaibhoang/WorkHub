@@ -319,4 +319,22 @@ mod tests {
         let s = state(vec![shipped("c1"), conflicted(), gate_requested(), decided(false), blocked, resumed]);
         assert!(resolves(decide(&s, &factory("{ conflict_gate: g }"))).contains("go on"));
     }
+
+    #[test]
+    fn poll_landing_before_the_gate_decision_is_handled_keeps_the_decision() {
+        let f = factory("{ conflict_gate: g }");
+        let poll_after = |approved| {
+            let review = TaskEvent::PrReviewed {
+                review_id: "1".into(),
+                reviewer: "bob".into(),
+                state: CHANGES_REQUESTED.into(),
+                body: "rename it".into(),
+                comments: vec![],
+                submitted_at: None,
+            };
+            state(vec![shipped("c1"), conflicted(), gate_requested(), decided(approved), review])
+        };
+        assert!(resolves(decide(&poll_after(true), &f)).contains("rename it"));
+        blocks(decide(&poll_after(false), &f), CONFLICT_STAGE);
+    }
 }
