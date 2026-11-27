@@ -119,6 +119,7 @@ async fn sweeps_finished_work_and_keeps_the_rest(pool: PgPool) {
         grace: Duration::from_secs(3600),
         caches: vec![(cache.clone(), 1024)],
         dry_run: true,
+        task_db: None,
     };
     let kinds = |r: &wh_foreman::cleanup::CleanupReport| {
         let mut v: Vec<String> = r.removed.iter().map(|x| format!("{}:{}", x.kind, x.what.rsplit('/').next().unwrap())).collect();
@@ -199,6 +200,7 @@ async fn keeps_a_running_session_when_its_pr_is_closed(pool: PgPool) {
         grace: Duration::ZERO,
         caches: vec![(cache.clone(), 1024)],
         dry_run: false,
+        task_db: None,
     };
     let r = sweep(&store, &cfg).await.unwrap();
     assert!(r.errors.is_empty(), "{:?}", r.errors);
@@ -282,6 +284,7 @@ async fn deletes_remote_task_branches(pool: PgPool) {
         grace: Duration::from_secs(3600),
         caches: vec![],
         dry_run: true,
+        task_db: None,
     };
     let local = |t: TaskId| format!("branch:{}", task_branch(t));
     let remote = |t: TaskId| format!("remote-branch:{}", task_branch(t));
