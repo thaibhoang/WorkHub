@@ -41,6 +41,10 @@ defaults:
     - "Bash(git status:*)"
     - "Bash(git diff:*)"
     - "Bash(git log:*)"
+    # The web UI's checks (CI runs the same). Lockfile install only, scoped to web/;
+    # without these every web task loops on "npm run build not run" until blocked.
+    - "Bash(npm --prefix web ci:*)"
+    - "Bash(npm --prefix web run build:*)"
   # Every session gets a fresh worktree; one shared target dir keeps the compiled
   # dependencies between sessions instead of rebuilding the workspace from scratch
   # each stage. `wh cleanup` / the foreman wipe it above WH_CACHE_MAX_GB (30).
