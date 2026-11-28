@@ -1,10 +1,10 @@
-//! Human commands (create, gate decision, resume, cancel). Each one validates
+//! Human commands (create, gate decision, answer, resume, cancel). Each one validates
 //! against the task's folded state and appends exactly one event with
 //! `ExpectedVersion::Exact`, so a decision made on stale state is rejected
 //! instead of silently overriding a newer one. Shared by the CLI and the API.
 
 use wh_core::{
-    Actor, EventMeta, NewEvent, TaskId,
+    Actor, Answer, EventMeta, NewEvent, Question, SessionId, TaskId,
     task::{TaskEvent, TaskSource, TaskState, TaskStatus},
 };
 use wh_eventstore::{EventStore, ExpectedVersion, StoreError};
@@ -112,6 +112,58 @@ pub async fn decide_gate(
     let ev = TaskEvent::GateDecided { gate: gate.clone(), stage, approved, reviewer, comment };
     append(store, task, ExpectedVersion::Exact(state.version), actor, ev).await?;
     Ok(gate)
+}
+
+/// Answer the questions the task is waiting on: `answers[i]` answers question `i`.
+/// `asked` names the session whose questions are being answered, if the caller
+/// knows it, so newer questions are never answered by mistake.
+pub async fn answer(
+    store: &EventStore,
+    actor: Actor,
+    task: TaskId,
+    asked: Option<SessionId>,
+    answers: Vec<Answer>,
+) -> Result<()> {
+    let state = load_task(store, task).await?;
+    let (TaskStatus::AwaitingInput { .. }, Some(pending)) = (&state.status, &state.pending_questions) else {
+        return Err(CommandError::InvalidState(format!(
+            "task is not waiting for an answer ({})",
+            status_name(&state.status)
+        )));
+    };
+    if asked.is_some_and(|s| s != pending.session) {
+        return Err(CommandError::Conflict);
+    }
+    let answers = check_answers(&pending.questions, answers)?;
+    let ev = TaskEvent::UserAnswered { stage: pending.stage.clone(), answers, user: actor_name(&actor) };
+    append(store, task, ExpectedVersion::Exact(state.version), actor, ev).await
+}
+
+/// One answer per question, each with an offered option and/or free text (both
+/// only when there is a single question). Blank text counts as none.
+fn check_answers(questions: &[Question], answers: Vec<Answer>) -> Result<Vec<Answer>> {
+    let invalid = |m: String| Err(CommandError::InvalidState(m));
+    if answers.len() != questions.len() {
+        return invalid(format!("expected {} answer(s), got {}", questions.len(), answers.len()));
+    }
+    let mut checked = Vec::with_capacity(answers.len());
+    for (i, (q, mut a)) in questions.iter().zip(answers).enumerate() {
+        let n = i + 1;
+        a.text = a.text.filter(|t| !t.trim().is_empty());
+        if a.option.is_none() && a.text.is_none() {
+            return invalid(format!("answer {n} is empty"));
+        }
+        if let Some(o) = &a.option
+            && !q.options.contains(o)
+        {
+            return invalid(format!("answer {n}: {o:?} is not one of the offered options"));
+        }
+        if questions.len() > 1 && a.option.is_some() && a.text.is_some() {
+            return invalid(format!("answer {n}: give an option or text, not both, when there are several questions"));
+        }
+        checked.push(a);
+    }
+    Ok(checked)
 }
 
 /// Restart a blocked task, optionally at another stage, with guidance for the agent.

@@ -64,7 +64,7 @@ async fn awaiting_input_keeps_the_stage_until_answered(pool: PgPool) {
     let a = TaskId::new();
     append(&store, a, TaskEvent::TaskCreated { title: "A".into(), body: None, source: TaskSource::Cli, factory: None, benchmark: None, external_ref: None, parent: None, draft: false }).await;
     append(&store, a, TaskEvent::StageEntered { stage: "spec".into(), feedback: None }).await;
-    append(&store, a, TaskEvent::AgentAsked { stage: "spec".into(), session: wh_core::SessionId::new(), questions: vec![] }).await;
+    append(&store, a, TaskEvent::AgentAsked { stage: "spec".into(), session: wh_core::SessionId::new(), questions: vec![], resume: None }).await;
 
     let mut proj = TasksProjection::new(pool.clone());
     let sub = Subscription::new(store.clone());

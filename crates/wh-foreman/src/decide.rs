@@ -99,6 +99,7 @@ pub fn decide(state: &TaskState, f: &Factory) -> Option<Action> {
         TaskEvent::StageEntered { .. }
         | TaskEvent::AgentAsked { .. }
         | TaskEvent::UserAnswered { .. }
+        | TaskEvent::StageResumed { .. }
         | TaskEvent::GateRequested { .. }
         | TaskEvent::TaskBlocked { .. }
         | TaskEvent::TaskCompleted { .. }
@@ -375,7 +376,7 @@ mod tests {
     fn awaiting_input_does_nothing() {
         let f = factory("{ repo: a/b }");
         let asked =
-            TaskEvent::AgentAsked { stage: "impl".into(), session: wh_core::SessionId::new(), questions: vec![] };
+            TaskEvent::AgentAsked { stage: "impl".into(), session: wh_core::SessionId::new(), questions: vec![], resume: None };
         let mut events = vec![TaskEvent::StageEntered { stage: "impl".into(), feedback: None }, asked];
         assert_eq!(decide(&state(events.clone()), &f), None);
         events.push(conflicted());

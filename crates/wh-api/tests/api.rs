@@ -9,13 +9,16 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
-use wh_api::{AppState, Live};
+use wh_api::{
+    AppState, Live,
+    commands::{self, CommandError, NewTask},
+};
 use wh_core::{
-    Actor, EventMeta, NewEvent, ProposalId, ScoreId, SessionId, TaskId,
+    Actor, Answer, EventMeta, NewEvent, ProposalId, Question, ScoreId, SessionId, TaskId,
     proposal::ProposalEvent,
     score::ScoreEvent,
     session::{SessionEvent, TokenUsage},
-    task::{StageOutcome, TaskEvent},
+    task::{StageOutcome, TaskEvent, TaskSource},
 };
 use wh_eventstore::{EventStore, ExpectedVersion};
 use wh_factory::Factory;
@@ -49,6 +52,72 @@ fn sys(task: TaskId) -> EventMeta {
 
 async fn task_ev(store: &EventStore, task: TaskId, e: TaskEvent) {
     append(store, &task.stream_id(), NewEvent::from_domain(&e, sys(task)).unwrap()).await;
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn answer_is_validated_and_recorded_once(pool: PgPool) {
+    let (_, store) = app(&pool, None);
+    let user = || Actor::Human { user: "thai".into() };
+    let new = NewTask { title: "t".into(), body: None, source: TaskSource::Cli, factory: None, parent: None, start: true };
+    let task = commands::create_task(&store, user(), new).await.unwrap();
+    let one = |option: Option<&str>, text: Option<&str>| {
+        vec![Answer { option: option.map(Into::into), text: text.map(Into::into) }]
+    };
+    let events = async || store.read_stream(&task.stream_id()).await.unwrap();
+
+    let res = commands::answer(&store, user(), task, None, one(None, Some("x"))).await;
+    assert!(matches!(res, Err(CommandError::InvalidState(m)) if m.contains("not waiting")));
+
+    let session = SessionId::new();
+    task_ev(&store, task, TaskEvent::StageEntered { stage: "impl".into(), feedback: None }).await;
+    let questions = vec![Question { text: "Which?".into(), options: vec!["A".into(), "B".into()] }];
+    task_ev(&store, task, TaskEvent::AgentAsked { stage: "impl".into(), session, questions, resume: None }).await;
+    let before = events().await.len();
+
+    let two = [one(Some("A"), None), one(Some("B"), None)].concat();
+    for bad in [vec![], two, one(None, None), one(None, Some("  ")), one(Some("C"), None)] {
+        let res = commands::answer(&store, user(), task, None, bad.clone()).await;
+        assert!(matches!(res, Err(CommandError::InvalidState(_))), "{bad:?}");
+    }
+    let res = commands::answer(&store, user(), task, Some(SessionId::new()), one(Some("A"), None)).await;
+    assert!(matches!(res, Err(CommandError::Conflict)));
+    assert_eq!(events().await.len(), before, "nothing appended by refused answers");
+
+    commands::answer(&store, user(), task, Some(session), one(Some("B"), Some("because"))).await.unwrap();
+    let all = events().await;
+    assert_eq!(all.len(), before + 1);
+    let last = all.last().unwrap();
+    assert_eq!(last.meta.actor, user());
+    assert_eq!(
+        last.decode::<TaskEvent>().unwrap(),
+        TaskEvent::UserAnswered { stage: "impl".into(), answers: one(Some("B"), Some("because")), user: "thai".into() }
+    );
+
+    let res = commands::answer(&store, user(), task, None, one(Some("A"), None)).await;
+    assert!(matches!(res, Err(CommandError::InvalidState(_))), "answering twice");
+    assert_eq!(events().await.len(), before + 1);
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn answer_to_several_questions_takes_one_value_each(pool: PgPool) {
+    let (_, store) = app(&pool, None);
+    let user = || Actor::Human { user: "thai".into() };
+    let task = TaskId::new();
+    task_ev(&store, task, TaskEvent::StageEntered { stage: "impl".into(), feedback: None }).await;
+    let q = |text: &str| Question { text: text.into(), options: vec!["A".into()] };
+    let asked = TaskEvent::AgentAsked {
+        stage: "impl".into(),
+        session: SessionId::new(),
+        questions: vec![q("one"), q("two")],
+        resume: None,
+    };
+    task_ev(&store, task, asked).await;
+    let option = Answer { option: Some("A".into()), text: None };
+    let both = Answer { option: Some("A".into()), text: Some("and".into()) };
+    let res = commands::answer(&store, user(), task, None, vec![both, option.clone()]).await;
+    assert!(matches!(res, Err(CommandError::InvalidState(_))));
+    let text = Answer { option: None, text: Some("free".into()) };
+    commands::answer(&store, user(), task, None, vec![option, text]).await.unwrap();
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]

@@ -12,7 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 use wh_api::commands::{self, NewTask, local_user};
 use wh_core::{
-    RecordedEvent, TaskId,
+    Answer, Question, RecordedEvent, TaskId,
     task::{TaskEvent, TaskSource},
 };
 use wh_eventstore::{EventStore, Subscription};
@@ -328,6 +328,16 @@ enum TaskCmd {
     List,
     /// Show a task's timeline and its agent sessions
     Show { task: TaskId },
+    /// Answer the questions a task is waiting on (see them with `wh task show`)
+    Answer {
+        task: TaskId,
+        /// Choose option N (1-based) of the question; only when there is one question
+        #[arg(long)]
+        option: Option<usize>,
+        /// Free text; with several questions, one value per question in order
+        /// (a value equal to an option's text chooses that option)
+        values: Vec<String>,
+    },
     /// Restart a blocked task (optionally at another stage, with guidance for the agent)
     Resume {
         task: TaskId,
@@ -626,6 +636,15 @@ async fn main() -> Result<()> {
                 }
             }
             TaskCmd::Show { task } => show_task(&store, task).await?,
+            TaskCmd::Answer { task, option, values } => {
+                let state = commands::load_task(&store, task).await?;
+                let Some(pending) = state.pending_questions else {
+                    anyhow::bail!("task is not waiting for an answer ({})", commands::status_name(&state.status));
+                };
+                let answers = answers_from_args(&pending.questions, option, values)?;
+                commands::answer(&store, local_user(), task, None, answers).await?;
+                println!("answered");
+            }
             TaskCmd::Resume { task, stage, comment } => {
                 commands::resume(&store, local_user(), task, stage, comment).await?;
                 println!("resumed; `wh foreman` will pick it up");
@@ -1262,6 +1281,39 @@ async fn run_projections(store: &EventStore) -> Result<()> {
     a.and(b).and(c).and(d).and(e)
 }
 
+/// `wh task answer` arguments → one `Answer` per pending question. Pure.
+fn answers_from_args(questions: &[Question], option: Option<usize>, values: Vec<String>) -> Result<Vec<Answer>> {
+    if let [q] = questions {
+        anyhow::ensure!(values.len() <= 1, "one question: give the text as a single (quoted) argument");
+        let option = match option {
+            Some(n) => {
+                let chosen = n.checked_sub(1).and_then(|i| q.options.get(i));
+                let count = q.options.len();
+                Some(chosen.with_context(|| format!("no option {n}: the question has {count} option(s)"))?.clone())
+            }
+            None => None,
+        };
+        let text = values.into_iter().next();
+        anyhow::ensure!(option.is_some() || text.is_some(), "give --option N, a text answer, or both");
+        return Ok(vec![Answer { option, text }]);
+    }
+    anyhow::ensure!(option.is_none(), "--option works only with one question; give one value per question");
+    anyhow::ensure!(
+        values.len() == questions.len(),
+        "expected {} values (one per question), got {}",
+        questions.len(),
+        values.len()
+    );
+    Ok(questions
+        .iter()
+        .zip(values)
+        .map(|(q, v)| match q.options.contains(&v) {
+            true => Answer { option: Some(v), text: None },
+            false => Answer { option: None, text: Some(v) },
+        })
+        .collect())
+}
+
 async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {
     let state = commands::load_task(store, task).await?;
     println!("{}  [{:?}]  rework loops: {}", state.title, state.status, state.rework_loops);
@@ -1280,6 +1332,20 @@ async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {
     }
     if state.status == wh_core::task::TaskStatus::Draft {
         println!("draft: start it with `wh task start {task}`");
+    }
+    if let Some(pending) = &state.pending_questions {
+        println!("questions from {}:", pending.stage);
+        for (i, q) in pending.questions.iter().enumerate() {
+            println!("  {}. {}", i + 1, q.text);
+            for (n, o) in q.options.iter().enumerate() {
+                println!("       {}) {o}", n + 1);
+            }
+        }
+        match pending.questions.as_slice() {
+            [q] if q.options.is_empty() => println!("answer: wh task answer {task} \"...\""),
+            [_] => println!("answer: wh task answer {task} [--option N] [\"...\"]"),
+            many => println!("answer: wh task answer {task}{}", " \"...\"".repeat(many.len())),
+        }
     }
     for e in store.read_stream(&task.stream_id()).await? {
         let detail = match e.decode::<TaskEvent>()? {
@@ -1301,6 +1367,7 @@ async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {
                 let texts: Vec<_> = questions.iter().map(|q| first_line(&q.text)).collect();
                 format!("{stage}: {}", texts.join(" | "))
             }
+            TaskEvent::StageResumed { stage } => stage,
             TaskEvent::UserAnswered { answers, user, .. } => {
                 let replies: Vec<_> = answers
                     .iter()
@@ -1533,6 +1600,43 @@ mod tests {
     use super::*;
 
     const OK: &str = "name: demo\nstages: [{ id: impl, agent: a }]\nagents: { a: { prompt: a.md } }\n";
+
+    fn question(options: &[&str]) -> Question {
+        Question { text: "?".into(), options: options.iter().map(|o| o.to_string()).collect() }
+    }
+
+    fn reply(option: Option<&str>, text: Option<&str>) -> Answer {
+        Answer { option: option.map(Into::into), text: text.map(Into::into) }
+    }
+
+    #[test]
+    fn answer_arguments_for_one_question() {
+        let q = [question(&["A", "B"])];
+        let map = |option, values: &[&str]| answers_from_args(&q, option, values.iter().map(|v| v.to_string()).collect());
+        assert_eq!(map(Some(2), &[]).unwrap(), [reply(Some("B"), None)]);
+        assert_eq!(map(None, &["A"]).unwrap(), [reply(None, Some("A"))]);
+        assert_eq!(map(Some(1), &["why"]).unwrap(), [reply(Some("A"), Some("why"))]);
+        assert!(map(Some(0), &[]).is_err());
+        assert!(map(Some(3), &[]).is_err());
+        assert!(map(None, &[]).is_err());
+        assert!(map(None, &["a", "b"]).is_err());
+    }
+
+    #[test]
+    fn answer_arguments_for_several_questions() {
+        let q = [question(&["A"]), question(&[])];
+        let values = |v: &[&str]| v.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            answers_from_args(&q, None, values(&["A", "free"])).unwrap(),
+            [reply(Some("A"), None), reply(None, Some("free"))]
+        );
+        assert_eq!(answers_from_args(&q, None, values(&["a", "A"])).unwrap()[1], reply(None, Some("A")));
+        assert!(answers_from_args(&q, Some(1), values(&["A", "x"])).is_err());
+        assert!(answers_from_args(&q, None, values(&["A"])).is_err());
+
+        let cli = Cli::try_parse_from(["wh", "task", "answer", &TaskId::new().to_string(), "x", "y"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Task { cmd: TaskCmd::Answer { option: None, values, .. } } if values == ["x", "y"]));
+    }
 
     /// A temp dir with a factory file and its agent prompt; returns the dir and the file.
     fn factory_dir(yaml: &str) -> (tempfile::TempDir, PathBuf) {

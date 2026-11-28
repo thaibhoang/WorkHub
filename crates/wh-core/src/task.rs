@@ -102,12 +102,20 @@ pub enum TaskEvent {
         stage: String,
         session: SessionId,
         questions: Vec<Question>,
+        /// What it takes to resume the paused session (None on old events).
+        #[serde(default)]
+        resume: Option<ResumeHandle>,
     },
     /// `answers[i]` answers `questions[i]` of the pending `AgentAsked`.
     UserAnswered {
         stage: String,
         answers: Vec<Answer>,
         user: String,
+    },
+    /// The answers are being handed to the paused `stage` (claims the resume,
+    /// which records no `StageEntered`).
+    StageResumed {
+        stage: String,
     },
     /// Needs a human: stage failed after retries, rework limit hit, bad verdict...
     TaskBlocked {
@@ -295,6 +303,7 @@ impl DomainEvent for TaskEvent {
             Self::GateDecided { .. } => "GateDecided",
             Self::AgentAsked { .. } => "AgentAsked",
             Self::UserAnswered { .. } => "UserAnswered",
+            Self::StageResumed { .. } => "StageResumed",
             Self::TaskBlocked { .. } => "TaskBlocked",
             Self::TaskResumed { .. } => "TaskResumed",
             Self::TaskCompleted { .. } => "TaskCompleted",
@@ -363,6 +372,36 @@ pub struct PendingQuestions {
     pub questions: Vec<Question>,
 }
 
+/// What resuming a paused session needs besides the answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeHandle {
+    /// First session of the conversation: owns the worktree and sandbox home.
+    pub home_session: SessionId,
+    /// The runtime's own conversation id.
+    pub runtime_session_id: String,
+    pub branch: String,
+    /// Paths of the merge the stage is resolving (empty = no merge).
+    pub conflicts: Vec<String>,
+}
+
+/// A stage that stopped to ask and has not exited yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pause {
+    pub stage: String,
+    /// Session that asked last.
+    pub session: SessionId,
+    pub resume: Option<ResumeHandle>,
+}
+
+/// One answered question set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exchange {
+    pub questions: Vec<Question>,
+    /// `answers[i]` answers `questions[i]`.
+    pub answers: Vec<Answer>,
+    pub user: String,
+}
+
 /// Task aggregate state, folded from its event stream.
 #[derive(Debug, Clone, Default)]
 pub struct TaskState {
@@ -381,6 +420,10 @@ pub struct TaskState {
     pub pending_questions: Option<PendingQuestions>,
     /// `AgentAsked` events since the latest `StageEntered` (limited by `max_questions`).
     pub question_rounds: u32,
+    /// Set by `AgentAsked` until the stage exits or is entered anew (kept while blocked).
+    pub paused: Option<Pause>,
+    /// Questions answered since the latest `StageEntered` (kept while blocked).
+    pub dialogue: Vec<Exchange>,
     pub results: Vec<StageResult>,
     /// Stages re-run because of feedback (review reject, gate reject, resume comment).
     pub rework_loops: u32,
@@ -429,6 +472,8 @@ impl TaskState {
             TaskEvent::StageEntered { stage, feedback } => {
                 self.pr_feedback.clear();
                 self.question_rounds = 0;
+                self.paused = None;
+                self.dialogue.clear();
                 // After the conflict gate (or a failed merge) the status is no longer `Shipped`.
                 if self.status == TaskStatus::Shipped || self.conflict.is_some() {
                     self.pr_rework_loops += 1;
@@ -441,6 +486,7 @@ impl TaskState {
                 if *outcome == StageOutcome::Succeeded {
                     self.conflict = None;
                 }
+                self.paused = None;
                 self.results.push(StageResult { stage: stage.clone(), outcome: *outcome, summary: summary.clone() });
             }
             TaskEvent::GateRequested { gate, stage } => {
@@ -455,17 +501,26 @@ impl TaskState {
                     c.decision = Some(*approved);
                 }
             }
-            TaskEvent::AgentAsked { stage, session, questions } => {
+            TaskEvent::AgentAsked { stage, session, questions, resume } => {
+                self.paused = Some(Pause { stage: stage.clone(), session: *session, resume: resume.clone() });
                 self.pending_questions =
                     Some(PendingQuestions { stage: stage.clone(), session: *session, questions: questions.clone() });
                 self.question_rounds += 1;
                 self.status = TaskStatus::AwaitingInput { stage: stage.clone() };
             }
-            TaskEvent::UserAnswered { .. } => {
+            TaskEvent::UserAnswered { answers, user, .. } => {
                 if let TaskStatus::AwaitingInput { stage } = &self.status {
+                    if let Some(pending) = &self.pending_questions {
+                        self.dialogue.push(Exchange {
+                            questions: pending.questions.clone(),
+                            answers: answers.clone(),
+                            user: user.clone(),
+                        });
+                    }
                     self.status = TaskStatus::Running { stage: stage.clone() };
                 }
             }
+            TaskEvent::StageResumed { stage } => self.status = TaskStatus::Running { stage: stage.clone() },
             TaskEvent::TaskBlocked { stage, reason } => {
                 self.blocked_stage = stage.clone();
                 self.status = TaskStatus::Blocked { reason: reason.clone() }
@@ -726,6 +781,12 @@ mod tests {
             stage: "impl".into(),
             session: SessionId::new(),
             questions: vec![Question { text: "Which?".into(), options: vec!["A".into()] }],
+            resume: Some(ResumeHandle {
+                home_session: SessionId::new(),
+                runtime_session_id: "r1".into(),
+                branch: "wh/task/x".into(),
+                conflicts: vec!["a.rs".into()],
+            }),
         }
     }
 
@@ -765,6 +826,39 @@ mod tests {
         assert_eq!(s.status, TaskStatus::Cancelled, "only acts while awaiting");
         s.apply(7, entered());
         assert_eq!(s.question_rounds, 0);
+    }
+
+    #[test]
+    fn question_event_without_resume_data_decodes() {
+        let v = serde_json::json!({"type": "AgentAsked", "stage": "impl", "session": SessionId::new(), "questions": []});
+        assert!(matches!(serde_json::from_value(v).unwrap(), TaskEvent::AgentAsked { resume: None, .. }));
+    }
+
+    #[test]
+    fn question_pause_and_dialogue_follow_the_stage() {
+        let entered = || TaskEvent::StageEntered { stage: "impl".into(), feedback: None };
+        let resumed = || TaskEvent::StageResumed { stage: "impl".into() };
+        let mut s = TaskState::fold([(1, entered()), (2, asked()), (3, answered()), (4, resumed())]);
+        assert_eq!(s.status, TaskStatus::Running { stage: "impl".into() });
+        let pause = s.paused.as_ref().unwrap();
+        assert_eq!((pause.stage.as_str(), pause.resume.is_some()), ("impl", true));
+        assert_eq!(s.dialogue.len(), 1);
+        assert_eq!((s.dialogue[0].questions[0].text.as_str(), s.dialogue[0].user.as_str()), ("Which?", "u"));
+        assert_eq!(s.dialogue[0].answers[0].option.as_deref(), Some("A"));
+        s.apply(5, asked());
+        s.apply(6, answered());
+        assert_eq!(s.dialogue.len(), 2);
+        s.apply(7, TaskEvent::TaskBlocked { stage: Some("impl".into()), reason: "x".into() });
+        s.apply(8, TaskEvent::TaskResumed { stage: None, comment: None });
+        assert_eq!((s.paused.is_some(), s.dialogue.len()), (true, 2));
+        s.apply(9, entered());
+        assert_eq!((&s.paused, s.dialogue.len()), (&None, 0));
+
+        s.apply(10, asked());
+        s.apply(11, answered());
+        let outcome = StageOutcome::Succeeded;
+        s.apply(12, TaskEvent::StageExited { stage: "impl".into(), outcome, summary: None, session: None });
+        assert_eq!((&s.paused, s.dialogue.len()), (&None, 1));
     }
 
     #[test]
