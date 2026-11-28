@@ -8,6 +8,7 @@ mod bench;
 pub mod commands;
 pub mod dto;
 mod live;
+pub mod system;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
@@ -47,6 +48,8 @@ pub struct AppState {
     pub bench_dir: PathBuf,
     /// Login settings (`wh serve --auth`); disabled by default.
     pub auth: auth::AuthConfig,
+    /// Update + restart from the UI (local `wh serve` only).
+    pub self_update: system::SelfUpdate,
 }
 
 impl AppState {
@@ -87,6 +90,9 @@ pub fn api(state: AppState) -> Router {
         .route("/stats", get(stats))
         .route("/dashboard", get(dashboard))
         .route("/factory", get(factory))
+        .route("/system", get(get_system))
+        .route("/system/update/check", post(check_update))
+        .route("/system/update", post(start_update))
         .route("/events", get(list_events))
         .route("/events/stream", get(stream_events))
         .route_layer(from_fn_with_state(state.clone(), auth::require_user));
@@ -99,13 +105,29 @@ pub fn app(state: AppState, web_dir: Option<PathBuf>) -> Router {
     let router = match web_dir {
         Some(dir) => {
             let index = dir.join("index.html");
-            router.fallback_service(tower_http::services::ServeDir::new(dir).fallback(
-                tower_http::services::ServeFile::new(index),
-            ))
+            router
+                .fallback_service(
+                    tower_http::services::ServeDir::new(dir).fallback(tower_http::services::ServeFile::new(index)),
+                )
+                .layer(axum::middleware::from_fn(web_cache))
         }
         None => router,
     };
     router.layer(tower_http::trace::TraceLayer::new_for_http())
+}
+
+/// Browsers must revalidate index.html (and SPA routes) on every load, or a tab
+/// keeps running the old bundle after an upgrade. Vite's hashed `/assets/*` files
+/// never change, so those may be cached for good.
+async fn web_cache(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    use axum::http::header::{CACHE_CONTROL, HeaderValue};
+    let path = req.uri().path().to_owned();
+    let mut res = next.run(req).await;
+    if !path.starts_with("/api/") && !res.headers().contains_key(CACHE_CONTROL) {
+        let policy = if path.starts_with("/assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
+        res.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static(policy));
+    }
+    res
 }
 
 /// Serve until `shutdown` resolves.
@@ -592,6 +614,86 @@ async fn dashboard(State(s): State<AppState>, Query(q): Query<DaysQuery>) -> Api
 
 async fn factory(State(s): State<AppState>) -> ApiResult<Option<FactoryDto>> {
     Ok(Json(s.factory.as_deref().map(FactoryDto::from)))
+}
+
+// ---------- system (self-update) ----------
+
+#[derive(Serialize)]
+struct SystemDto {
+    /// New on every server start; the UI reloads when it changes.
+    boot_id: String,
+    version: &'static str,
+    /// Commit the server was started at (self-update only).
+    commit: Option<String>,
+    self_update: SelfUpdateDto,
+    job: Option<system::Job>,
+    /// Stage runs in flight (what a restart waits for).
+    busy: usize,
+}
+
+#[derive(Serialize)]
+struct SelfUpdateDto {
+    enabled: bool,
+    reason: Option<String>,
+    branch: Option<String>,
+    repo: Option<String>,
+}
+
+async fn get_system(State(s): State<AppState>) -> ApiResult<SystemDto> {
+    let boot_id = system::BOOT_ID.clone();
+    let version = env!("CARGO_PKG_VERSION");
+    Ok(Json(match &s.self_update {
+        system::SelfUpdate::Enabled(u) => SystemDto {
+            boot_id,
+            version,
+            commit: Some(u.started_commit.clone()),
+            self_update: SelfUpdateDto {
+                enabled: true,
+                reason: None,
+                branch: Some(u.branch().into()),
+                repo: Some(u.repo().display().to_string()),
+            },
+            job: u.job(),
+            busy: u.busy(),
+        },
+        system::SelfUpdate::Disabled(why) => SystemDto {
+            boot_id,
+            version,
+            commit: None,
+            self_update: SelfUpdateDto { enabled: false, reason: Some(why.clone()), branch: None, repo: None },
+            job: None,
+            busy: 0,
+        },
+    }))
+}
+
+fn updater(s: &AppState) -> Result<&Arc<system::Updater>, ApiError> {
+    match &s.self_update {
+        system::SelfUpdate::Enabled(u) => Ok(u),
+        system::SelfUpdate::Disabled(why) => Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, why.clone())),
+    }
+}
+
+async fn check_update(State(s): State<AppState>) -> ApiResult<system::UpdateCheck> {
+    let u = updater(&s)?;
+    u.check().await.map(Json).map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))
+}
+
+#[derive(Deserialize, Default)]
+struct UpdateBody {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn start_update(State(s): State<AppState>, body: axum::body::Bytes) -> ApiResult<Value> {
+    let u = updater(&s)?;
+    let body: UpdateBody = if body.is_empty() {
+        UpdateBody::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?
+    };
+    u.start(body.force).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok(Json(serde_json::json!({ "message": "update started" })))
 }
 
 // ---------- events ----------

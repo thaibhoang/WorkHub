@@ -165,6 +165,10 @@ enum Cmd {
         /// Built UI to serve at / (skipped if missing)
         #[arg(long, env = "WH_WEB_DIR", default_value = "web/dist")]
         web_dir: PathBuf,
+        /// Do not offer "Update & restart" in the UI (it is offered without --auth when
+        /// the running binary was built in the current directory's git checkout)
+        #[arg(long, env = "WH_NO_SELF_UPDATE", value_parser = clap::builder::BoolishValueParser::new())]
+        no_self_update: bool,
         /// Require a login (users from `wh user add`); needed to bind a non-loopback address
         #[arg(long, env = "WH_AUTH", value_parser = clap::builder::BoolishValueParser::new())]
         auth: bool,
@@ -738,7 +742,7 @@ async fn main() -> Result<()> {
             let bench = run_bench_worker(&store, claude_bin.clone(), !no_bench);
             let gh = run_github(&store, f.clone(), gh_bin.clone(), !no_github);
             let (a, b, c, d, e, g) = tokio::join!(
-                run_foreman(&store, f, max_parallel, claude_bin, gh_bin),
+                run_foreman(&store, f, max_parallel, claude_bin, gh_bin, None),
                 run_projections(&store),
                 scorer,
                 improver,
@@ -922,6 +926,7 @@ async fn main() -> Result<()> {
             gh_bin,
             bench_dir,
             web_dir,
+            no_self_update,
             auth,
             public_url,
             trust_proxy,
@@ -948,12 +953,24 @@ async fn main() -> Result<()> {
                 Some(d) => println!("serving UI from {}", d.display()),
                 None => println!("no built UI found (run `npm run build` in web/); API only"),
             }
+            let drain = wh_core::Drain::new();
+            let self_update = if auth {
+                wh_api::system::SelfUpdate::Disabled("not offered with --auth (production updates with deploy/deploy.sh)".into())
+            } else if no_self_update {
+                wh_api::system::SelfUpdate::Disabled("disabled with --no-self-update".into())
+            } else {
+                match wh_api::system::Updater::detect(std::path::Path::new("."), "origin", "main", drain.clone()) {
+                    Ok(u) => wh_api::system::SelfUpdate::Enabled(std::sync::Arc::new(u)),
+                    Err(why) => wh_api::system::SelfUpdate::Disabled(why),
+                }
+            };
             let state = wh_api::AppState {
                 store: store.clone(),
                 factory: f.clone().map(std::sync::Arc::new),
                 live: wh_api::Live::start(store.clone()).await?,
                 bench_dir: std::fs::canonicalize(&bench_dir).unwrap_or(bench_dir),
                 auth: wh_api::auth::AuthConfig::new(auth, public_url, trust_proxy),
+                self_update,
             };
             println!("WorkHub on http://{addr}  (Ctrl+C to stop)");
             let api = wh_api::serve(addr, state, web_dir, ctrl_c());
@@ -966,7 +983,7 @@ async fn main() -> Result<()> {
                         let bench = run_bench_worker(&store, claude_bin.clone(), !no_bench);
                         let gh = run_github(&store, f.clone(), gh_bin.clone(), !no_github);
                         let (a, b, c, d, e) = tokio::join!(
-                            run_foreman(&store, f, max_parallel, claude_bin, gh_bin),
+                            run_foreman(&store, f, max_parallel, claude_bin, gh_bin, Some(drain)),
                             scorer,
                             improver,
                             bench,
@@ -1082,7 +1099,14 @@ pub(crate) async fn ctrl_c() {
 }
 
 /// Foreman daemon until Ctrl+C (recovers interrupted stages first).
-async fn run_foreman(store: &EventStore, f: Factory, max_parallel: usize, claude_bin: PathBuf, gh_bin: PathBuf) -> Result<()> {
+async fn run_foreman(
+    store: &EventStore,
+    f: Factory,
+    max_parallel: usize,
+    claude_bin: PathBuf,
+    gh_bin: PathBuf,
+    drain: Option<std::sync::Arc<wh_core::Drain>>,
+) -> Result<()> {
     let runner = Runner::new(store.clone(), ClaudeCode::new(claude_bin), RunnerConfig { data_dir: data_dir() });
     let dispatch = Dispatch::Spawn(std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel)));
     let cleanup = cleanup_config(&f)?;
@@ -1090,6 +1114,9 @@ async fn run_foreman(store: &EventStore, f: Factory, max_parallel: usize, claude
     let mut foreman = Foreman::new(store.clone(), f, runner, dispatch).with_gh(wh_github::Gh::new(gh_bin));
     if cleanup.is_some() {
         foreman = foreman.with_janitor(wake.clone());
+    }
+    if let Some(d) = drain {
+        foreman = foreman.with_drain(d);
     }
     for task in foreman.recover_interrupted().await? {
         println!("task {task} was interrupted mid-stage → blocked. Restart it with: wh task resume {task}");

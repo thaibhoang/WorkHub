@@ -2,6 +2,7 @@
 //! and the domain events themselves. No I/O lives here.
 
 pub mod benchmark;
+pub mod drain;
 pub mod event;
 pub mod failure;
 pub mod ids;
@@ -12,6 +13,7 @@ pub mod score;
 pub mod session;
 pub mod task;
 
+pub use drain::{Drain, DrainGuard};
 pub use event::{Actor, DomainEvent, EventMeta, NewEvent, RecordedEvent};
 pub use failure::FailureClass;
 pub use sandbox::{DockerSandbox, Sandbox};
