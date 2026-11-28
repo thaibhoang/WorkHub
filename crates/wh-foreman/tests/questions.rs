@@ -25,11 +25,13 @@ struct Fake {
     asks: usize,
     /// Prompt of every implement turn, with whether it resumed a conversation.
     turns: Arc<Mutex<Vec<(String, bool)>>>,
+    /// Cancelled during the next implement turn, before it ends.
+    cancel: Arc<Mutex<Option<(EventStore, TaskId)>>>,
 }
 
 impl Fake {
     fn new(asks: usize) -> Self {
-        Self { asks, turns: Default::default() }
+        Self { asks, turns: Default::default(), cancel: Default::default() }
     }
 
     fn turns(&self) -> Vec<(String, bool)> {
@@ -51,6 +53,10 @@ impl AgentRuntime for Fake {
                 turns.len()
             };
             std::fs::write(req.workdir.join("impl.txt"), format!("turn {n}\n")).unwrap();
+            let cancel = self.cancel.lock().unwrap().take();
+            if let Some((store, task)) = cancel {
+                append(&store, task, TaskEvent::TaskCancelled { reason: "stop".into() }).await;
+            }
             if n <= self.asks { "QUESTION: {\"text\": \"Which?\", \"options\": [\"A\", \"B\"]}" } else { "implemented" }
         } else {
             "reviewed"
@@ -142,9 +148,7 @@ agents:
     }
 
     async fn append(&self, task: TaskId, ev: TaskEvent) {
-        let meta = EventMeta::new(task.0, Actor::Human { user: "tester".into() });
-        let events = vec![NewEvent::from_domain(&ev, meta).unwrap()];
-        self.store.append(&task.stream_id(), ExpectedVersion::Any, events).await.unwrap();
+        append(&self.store, task, ev).await;
     }
 
     async fn answer(&self, task: TaskId) -> Result<(), wh_api::commands::CommandError> {
@@ -165,6 +169,12 @@ agents:
         let branch = wh_core::task::task_branch(task);
         git(&self.dir.path().join("repo"), &["show", &format!("{branch}:impl.txt")])
     }
+}
+
+async fn append(store: &EventStore, task: TaskId, ev: TaskEvent) {
+    let meta = EventMeta::new(task.0, Actor::Human { user: "tester".into() });
+    let events = vec![NewEvent::from_domain(&ev, meta).unwrap()];
+    store.append(&task.stream_id(), ExpectedVersion::Any, events).await.unwrap();
 }
 
 fn waiting(state: &TaskState) -> bool {
@@ -192,6 +202,21 @@ async fn ask_answer_resume(pool: PgPool) {
     assert_eq!(turns.len(), 2);
     assert!(turns[1].1 && turns[1].0.contains("Which?\nAnswer: A"), "{}", turns[1].0);
     assert_eq!(env.committed(task), "turn 2");
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn question_of_a_cancelled_task_is_dropped(pool: PgPool) {
+    let env = Env::new(pool, 1);
+    let mut foreman = env.foreman();
+    let task = env.task(None).await;
+    *env.fake.cancel.lock().unwrap() = Some((env.store.clone(), task));
+
+    let state = foreman.drive(task).await.unwrap();
+    assert_eq!(state.status, TaskStatus::Cancelled);
+    assert_eq!(env.fake.turns().len(), 1);
+    for kind in ["AgentAsked", "UserAnswered", "StageResumed"] {
+        assert_eq!(env.count(task, kind).await, 0, "{kind}");
+    }
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
