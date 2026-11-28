@@ -41,13 +41,15 @@ pub struct TaskSummary {
     pub pr_rework_loops: i32,
     /// Parent task (tasks form a tree).
     pub parent_id: Option<Uuid>,
+    /// Gates and questions are decided by the autopilot agent.
+    pub autopilot: bool,
 }
 
 const TASK_SUMMARY_SQL: &str = "SELECT t.task_id, t.title, t.source, t.factory, t.status, t.current_stage, \
      t.rework_loops, t.gate_rejections, t.blocked_reason, t.created_at, t.updated_at, t.completed_at, \
      COALESCE(s.sessions, 0) AS sessions, COALESCE(s.cost_usd, 0) AS cost_usd, \
      t.benchmark_run, t.benchmark_case, t.external_ref, t.pr_url, t.pr_number, t.pr_state, t.shipped_at, \
-     t.first_review_at, t.merged_at, t.pr_reviews, t.changes_requested, t.ci_failures, t.pr_rework_loops, t.parent_id \
+     t.first_review_at, t.merged_at, t.pr_reviews, t.changes_requested, t.ci_failures, t.pr_rework_loops, t.parent_id, t.autopilot \
      FROM tasks_view t LEFT JOIN ( \
        SELECT task_id, count(*) AS sessions, sum(cost_usd) AS cost_usd FROM session_facts GROUP BY task_id \
      ) s ON s.task_id = t.task_id";

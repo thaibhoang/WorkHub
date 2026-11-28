@@ -134,6 +134,7 @@ export function RunsTable({ rows, page: pageProp, onPage }: { rows: TaskSummary[
                   <div className={cn('truncate text-xs text-muted-foreground', depth && 'pl-4')}>
                     <span className="font-mono">{shortId(t.task_id)}</span>
                     {t.factory ? ` · ${t.factory}` : ' · manual'}
+                    {t.autopilot ? <span className="text-info"> · autopilot</span> : null}
                     {t.external_ref ? ` · ${t.external_ref}` : null}
                     {t.blocked_reason ? <span className="text-fail"> · {firstLine(t.blocked_reason)}</span> : null}
                   </div>

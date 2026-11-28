@@ -247,6 +247,7 @@ async fn create_task(
         factory: factory.clone(),
         parent: b.parent,
         start: b.start,
+        autopilot: b.autopilot,
     };
     let task_id = commands::create_task(&s.store, user.actor(), t).await?;
     Ok((StatusCode::CREATED, Json(Created { task_id, factory })))
@@ -268,6 +269,15 @@ async fn get_task(State(s): State<AppState>, Path(id): Path<String>) -> ApiResul
         ancestors.push(row);
     }
     ancestors.reverse();
+    let mut autopilot = Vec::new();
+    if state.autopilot {
+        for e in events.iter().filter(|e| matches!(e.event_type.as_str(), "GateRequested" | "AgentAsked")) {
+            let stream = wh_core::AutopilotId::for_request(task, e.stream_version).stream_id();
+            if let Some(run) = AutopilotRunDto::from_events(&s.store.read_stream(&stream).await?) {
+                autopilot.push(run);
+            }
+        }
+    }
     Ok(Json(TaskDetail {
         task: queries::task(s.pool(), task.0).await?,
         state: TaskStateDto::from(&state),
@@ -276,6 +286,7 @@ async fn get_task(State(s): State<AppState>, Path(id): Path<String>) -> ApiResul
         events: events.iter().map(EventDto::from).collect(),
         sessions: queries::task_sessions(s.pool(), task.0).await?,
         scores: scores::scores(s.pool(), &scores::ScoreFilter { task: Some(task.0), ..Default::default() }, 500).await?,
+        autopilot,
     }))
 }
 
@@ -332,12 +343,12 @@ async fn start_task(
     } else {
         serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(format!("invalid body: {e}")))?
     };
-    let subtree = b.subtree;
-    let started = commands::activate(&s.store, user.actor(), parse_id(&id, "task")?, subtree).await?;
+    let started = commands::activate(&s.store, user.actor(), parse_id(&id, "task")?, b.subtree, b.autopilot).await?;
+    let mode = if b.autopilot { " on autopilot" } else { "" };
     Ok(ok(match started.len() {
         0 => "no draft tasks to start".to_owned(),
-        1 => "task started".to_owned(),
-        n => format!("{n} tasks started"),
+        1 => format!("task started{mode}"),
+        n => format!("{n} tasks started{mode}"),
     }))
 }
 

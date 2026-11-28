@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Check, ChevronRight, FolderTree, Play, Plus, X } from 'lucide-react'
+import { ArrowLeft, Bot, Check, ChevronRight, FolderTree, Play, Plus, X } from 'lucide-react'
 import { useState } from 'react'
 import { Link, useParams } from 'react-router'
 import { toast } from 'sonner'
@@ -35,6 +35,7 @@ import {
   shortId,
   subtreeIds,
   taskTree,
+  type AutopilotRun,
   type FactoryDef,
   type ScoreRow,
   type SessionDetail,
@@ -84,6 +85,7 @@ export default function RunDetail() {
         description={
           <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <TaskStatusBadge status={state.status} />
+            {state.autopilot ? <AutopilotBadge /> : null}
             <span className="font-mono">{shortId(id)}</span>
             <span>{task?.factory ?? 'manual task'}</span>
             <span className="tabular-nums">{fmtUsd(cost)} · {sessions.length} sessions</span>
@@ -123,6 +125,7 @@ export default function RunDetail() {
       {pipeline ? <PipelineStrip factory={pipeline} detail={data} /> : null}
       <ActionPanel key={id} id={id} detail={data} factory={pipeline} />
       <PrPanel detail={data} />
+      <AutopilotPanel runs={data.autopilot ?? []} />
       {task?.benchmark_run ? null : <Subtasks id={id} title={title} detail={data} />}
 
       <Tabs defaultValue="timeline" className="mt-6">
@@ -251,7 +254,13 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
   )
   const resume = useCommand(id, (_version: number) => api.resume(id, stage || undefined, comment || undefined), setSentAt)
   const reset = () => setComment('')
-  const start = useCommand(id, (subtree: boolean) => api.startTask(id, subtree))
+  const [autopilot, setAutopilot] = useState(false)
+  const start = useCommand(id, (subtree: boolean) => api.startTask(id, subtree, autopilot))
+  // The autopilot run for the request the task is waiting on (it decides by request version).
+  const requestVersion = [...detail.events].reverse().find((e) => e.type === 'GateRequested')?.stream_version
+  // Older servers do not send `autopilot`.
+  const pendingRun = (detail.autopilot ?? []).find((r) => r.request_version === requestVersion)
+  const autopilotNote = state.autopilot ? <AutopilotNote run={pendingRun} what="gate" /> : null
 
   if (state.status === 'awaiting_gate') {
     const output =
@@ -282,6 +291,7 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-4">
+          {autopilotNote}
           {output?.summary ? <Summary text={output.summary} /> : null}
           {state.gate_decided ? (
             <p className="text-sm text-muted-foreground">Decision recorded, waiting for the foreman.</p>
@@ -325,15 +335,35 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
               : 'Nothing runs until you start it.'}
           </CardDescription>
         </CardHeader>
-        <CardContent className="flex flex-wrap gap-2">
-          <Button onClick={() => start.mutate(false)} disabled={start.isPending}>
-            <Play /> Start
-          </Button>
-          {draftKids ? (
-            <Button variant="outline" onClick={() => start.mutate(true)} disabled={start.isPending}>
-              <Play /> Start with subtasks
-            </Button>
+        <CardContent className="grid gap-3">
+          {factory ? (
+            <label className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="mt-0.5 size-4 accent-primary"
+                checked={autopilot}
+                onChange={(e) => setAutopilot(e.target.checked)}
+              />
+              <span>
+                <span className="font-medium">Autopilot</span>
+                <span className="text-muted-foreground">
+                  {' '}
+                  — an independent agent approves or rejects gates and answers the agents' questions for you, so the
+                  task runs without waiting on a human. Blocked tasks still need you.
+                </span>
+              </span>
+            </label>
           ) : null}
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={() => start.mutate(false)} disabled={start.isPending}>
+              {autopilot ? <Bot /> : <Play />} {autopilot ? 'Start on autopilot' : 'Start'}
+            </Button>
+            {draftKids ? (
+              <Button variant="outline" onClick={() => start.mutate(true)} disabled={start.isPending}>
+                <Play /> Start with subtasks{autopilot ? ' on autopilot' : ''}
+              </Button>
+            ) : null}
+          </div>
         </CardContent>
       </Card>
     )
@@ -382,6 +412,107 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
     )
   }
   return null
+}
+
+function AutopilotBadge() {
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-md border border-info/50 px-1.5 py-0.5 text-xs text-info"
+      title="Gates and agent questions are decided by the autopilot agent"
+    >
+      <Bot className="size-3.5" /> autopilot
+    </span>
+  )
+}
+
+/** What the autopilot is doing about the request the task waits on. */
+function AutopilotNote({ run, what }: { run: AutopilotRun | undefined; what: string }) {
+  if (run?.status === 'failed') {
+    return (
+      <p className="rounded-md border border-fail/40 p-2 text-sm">
+        <Bot className="mr-1 inline size-4 text-fail" />
+        The autopilot could not decide this {what}: <span className="text-muted-foreground">{run.message}</span>. Decide
+        it yourself below.
+      </p>
+    )
+  }
+  return (
+    <p className="rounded-md border border-info/40 p-2 text-sm text-muted-foreground">
+      <Bot className="mr-1 inline size-4 text-info" />
+      {run?.status === 'running' ? 'The autopilot is deciding this' : 'Waiting for the autopilot to decide this'} {what}.
+      You can still decide it yourself; whichever decision comes first counts.
+    </p>
+  )
+}
+
+/** Every decision the autopilot made for this task, with its reasons and cost. */
+function AutopilotPanel({ runs }: { runs: AutopilotRun[] }) {
+  if (!runs.length) return null
+  const cost = runs.reduce((a, r) => a + r.cost_usd, 0)
+  return (
+    <Card className="mt-4">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Bot className="size-5" /> Autopilot decisions
+        </CardTitle>
+        <CardDescription className="tabular-nums">
+          {runs.length} decision{runs.length > 1 ? 's' : ''} · {fmtUsd(cost)}
+          {runs[0]?.model ? <span className="ml-2 font-mono">{runs[0].model}</span> : null}
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <ul className="grid gap-3 text-sm">
+          {runs.map((r) => {
+            const tone =
+              r.status === 'failed'
+                ? 'text-fail'
+                : r.decision === 'reject'
+                  ? 'text-warn'
+                  : r.status === 'running'
+                    ? 'text-info'
+                    : 'text-ok'
+            const label =
+              r.status === 'failed'
+                ? 'could not decide (left to a human)'
+                : r.status === 'running'
+                  ? 'deciding…'
+                  : r.decision === 'answered'
+                    ? 'answered'
+                    : r.decision === 'reject'
+                      ? 'rejected'
+                      : 'approved'
+            return (
+              <li key={r.request_version} className="grid gap-1">
+                <div className="flex flex-wrap items-baseline gap-x-2">
+                  <span className="w-16 shrink-0 text-xs tabular-nums text-muted-foreground">{fmtTime(r.started_at)}</span>
+                  <span>
+                    {r.kind === 'gate' ? (
+                      <>
+                        Gate <span className="font-mono">{r.gate}</span> after <span className="font-mono">{r.stage}</span>
+                      </>
+                    ) : (
+                      <>
+                        Questions from <span className="font-mono">{r.stage}</span>
+                      </>
+                    )}
+                    : <span className={tone}>{label}</span>
+                  </span>
+                  <span className="text-xs tabular-nums text-muted-foreground">{fmtUsd(r.cost_usd)}</span>
+                </div>
+                {r.rationale || r.detail || r.message ? (
+                  <div className="ml-18 grid gap-1 text-muted-foreground">
+                    {r.detail ? <p className="whitespace-pre-wrap text-foreground">{r.detail}</p> : null}
+                    {r.rationale ? <p className="italic">{r.rationale}</p> : null}
+                    {r.message ? <p className="text-fail">{r.message}</p> : null}
+                  </div>
+                ) : null}
+              </li>
+            )
+          })}
+        </ul>
+      </CardContent>
+    </Card>
+  )
 }
 
 /** The task's pull request: what humans and CI said, and the PR rework loop. */

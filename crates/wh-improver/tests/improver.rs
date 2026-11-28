@@ -135,6 +135,7 @@ async fn session(store: &EventStore, f: &Factory, stage: &str, failed: bool, rej
         external_ref: None,
         parent: None,
         draft: false,
+        autopilot: false,
     };
     append(store, &task.stream_id(), task.0, v, created).await;
     let dispatched = SessionEvent::AgentDispatched {

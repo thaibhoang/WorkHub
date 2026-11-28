@@ -24,12 +24,13 @@ export function NewTaskDialog({ parent, trigger }: { parent?: { id: string; titl
   const [title, setTitle] = useState('')
   const [body, setBody] = useState('')
   const [start, setStart] = useState(false)
+  const [autopilot, setAutopilot] = useState(false)
   const qc = useQueryClient()
   const navigate = useNavigate()
   const { data: factory } = useQuery({ queryKey: ['factory'], queryFn: api.factory, staleTime: Infinity })
 
   const create = useMutation({
-    mutationFn: () => api.createTask({ title, body: body || undefined, parent: parent?.id, start }),
+    mutationFn: () => api.createTask({ title, body: body || undefined, parent: parent?.id, start, autopilot: start && autopilot }),
     onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ['tasks'] })
       if (parent) qc.invalidateQueries({ queryKey: ['task', parent.id] })
@@ -37,8 +38,13 @@ export function NewTaskDialog({ parent, trigger }: { parent?: { id: string; titl
       setTitle('')
       setBody('')
       setStart(false)
+      setAutopilot(false)
       toast.success(
-        !r.factory ? 'Task created (no pipeline)' : start ? `Task queued for ${r.factory}` : 'Draft created; start it when you are ready',
+        !r.factory
+          ? 'Task created (no pipeline)'
+          : start
+            ? `Task queued for ${r.factory}${autopilot ? ' on autopilot' : ''}`
+            : 'Draft created; start it when you are ready',
       )
       navigate(`/runs/${r.task_id}`)
     },
@@ -90,9 +96,24 @@ export function NewTaskDialog({ parent, trigger }: { parent?: { id: string; titl
             <input type="checkbox" className="size-4 accent-primary" checked={start} onChange={(e) => setStart(e.target.checked)} />
             Start right away (otherwise it stays a draft until you start it)
           </label>
+          {factory ? (
+            <label className={`flex items-start gap-2 text-sm ${start ? '' : 'opacity-50'}`}>
+              <input
+                type="checkbox"
+                className="mt-0.5 size-4 accent-primary"
+                checked={start && autopilot}
+                disabled={!start}
+                onChange={(e) => setAutopilot(e.target.checked)}
+              />
+              <span>
+                Autopilot: an independent agent decides gates and answers the agents' questions instead of you
+                {start ? '' : ' (chosen when the task starts)'}
+              </span>
+            </label>
+          ) : null}
           <DialogFooter>
             <Button type="submit" disabled={!title.trim() || create.isPending}>
-              {create.isPending ? 'Creating…' : start ? 'Create and start' : 'Create draft'}
+              {create.isPending ? 'Creating…' : start ? (autopilot ? 'Create and start on autopilot' : 'Create and start') : 'Create draft'}
             </Button>
           </DialogFooter>
         </form>

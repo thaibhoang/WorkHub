@@ -38,6 +38,7 @@ async fn task(store: &EventStore, last: Option<TaskEvent>) -> TaskId {
         external_ref: None,
         parent: None,
         draft: false,
+        autopilot: false,
     };
     append(store, &t.stream_id(), t, created).await;
     if let Some(ev) = last {

@@ -8,6 +8,7 @@ use std::{
 
 use sqlx::PgPool;
 use tokio::sync::mpsc::UnboundedSender;
+use wh_autopilot::{AutopilotService, Handled};
 use wh_core::{
     AUTO_ANSWER_USER, Actor, Answer, BenchmarkRunId, EventMeta, NewEvent, RecordedEvent, TaskId,
     benchmark::BenchmarkContext,
@@ -46,7 +47,10 @@ impl AgentRuntime for Fake {
     async fn run(&self, req: &AgentRequest, tx: UnboundedSender<Signal>) -> Outcome {
         tx.send(Signal::Ready { runtime_session_id: Some("conversation".into()), model: None }).unwrap();
         let resumed = matches!(req.session, SessionMode::Resume(_));
-        let summary = if resumed || req.prompt.starts_with("ROLE: implement") {
+        // The autopilot's own turn (no tools): it answers the pending question.
+        let summary = if req.tools.as_ref().is_some_and(Vec::is_empty) {
+            r#"{"answers": [{"option": "B"}], "rationale": "simpler"}"#
+        } else if resumed || req.prompt.starts_with("ROLE: implement") {
             let n = {
                 let mut turns = self.turns.lock().unwrap();
                 turns.push((req.prompt.clone(), resumed));
@@ -132,6 +136,10 @@ agents:
     }
 
     async fn task(&self, benchmark: Option<BenchmarkContext>) -> TaskId {
+        self.create(benchmark, false).await
+    }
+
+    async fn create(&self, benchmark: Option<BenchmarkContext>, autopilot: bool) -> TaskId {
         let task = TaskId::new();
         let created = TaskEvent::TaskCreated {
             title: "t".into(),
@@ -142,6 +150,7 @@ agents:
             external_ref: None,
             parent: None,
             draft: false,
+            autopilot,
         };
         self.append(task, created).await;
         task
@@ -201,6 +210,27 @@ async fn ask_answer_resume(pool: PgPool) {
     let turns = env.fake.turns();
     assert_eq!(turns.len(), 2);
     assert!(turns[1].1 && turns[1].0.contains("Which?\nAnswer: A"), "{}", turns[1].0);
+    assert_eq!(env.committed(task), "turn 2");
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn autopilot_answers_then_resume(pool: PgPool) {
+    let env = Env::new(pool, 1);
+    let mut foreman = env.foreman();
+    let task = env.create(None, true).await;
+    assert!(waiting(&foreman.drive(task).await.unwrap()));
+
+    let data = env.dir.path().join("data");
+    let dispatch = wh_autopilot::Dispatch::Inline;
+    let autopilot = AutopilotService::new(env.store.clone(), env.factory(), env.fake.clone(), data, dispatch);
+    let handled = autopilot.decide_now(task).await.unwrap();
+    assert!(matches!(handled, Handled::Decided { .. }), "{handled:?}");
+
+    assert_eq!(foreman.drive(task).await.unwrap().status, TaskStatus::Done);
+    assert_eq!(env.count(task, "StageResumed").await, 1);
+    assert_eq!(env.count(task, "StageExited").await, 2);
+    let turns = env.fake.turns();
+    assert!(turns[1].1 && turns[1].0.contains("Which?\nAnswer: B"), "{}", turns[1].0);
     assert_eq!(env.committed(task), "turn 2");
 }
 

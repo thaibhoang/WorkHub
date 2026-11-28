@@ -21,7 +21,7 @@ Non-goals: lost-session fallback (4c), API/UI (5–6), agent prompts, `wh run` p
 2. Benchmarks get the same "decide yourself and record your assumptions" text on every question, within the same limit.
 3. Automatic answers: actor `System{foreman}` and `user = "foreman:auto"` (a `pub const AUTO_ANSWER_USER` in `wh-core`, for part 5 to exclude).
 4. **Verification gates enabling.** Pause is enabled only if the results above are in the gate comment or the implementer can run them. Otherwise everything is built with `const PAUSE_ENABLED: bool = false`, tests opt in with `Foreman::with_pause(true)`, and the summary and §5.3 say it is unverified and off.
-5. Autopilot (PR #21) is not merged (no `wh-autopilot` crate): the end-to-end test answers as a human only.
+5. Autopilot (PR #21) was not merged when this was written, so the end-to-end test answered as a human only. It merged before this branch did; `questions.rs` now also covers an autopilot answer.
 6. The 4b-1 guards are present (`Runner::discard` in `run_stage`; `recover_interrupted` treats `StageResumed` as running).
 7. A restart after `StageResumed` but before the turn ends (including while waiting for a parallel slot) blocks the task, as 4b-1 does.
 

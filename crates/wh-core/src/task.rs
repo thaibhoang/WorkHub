@@ -16,6 +16,9 @@ pub const SHIP_STAGE: &str = "ship";
 /// conflicts with its base branch.
 pub const CONFLICT_STAGE: &str = "conflict";
 
+/// Reviewer / user recorded on the gate decisions and answers the autopilot makes.
+pub const AUTOPILOT_REVIEWER: &str = "autopilot";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskSource {
@@ -64,9 +67,17 @@ pub enum TaskEvent {
         /// (false) start right away.
         #[serde(default)]
         draft: bool,
+        /// Started in autopilot mode (only with `draft: false`): gates and agent
+        /// questions are decided by the autopilot agent instead of a human.
+        #[serde(default)]
+        autopilot: bool,
     },
     /// A human started a draft task; the foreman runs its first stage.
-    TaskActivated {},
+    TaskActivated {
+        /// Run in autopilot mode (see `TaskCreated.autopilot`).
+        #[serde(default)]
+        autopilot: bool,
+    },
     /// The task was moved under another parent (None = top level). The command
     /// refuses a move that would make a task its own ancestor.
     TaskMoved {
@@ -412,6 +423,8 @@ pub struct TaskState {
     pub factory: Option<String>,
     pub benchmark: Option<BenchmarkContext>,
     pub parent: Option<TaskId>,
+    /// Gates and questions are decided by the autopilot agent (set when started).
+    pub autopilot: bool,
     pub status: TaskStatus,
     /// The current gate already has a decision (only meaningful while `AwaitingGate`):
     /// the status stays until the foreman acts on it.
@@ -458,7 +471,8 @@ impl TaskState {
     pub fn apply(&mut self, version: i64, ev: TaskEvent) {
         self.version = version;
         match &ev {
-            TaskEvent::TaskCreated { title, body, factory, benchmark, external_ref, parent, draft, .. } => {
+            TaskEvent::TaskCreated { title, body, factory, benchmark, external_ref, parent, draft, autopilot, .. } => {
+                self.autopilot = *autopilot;
                 self.title = title.clone();
                 self.body = body.clone();
                 self.factory = factory.clone();
@@ -467,7 +481,10 @@ impl TaskState {
                 self.parent = *parent;
                 self.status = if *draft { TaskStatus::Draft } else { TaskStatus::Open };
             }
-            TaskEvent::TaskActivated {} => self.status = TaskStatus::Open,
+            TaskEvent::TaskActivated { autopilot } => {
+                self.autopilot = *autopilot;
+                self.status = TaskStatus::Open;
+            }
             TaskEvent::TaskMoved { parent } => {
                 self.parent = *parent;
                 return;
@@ -667,7 +684,7 @@ mod tests {
     #[test]
     fn fold_tracks_status_and_rework() {
         let s = TaskState::fold([
-            (1, TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("f".into()), benchmark: None, external_ref: None, parent: None, draft: false }),
+            (1, TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("f".into()), benchmark: None, external_ref: None, parent: None, draft: false, autopilot: false }),
             (2, TaskEvent::StageEntered { stage: "impl".into(), feedback: None }),
             (3, TaskEvent::StageExited { stage: "impl".into(), outcome: StageOutcome::Succeeded, summary: None, session: None }),
             (4, TaskEvent::StageEntered { stage: "impl".into(), feedback: Some("fix".into()) }),
@@ -764,6 +781,7 @@ mod tests {
             external_ref: None,
             parent: None,
             draft,
+            autopilot: false,
         };
         let parent = TaskId::new();
         let mut s = TaskState::fold([(1, created(true))]);
@@ -771,13 +789,36 @@ mod tests {
         s.apply(2, TaskEvent::TaskMoved { parent: Some(parent) });
         assert_eq!((s.version, s.parent, s.status.clone()), (2, Some(parent), TaskStatus::Draft));
         assert!(matches!(s.last, Some(TaskEvent::TaskCreated { draft: true, .. })));
-        s.apply(3, TaskEvent::TaskActivated {});
+        s.apply(3, TaskEvent::TaskActivated { autopilot: false });
         assert_eq!(s.status, TaskStatus::Open);
         assert_eq!(TaskState::fold([(1, created(false))]).status, TaskStatus::Open);
 
         // Events written before drafts existed start right away.
         let v = serde_json::json!({"type": "TaskCreated", "title": "t", "body": null, "source": "cli"});
         assert!(matches!(serde_json::from_value(v).unwrap(), TaskEvent::TaskCreated { draft: false, parent: None, .. }));
+    }
+
+    #[test]
+    fn autopilot_is_chosen_at_start() {
+        let created = |draft, autopilot| TaskEvent::TaskCreated {
+            title: "t".into(),
+            body: None,
+            source: TaskSource::Cli,
+            factory: None,
+            benchmark: None,
+            external_ref: None,
+            parent: None,
+            draft,
+            autopilot,
+        };
+        assert!(TaskState::fold([(1, created(false, true))]).autopilot);
+        let mut s = TaskState::fold([(1, created(true, false))]);
+        assert!(!s.autopilot);
+        s.apply(2, TaskEvent::TaskActivated { autopilot: true });
+        assert!(s.autopilot);
+        // Events written before autopilot existed decode as manual.
+        let v = serde_json::json!({"type": "TaskActivated"});
+        assert_eq!(serde_json::from_value::<TaskEvent>(v).unwrap(), TaskEvent::TaskActivated { autopilot: false });
     }
 
     #[test]

@@ -65,6 +65,8 @@ pub struct TaskStateDto {
     pub external_ref: Option<ExternalRefDto>,
     /// Parent task (tasks form a tree).
     pub parent: Option<TaskId>,
+    /// Gates and questions are decided by the autopilot agent.
+    pub autopilot: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,6 +126,7 @@ impl From<&TaskState> for TaskStateDto {
             }),
             pr_rework_loops: s.pr_rework_loops,
             parent: s.parent,
+            autopilot: s.autopilot,
             external_ref: s
                 .external_ref
                 .as_ref()
@@ -144,6 +147,72 @@ pub struct TaskDetail {
     pub events: Vec<EventDto>,
     pub sessions: Vec<SessionDetail>,
     pub scores: Vec<ScoreRow>,
+    /// What the autopilot decided for this task (autopilot tasks only), oldest first.
+    pub autopilot: Vec<AutopilotRunDto>,
+}
+
+/// One gate decision / question set handled by the autopilot (`autopilot-<id>` stream).
+#[derive(Debug, Clone, Serialize)]
+pub struct AutopilotRunDto {
+    /// Task stream version of the `GateRequested` / `AgentAsked` it handled.
+    pub request_version: i64,
+    /// `gate` | `questions`
+    pub kind: &'static str,
+    pub stage: String,
+    pub gate: Option<String>,
+    pub model: Option<String>,
+    /// `running` | `decided` | `failed` (failed = left to a human)
+    pub status: &'static str,
+    /// `approve` | `reject` | `answered`
+    pub decision: Option<String>,
+    /// Comment for the agent, or the answers.
+    pub detail: Option<String>,
+    pub rationale: Option<String>,
+    /// Why it could not decide.
+    pub message: Option<String>,
+    pub cost_usd: f64,
+    pub started_at: DateTime<Utc>,
+}
+
+impl AutopilotRunDto {
+    /// From the events of one `autopilot-<id>` stream (None if it has no start).
+    pub fn from_events(events: &[RecordedEvent]) -> Option<Self> {
+        use wh_core::autopilot::AutopilotEvent as E;
+        let first = events.first()?;
+        let E::AutopilotStarted { kind, stage, gate, request_version, model, .. } = first.decode().ok()? else {
+            return None;
+        };
+        let mut dto = Self {
+            request_version,
+            kind: kind.as_str(),
+            stage,
+            gate,
+            model,
+            status: "running",
+            decision: None,
+            detail: None,
+            rationale: None,
+            message: None,
+            cost_usd: 0.0,
+            started_at: first.meta.occurred_at,
+        };
+        match events.get(1).and_then(|e| e.decode().ok()) {
+            Some(E::AutopilotDecided { decision, detail, rationale, cost_usd, .. }) => {
+                dto.status = "decided";
+                dto.decision = Some(decision);
+                dto.detail = Some(detail).filter(|d| !d.is_empty());
+                dto.rationale = Some(rationale).filter(|r| !r.is_empty());
+                dto.cost_usd = cost_usd;
+            }
+            Some(E::AutopilotFailed { message, cost_usd, .. }) => {
+                dto.status = "failed";
+                dto.message = Some(message);
+                dto.cost_usd = cost_usd;
+            }
+            _ => {}
+        }
+        Some(dto)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -358,6 +427,9 @@ pub struct CreateTaskBody {
     /// Start it right away (default: a draft that waits for `/start`).
     #[serde(default)]
     pub start: bool,
+    /// Start in autopilot mode (needs `start`).
+    #[serde(default)]
+    pub autopilot: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -365,6 +437,9 @@ pub struct StartBody {
     /// Also start every draft subtask below it.
     #[serde(default)]
     pub subtree: bool,
+    /// Run the started tasks in autopilot mode.
+    #[serde(default)]
+    pub autopilot: bool,
 }
 
 #[derive(Debug, Deserialize)]
