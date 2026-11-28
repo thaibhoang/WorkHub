@@ -43,6 +43,21 @@ pub fn parse_questions(text: &str) -> Vec<Question> {
     questions
 }
 
+/// The text handed back to the agent: each numbered question followed by its
+/// answer (`answers[i]` answers `questions[i]`). Pure.
+pub fn format_answers(questions: &[Question], answers: &[Answer]) -> String {
+    let blocks: Vec<_> = questions
+        .iter()
+        .zip(answers)
+        .enumerate()
+        .map(|(i, (q, a))| {
+            let reply: Vec<_> = [&a.option, &a.text].into_iter().flatten().map(String::as_str).collect();
+            format!("{}. {}\nAnswer: {}", i + 1, q.text, reply.join("\n"))
+        })
+        .collect();
+    blocks.join("\n\n")
+}
+
 /// The part after `QUESTION:`, without surrounding markdown.
 fn question_json(line: &str) -> Option<&str> {
     const PREFIX: &str = "QUESTION:";
@@ -58,6 +73,20 @@ mod tests {
 
     fn q(text: &str, options: &[&str]) -> Question {
         Question { text: text.into(), options: options.iter().map(|o| o.to_string()).collect() }
+    }
+
+    #[test]
+    fn question_answers_are_formatted_with_option_text_or_both() {
+        let questions = [q("Which?", &["A"]), q("Name?", &[]), q("Colour?", &["red"])];
+        let answer = |option: Option<&str>, text: Option<&str>| Answer {
+            option: option.map(Into::into),
+            text: text.map(Into::into),
+        };
+        let answers = [answer(Some("A"), None), answer(None, Some("wh")), answer(Some("red"), Some("dark"))];
+        assert_eq!(
+            format_answers(&questions, &answers),
+            "1. Which?\nAnswer: A\n\n2. Name?\nAnswer: wh\n\n3. Colour?\nAnswer: red\ndark"
+        );
     }
 
     #[test]

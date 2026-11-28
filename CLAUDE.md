@@ -41,6 +41,7 @@ cargo run --bin wh -- bench run <suite|file> [--ref R | --proposal P] [--repeat 
 cargo run --bin wh -- bench worker                                   # runs benchmarks queued from the UI/API
 cargo run --bin wh -- gate approve|reject <task> [--comment ...]
 cargo run --bin wh -- task show|resume|cancel <task>
+cargo run --bin wh -- task answer <task> [--option N] ["text"]       # answer an agent's questions (several: one value each)
 cargo run --bin wh -- task ship <task>                               # push + open/update the PR now (factory with `github:`)
 cargo run --bin wh -- github check | sync [--factory ...]             # gh/auth/remote/repo/base check | poll issues + PRs once
 cargo run --bin wh -- cleanup [--dry-run] [--grace-hours 24] [--cache-max-gb 30]   # free disk (the foreman also does it by itself)
