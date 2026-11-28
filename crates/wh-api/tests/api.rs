@@ -776,3 +776,27 @@ async fn password_change_logs_out_everywhere(pool: PgPool) {
         StatusCode::OK
     );
 }
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn the_ui_is_revalidated_but_hashed_assets_are_cached(pool: PgPool) {
+    let dir = std::env::temp_dir().join(format!("wh-web-{}", TaskId::new().0));
+    std::fs::create_dir_all(dir.join("assets")).unwrap();
+    std::fs::write(dir.join("index.html"), "<html></html>").unwrap();
+    std::fs::write(dir.join("assets/index-abc.js"), "1").unwrap();
+    let store = EventStore::new(pool.clone());
+    let state = AppState { store, factory: None, live: Live::detached(0), bench_dir: PathBuf::from("benchmarks"), auth: Default::default() };
+    let app = wh_api::app(state, Some(dir.clone()));
+    let cache = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let res = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{uri}");
+            res.headers().get("cache-control").map(|v| v.to_str().unwrap().to_owned())
+        }
+    };
+    assert_eq!(cache("/").await.as_deref(), Some("no-cache"));
+    assert_eq!(cache("/runs/123").await.as_deref(), Some("no-cache"));
+    assert_eq!(cache("/assets/index-abc.js").await.as_deref(), Some("public, max-age=31536000, immutable"));
+    assert_eq!(cache("/api/health").await, None);
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -99,13 +99,29 @@ pub fn app(state: AppState, web_dir: Option<PathBuf>) -> Router {
     let router = match web_dir {
         Some(dir) => {
             let index = dir.join("index.html");
-            router.fallback_service(tower_http::services::ServeDir::new(dir).fallback(
-                tower_http::services::ServeFile::new(index),
-            ))
+            router
+                .fallback_service(
+                    tower_http::services::ServeDir::new(dir).fallback(tower_http::services::ServeFile::new(index)),
+                )
+                .layer(axum::middleware::from_fn(web_cache))
         }
         None => router,
     };
     router.layer(tower_http::trace::TraceLayer::new_for_http())
+}
+
+/// Browsers must revalidate index.html (and SPA routes) on every load, or a tab
+/// keeps running the old bundle after an upgrade. Vite's hashed `/assets/*` files
+/// never change, so those may be cached for good.
+async fn web_cache(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    use axum::http::header::{CACHE_CONTROL, HeaderValue};
+    let path = req.uri().path().to_owned();
+    let mut res = next.run(req).await;
+    if !path.starts_with("/api/") && !res.headers().contains_key(CACHE_CONTROL) {
+        let policy = if path.starts_with("/assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
+        res.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static(policy));
+    }
+    res
 }
 
 /// Serve until `shutdown` resolves.
