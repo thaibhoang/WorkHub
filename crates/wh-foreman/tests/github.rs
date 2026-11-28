@@ -264,6 +264,8 @@ async fn ship_gate_then_failed_ship_blocks_and_resume_retries(pool: PgPool) {
         factory: Some("gh-test".into()),
         benchmark: None,
         external_ref: None,
+        parent: None,
+        draft: false,
     };
     let append = |ev: TaskEvent, v: ExpectedVersion| {
         let store = store.clone();
@@ -312,6 +314,8 @@ async fn conflicting_pr_is_gated_merged_resolved_and_pushed_to_the_same_pr(pool:
         factory: Some("gh-test".into()),
         benchmark: None,
         external_ref: None,
+        parent: None,
+        draft: false,
     };
     let meta = || EventMeta::new(task.0, Actor::Human { user: "tester".into() });
     store.append(&task.stream_id(), ExpectedVersion::NoStream, vec![NewEvent::from_domain(&created, meta()).unwrap()]).await.unwrap();
@@ -389,6 +393,8 @@ async fn shipped_task(store: &EventStore, env: &Env) -> (TaskId, String) {
         factory: Some("gh-test".into()),
         benchmark: None,
         external_ref: None,
+        parent: None,
+        draft: false,
     };
     let meta = EventMeta::new(task.0, Actor::Human { user: "tester".into() });
     store.append(&task.stream_id(), ExpectedVersion::NoStream, vec![NewEvent::from_domain(&created, meta).unwrap()]).await.unwrap();
@@ -448,6 +454,8 @@ async fn closed_pr_blocks_the_task(pool: PgPool) {
         factory: Some("gh-test".into()),
         benchmark: None,
         external_ref: None,
+        parent: None,
+        draft: false,
     };
     let meta = EventMeta::new(task.0, Actor::Human { user: "tester".into() });
     store.append(&task.stream_id(), ExpectedVersion::NoStream, vec![NewEvent::from_domain(&created, meta).unwrap()]).await.unwrap();

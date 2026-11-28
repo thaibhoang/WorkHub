@@ -2,6 +2,7 @@ import { cn } from '@/lib/utils'
 import type { PrState, SessionDetail, StageResult, TaskStatus } from '@/lib/api'
 
 const TASK: Record<TaskStatus, { label: string; dot: string; text: string }> = {
+  draft: { label: 'Draft', dot: 'border border-muted-foreground bg-transparent', text: 'text-muted-foreground' },
   open: { label: 'Queued', dot: 'bg-muted-foreground', text: 'text-muted-foreground' },
   running: { label: 'Running', dot: 'bg-info animate-pulse', text: 'text-info' },
   awaiting_gate: { label: 'Needs review', dot: 'bg-warn', text: 'text-warn' },

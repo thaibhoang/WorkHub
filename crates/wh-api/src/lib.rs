@@ -68,6 +68,8 @@ pub fn api(state: AppState) -> Router {
         .route("/tasks/{id}/gate", post(decide_gate))
         .route("/tasks/{id}/resume", post(resume_task))
         .route("/tasks/{id}/cancel", post(cancel_task))
+        .route("/tasks/{id}/start", post(start_task))
+        .route("/tasks/{id}/move", post(move_task))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{id}", get(get_session))
         .route("/sessions/{id}/transcript", get(get_transcript))
@@ -216,7 +218,14 @@ async fn create_task(
         }
         _ => None,
     };
-    let t = NewTask { title: b.title, body: b.body, source: TaskSource::Web, factory: factory.clone() };
+    let t = NewTask {
+        title: b.title,
+        body: b.body,
+        source: TaskSource::Web,
+        factory: factory.clone(),
+        parent: b.parent,
+        start: b.start,
+    };
     let task_id = commands::create_task(&s.store, user.actor(), t).await?;
     Ok((StatusCode::CREATED, Json(Created { task_id, factory })))
 }
@@ -225,9 +234,23 @@ async fn get_task(State(s): State<AppState>, Path(id): Path<String>) -> ApiResul
     let task: TaskId = parse_id(&id, "task")?;
     let state = commands::load_task(&s.store, task).await?;
     let events = s.store.read_stream(&task.stream_id()).await?;
+    let mut ancestors = Vec::new();
+    let mut up = state.parent;
+    while let Some(p) = up {
+        // Bounded: moves keep the tree acyclic, but never loop on a bad read model.
+        if ancestors.len() >= 64 {
+            break;
+        }
+        let Some(row) = queries::task(s.pool(), p.0).await? else { break };
+        up = row.parent_id.map(TaskId);
+        ancestors.push(row);
+    }
+    ancestors.reverse();
     Ok(Json(TaskDetail {
         task: queries::task(s.pool(), task.0).await?,
         state: TaskStateDto::from(&state),
+        children: queries::children(s.pool(), task.0).await?,
+        ancestors,
         events: events.iter().map(EventDto::from).collect(),
         sessions: queries::task_sessions(s.pool(), task.0).await?,
         scores: scores::scores(s.pool(), &scores::ScoreFilter { task: Some(task.0), ..Default::default() }, 500).await?,
@@ -273,6 +296,37 @@ async fn cancel_task(
 ) -> ApiResult<Ok_> {
     commands::cancel(&s.store, user.actor(), parse_id(&id, "task")?, b.reason).await?;
     Ok(ok("cancelled"))
+}
+
+async fn start_task(
+    State(s): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> ApiResult<Ok_> {
+    // The body is optional: no body (or `{}`) starts just this task.
+    let b: StartBody = if body.iter().all(u8::is_ascii_whitespace) {
+        StartBody::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(format!("invalid body: {e}")))?
+    };
+    let subtree = b.subtree;
+    let started = commands::activate(&s.store, user.actor(), parse_id(&id, "task")?, subtree).await?;
+    Ok(ok(match started.len() {
+        0 => "no draft tasks to start".to_owned(),
+        1 => "task started".to_owned(),
+        n => format!("{n} tasks started"),
+    }))
+}
+
+async fn move_task(
+    State(s): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(b): Json<MoveBody>,
+) -> ApiResult<Ok_> {
+    commands::move_task(&s.store, user.actor(), parse_id(&id, "task")?, b.parent).await?;
+    Ok(ok(if b.parent.is_some() { "task moved" } else { "task moved to the top level" }))
 }
 
 // ---------- sessions ----------

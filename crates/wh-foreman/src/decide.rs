@@ -22,7 +22,9 @@ pub fn decide(state: &TaskState, f: &Factory) -> Option<Action> {
         return None;
     }
     match state.last.as_ref()? {
-        TaskEvent::TaskCreated { .. } => Some(run(&f.first_stage().id, None)),
+        // A draft waits for a human to activate it.
+        TaskEvent::TaskCreated { draft: true, .. } => None,
+        TaskEvent::TaskCreated { .. } | TaskEvent::TaskActivated {} => Some(run(&f.first_stage().id, None)),
         TaskEvent::StageExited { stage, outcome, summary, .. } => {
             let Some(st) = f.stage(stage) else {
                 return Some(block(Some(stage), format!("stage '{stage}' is not in factory '{}'", f.name)));
@@ -106,7 +108,8 @@ pub fn decide(state: &TaskState, f: &Factory) -> Option<Action> {
         | TaskEvent::PrChecksCompleted { .. }
         | TaskEvent::PrConflicted { .. }
         | TaskEvent::PrMerged { .. }
-        | TaskEvent::PrClosed { .. } => None,
+        | TaskEvent::PrClosed { .. }
+        | TaskEvent::TaskMoved { .. } => None,
     }
 }
 
@@ -273,6 +276,33 @@ mod tests {
 
     fn blocks(a: Option<Action>, at: &str) {
         assert!(matches!(&a, Some(Action::Block { stage: Some(s), .. }) if s == at), "{a:?}");
+    }
+
+    #[test]
+    fn drafts_run_only_once_activated() {
+        use wh_core::{TaskId, task::TaskSource};
+        let f = factory("null");
+        let created = |draft| TaskEvent::TaskCreated {
+            title: "t".into(),
+            body: None,
+            source: TaskSource::Cli,
+            factory: Some("f".into()),
+            benchmark: None,
+            external_ref: None,
+            parent: None,
+            draft,
+        };
+        let moved = || TaskEvent::TaskMoved { parent: Some(TaskId::new()) };
+        let runs = |a: Option<Action>| matches!(a, Some(Action::RunStage { stage, feedback: None }) if stage == "impl");
+        assert_eq!(decide(&state(vec![created(true)]), &f), None);
+        assert_eq!(decide(&state(vec![created(true), moved()]), &f), None);
+        assert!(runs(decide(&state(vec![created(true), TaskEvent::TaskActivated {}]), &f)));
+        assert!(runs(decide(&state(vec![created(false)]), &f)));
+        // A move landing before the foreman acted must not swallow the start.
+        assert!(runs(decide(&state(vec![created(false), moved()]), &f)));
+        assert!(runs(decide(&state(vec![created(true), TaskEvent::TaskActivated {}, moved()]), &f)));
+        let entered = TaskEvent::StageEntered { stage: "impl".into(), feedback: None };
+        assert_eq!(decide(&state(vec![created(false), entered, moved()]), &f), None);
     }
 
     #[test]
