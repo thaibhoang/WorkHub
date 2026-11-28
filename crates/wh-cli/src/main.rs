@@ -219,7 +219,7 @@ enum Cmd {
     },
     /// List improvement proposals, newest first
     Proposals {
-        /// requested | running | open | no_proposal | failed | approved | rejected | rolled_out | inbox
+        /// requested | running | open | no_proposal | failed | approved | rejected | withdrawn | rolled_out | inbox
         #[arg(long)]
         status: Option<String>,
         #[arg(long, default_value_t = 20)]
@@ -411,6 +411,12 @@ enum ProposalCmd {
     },
     /// Cherry-pick an approved proposal onto the factory repo's current branch
     Apply { id: ProposalId },
+    /// Close an approved proposal without rolling it out (e.g. its repo is gone)
+    Withdraw {
+        id: ProposalId,
+        #[arg(long)]
+        comment: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -851,6 +857,10 @@ async fn main() -> Result<()> {
             ProposalCmd::Apply { id } => {
                 let v = wh_improver::commands::apply(&store, local_user(), id).await?;
                 println!("applied: factory version is now {v}; restart the foreman to use it");
+            }
+            ProposalCmd::Withdraw { id, comment } => {
+                wh_improver::commands::withdraw(&store, local_user(), id, comment).await?;
+                println!("withdrawn");
             }
         },
         Cmd::Versions { factory } => {
@@ -1309,7 +1319,7 @@ async fn show_proposal(store: &EventStore, id: ProposalId) -> Result<()> {
     }
     match p.status.as_str() {
         "open" => println!("\napprove: wh proposal approve {id} [--apply]   reject: wh proposal reject {id} --comment ..."),
-        "approved" => println!("\nroll out: wh proposal apply {id}"),
+        "approved" => println!("\nroll out: wh proposal apply {id}   or close it: wh proposal withdraw {id} --comment ..."),
         _ => {}
     }
     Ok(())

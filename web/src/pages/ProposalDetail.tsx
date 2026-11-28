@@ -64,7 +64,7 @@ export default function ProposalDetail() {
         ) : null}
         {p.rationale ? <Section title="Diagnosis and rationale">{p.rationale}</Section> : null}
         {p.expected_impact ? <Section title="Expected impact">{p.expected_impact}</Section> : null}
-        {p.decision_comment ? <Section title={`Reviewer (${p.decided_by})`}>{p.decision_comment}</Section> : null}
+        {p.decision_comment ? <Section title={`${p.status === 'withdrawn' ? 'Withdrawn' : 'Reviewer'} (${p.decided_by})`}>{p.decision_comment}</Section> : null}
         <Impact d={data} />
         {p.commit_sha ? <Benchmarks proposalId={p.proposal_id} /> : null}
         {data.evidence.length ? <Evidence d={data} /> : null}
@@ -96,7 +96,15 @@ function Actions({ p }: { p: ProposalRow }) {
     },
     onError: (e) => toast.error(e.message),
   })
-  const busy = decide.isPending || apply.isPending
+  const withdraw = useMutation({
+    mutationFn: () => api.withdrawProposal(p.proposal_id, comment),
+    onSuccess: (r) => {
+      done(r)
+      setComment('')
+    },
+    onError: (e) => toast.error(e.message),
+  })
+  const busy = decide.isPending || apply.isPending || withdraw.isPending
 
   if (p.status === 'open') {
     return (
@@ -134,12 +142,22 @@ function Actions({ p }: { p: ProposalRow }) {
           <CardDescription>
             Apply cherry-picks <code>{p.commit_sha?.slice(0, 10)}</code> onto the factory repo. If you merge <code>{p.branch}</code> by
             hand, the rollout is detected when the foreman starts with version <code>{p.proposed_factory_version?.slice(0, 7)}</code>.
+            If it cannot be applied (e.g. the factory repo is gone), withdraw it with a comment the improver will read.
           </CardDescription>
         </CardHeader>
-        <CardContent>
-          <Button onClick={() => apply.mutate()} disabled={busy}>
-            <GitMerge /> Apply now
-          </Button>
+        <CardContent className="grid gap-4">
+          <div className="grid gap-2">
+            <Label htmlFor="p-comment">Comment (required to withdraw)</Label>
+            <Textarea id="p-comment" rows={2} value={comment} onChange={(e) => setComment(e.target.value)} />
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={() => apply.mutate()} disabled={busy}>
+              <GitMerge /> Apply now
+            </Button>
+            <Button variant="outline" onClick={() => withdraw.mutate()} disabled={busy || !comment.trim()}>
+              <X /> Withdraw
+            </Button>
+          </div>
         </CardContent>
       </Card>
     )

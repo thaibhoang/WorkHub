@@ -566,6 +566,8 @@ async fn proposals_request_review_and_improvement_overview(pool: PgPool) {
     assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
     let (_, d) = call(&app, "GET", &format!("/api/proposals/{id}"), None).await;
     assert_eq!((d["proposal"]["status"].as_str(), d["proposal"]["decision_comment"].as_str()), (Some("rejected"), Some("fmt is in CI already")));
+    let (st, _) = call(&app, "POST", &format!("/api/proposals/{id}/withdraw"), Some(json!({"comment": "gone"}))).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "only approved proposals can be withdrawn");
 
     let (st, _) = call(&app, "GET", "/api/proposals/not-a-uuid", None).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);

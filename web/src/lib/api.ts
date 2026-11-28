@@ -407,6 +407,7 @@ export type ProposalStatus =
   | 'failed'
   | 'approved'
   | 'rejected'
+  | 'withdrawn'
   | 'rolled_out'
 
 /** One improver run / proposal; `proposals_view` row. */
@@ -596,6 +597,8 @@ export const api = {
   decideProposal: (id: string, approved: boolean, comment?: string) =>
     request<{ message: string }>('POST', `/proposals/${id}/decide`, { approved, comment }),
   applyProposal: (id: string) => request<{ message: string }>('POST', `/proposals/${id}/apply`),
+  withdrawProposal: (id: string, comment: string) =>
+    request<{ message: string }>('POST', `/proposals/${id}/withdraw`, { comment }),
   improvement: () => request<ImprovementResponse>('GET', '/improvement'),
   events: (after = 0, limit = 100) => request<WhEvent[]>('GET', `/events?after=${after}&limit=${limit}`),
 }

@@ -21,5 +21,6 @@ Work in thin slices, in the spec's plan order: implement, run that slice's narro
 - Locate with `grep -n`/`rg`, then read only the ranges you need. Never `cat` large files; do not re-read a file you already have unless it changed.
 - Trim command output, e.g. `cargo build 2>&1 | grep -E '^(error|warning)' -A6 | head -60`, `cargo test -p X 2>&1 | grep -E 'test result|FAILED|panicked' | head -30`.
 - Narrow tests while iterating. Run the full `cargo build`, `cargo test` and `cargo clippy --all-targets -- -D warnings` once, at the end. Keep the shared CARGO_TARGET_DIR: no `--target-dir`, no `cargo clean`.
+- If the change touches `web/`, build it with exactly `npm --prefix web ci` (once, if `web/node_modules` is missing) and `npm --prefix web run build`, each as its own command; other npm forms (`cd web && ...`, `npm install`) need approval and will be refused.
 
 Final message (at most 15 lines): files changed, the behaviour, how each feedback point was handled, and the final test and clippy results with counts.

@@ -138,6 +138,18 @@ impl EventHandler for ProposalsProjection {
                     .execute(&self.pool)
                     .await?;
             }
+            ProposalEvent::ProposalWithdrawn { reviewer, comment } => {
+                sqlx::query(&Self::guarded(
+                    "status = 'withdrawn', decided_by = $3, decided_at = $4, decision_comment = $5",
+                ))
+                .bind(id)
+                .bind(seq)
+                .bind(reviewer)
+                .bind(at)
+                .bind(comment)
+                .execute(&self.pool)
+                .await?;
+            }
             ProposalEvent::ProposalRolledOut { factory_version, .. } => {
                 sqlx::query(&Self::guarded("status = 'rolled_out', rolled_out_at = $3, rolled_out_version = $4"))
                     .bind(id)
@@ -249,7 +261,7 @@ pub async fn improver_stats(pool: &PgPool, factory: Option<&str>) -> anyhow::Res
     Ok(sqlx::query_as(
         "SELECT \
            count(*) FILTER (WHERE status NOT IN ('requested', 'running')) AS runs, \
-           count(*) FILTER (WHERE status IN ('open', 'approved', 'rejected', 'rolled_out')) AS proposals, \
+           count(*) FILTER (WHERE status IN ('open', 'approved', 'rejected', 'withdrawn', 'rolled_out')) AS proposals, \
            count(*) FILTER (WHERE status = 'no_proposal') AS no_proposal, \
            count(*) FILTER (WHERE status = 'failed') AS failed, \
            count(*) FILTER (WHERE status = 'open') AS open, \

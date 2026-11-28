@@ -82,6 +82,7 @@ pub fn api(state: AppState) -> Router {
         .route("/proposals/{id}", get(get_proposal))
         .route("/proposals/{id}/decide", post(decide_proposal))
         .route("/proposals/{id}/apply", post(apply_proposal))
+        .route("/proposals/{id}/withdraw", post(withdraw_proposal))
         .route("/improvement", get(improvement))
         .route("/benchmarks", get(bench::runs).post(bench::request))
         .route("/benchmarks/suites", get(bench::suites))
@@ -548,6 +549,22 @@ async fn apply_proposal(
 ) -> ApiResult<Ok_> {
     let version = wh_improver::commands::apply(&s.store, user.actor(), parse_id(&id, "proposal")?).await?;
     Ok(ok(format!("rolled out as factory version {version}; restart the foreman to use it")))
+}
+
+#[derive(Deserialize)]
+struct WithdrawBody {
+    #[serde(default)]
+    comment: String,
+}
+
+async fn withdraw_proposal(
+    State(s): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(b): Json<WithdrawBody>,
+) -> ApiResult<Ok_> {
+    wh_improver::commands::withdraw(&s.store, user.actor(), parse_id(&id, "proposal")?, b.comment).await?;
+    Ok(ok("proposal withdrawn"))
 }
 
 #[derive(Serialize)]
