@@ -46,7 +46,7 @@ export function NewTaskDialog() {
           <Plus /> New task
         </Button>
       </DialogTrigger>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-lg">
         <form
           className="grid gap-4"
           onSubmit={(e) => {
@@ -70,6 +70,7 @@ export function NewTaskDialog() {
             <Label htmlFor="body">Details</Label>
             <Textarea
               id="body"
+              className="max-h-[50vh] overflow-y-auto"
               rows={6}
               value={body}
               onChange={(e) => setBody(e.target.value)}
