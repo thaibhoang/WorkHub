@@ -1,7 +1,10 @@
 import { useQuery } from '@tanstack/react-query'
+import { ChevronLeft, ChevronRight } from 'lucide-react'
+import { Fragment, useMemo, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { NewTaskDialog } from '@/components/NewTaskDialog'
 import { PageHeader } from '@/components/PageHeader'
+import { Button } from '@/components/ui/button'
 import { PrLink, TaskStatusBadge } from '@/components/status'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
@@ -27,6 +30,7 @@ function matches(t: TaskSummary, f: string) {
 export default function Runs() {
   const [params, setParams] = useSearchParams()
   const filter = params.get('filter') ?? 'all'
+  const page = Math.max(0, Number(params.get('page') ?? 1) - 1) || 0
   const { data, isLoading, error } = useQuery({ queryKey: ['tasks'], queryFn: () => api.tasks() })
   const rows = data?.filter((t) => matches(t, filter)) ?? []
 
@@ -64,15 +68,45 @@ export default function Runs() {
           {data?.length ? 'No tasks match this filter.' : 'No tasks yet. Create one, then start it to run the pipeline.'}
         </p>
       ) : (
-        <RunsTable rows={rows} />
+        <RunsTable
+          rows={rows}
+          page={page}
+          onPage={(p) => {
+            const next = new URLSearchParams(params)
+            if (p) next.set('page', String(p + 1))
+            else next.delete('page')
+            setParams(next)
+          }}
+        />
       )}
     </>
   )
 }
 
-export function RunsTable({ rows }: { rows: TaskSummary[] }) {
+/** Top-level tasks per page; a task's subtasks always stay on its page. */
+const PAGE_SIZE = 25
+
+/**
+ * Tasks as a tree, paged by top-level task. Pass `page`/`onPage` to keep the
+ * page somewhere else (the URL); otherwise it is local state.
+ */
+export function RunsTable({ rows, page: pageProp, onPage }: { rows: TaskSummary[]; page?: number; onPage?: (page: number) => void }) {
   const navigate = useNavigate()
+  const [localPage, setLocalPage] = useState(0)
+  const groups = useMemo(() => {
+    const out: { task: TaskSummary; depth: number }[][] = []
+    for (const item of taskTree(rows)) {
+      if (item.depth === 0 || !out.length) out.push([item])
+      else out[out.length - 1].push(item)
+    }
+    return out
+  }, [rows])
+  const pages = Math.max(1, Math.ceil(groups.length / PAGE_SIZE))
+  const page = Math.min(pageProp ?? localPage, pages - 1)
+  const setPage = onPage ?? setLocalPage
+  const items = groups.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).flat()
   return (
+    <>
     <div className="overflow-hidden rounded-lg border">
       <Table>
         <TableHeader>
@@ -87,7 +121,7 @@ export function RunsTable({ rows }: { rows: TaskSummary[] }) {
           </TableRow>
         </TableHeader>
         <TableBody>
-          {taskTree(rows).map(({ task: t, depth }) => {
+          {items.map(({ task: t, depth }) => {
             const active = t.status !== 'done' && t.status !== 'cancelled'
             const end = new Date(t.completed_at ?? (active ? Date.now() : t.updated_at)).getTime()
             return (
@@ -124,6 +158,38 @@ export function RunsTable({ rows }: { rows: TaskSummary[] }) {
           })}
         </TableBody>
       </Table>
+    </div>
+    {pages > 1 ? <Pager page={page} pages={pages} groups={groups.length} onPage={setPage} /> : null}
+    </>
+  )
+}
+
+function Pager({ page, pages, groups, onPage }: { page: number; pages: number; groups: number; onPage: (p: number) => void }) {
+  // First, last, and two around the current page; gaps become "…".
+  const shown = [...new Set([0, page - 2, page - 1, page, page + 1, page + 2, pages - 1])].filter((p) => p >= 0 && p < pages).sort((a, b) => a - b)
+  const first = page * PAGE_SIZE + 1
+  const last = Math.min(groups, (page + 1) * PAGE_SIZE)
+  return (
+    <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-sm">
+      <span className="text-muted-foreground tabular-nums">
+        {first}–{last} of {groups} top-level tasks
+      </span>
+      <div className="flex items-center gap-1">
+        <Button variant="outline" size="sm" onClick={() => onPage(page - 1)} disabled={page === 0}>
+          <ChevronLeft /> Prev
+        </Button>
+        {shown.map((p, i) => (
+          <Fragment key={p}>
+            {i > 0 && p - shown[i - 1] > 1 ? <span className="px-1 text-muted-foreground">…</span> : null}
+            <Button variant={p === page ? 'secondary' : 'ghost'} size="sm" className="min-w-8 tabular-nums" onClick={() => onPage(p)}>
+              {p + 1}
+            </Button>
+          </Fragment>
+        ))}
+        <Button variant="outline" size="sm" onClick={() => onPage(page + 1)} disabled={page >= pages - 1}>
+          Next <ChevronRight />
+        </Button>
+      </div>
     </div>
   )
 }

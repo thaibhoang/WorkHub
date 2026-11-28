@@ -539,7 +539,8 @@ export const api = {
   me: () => request<Me>('GET', '/auth/me'),
   login: (username: string, password: string) => request<Me>('POST', '/auth/login', { username, password }),
   logout: () => request<null>('POST', '/auth/logout'),
-  tasks: (status?: string) => request<TaskSummary[]>('GET', `/tasks${status ? `?status=${status}` : ''}`),
+  // The Runs page pages through the list itself; the server returns at most 1000.
+  tasks: (status?: string) => request<TaskSummary[]>('GET', `/tasks?limit=1000${status ? `&status=${status}` : ''}`),
   task: (id: string) => request<TaskDetail>('GET', `/tasks/${id}`),
   createTask: (b: { title: string; body?: string; pipeline?: boolean; parent?: string; start?: boolean }) =>
     request<{ task_id: string; factory: string | null }>('POST', '/tasks', b),
