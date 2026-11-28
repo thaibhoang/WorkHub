@@ -120,8 +120,12 @@ fn bind(path: &Path, mode: &str) -> anyhow::Result<String> {
 /// Resolve the mounts and home directory for running a session in `config`.
 /// Errors here are environment problems (missing volume, odd paths) and are
 /// recorded as `env_setup` failures.
+///
+/// `home_session` names the home directory: `session` itself, except for a resumed
+/// session, which reuses the home of the first one (its conversation is there).
 pub async fn prepare(
     session: SessionId,
+    home_session: SessionId,
     config: &DockerSandbox,
     workdir: &Path,
     data_dir: &Path,
@@ -134,7 +138,7 @@ pub async fn prepare(
     let mut dirs = dirs.lines().map(PathBuf::from);
     let (git_dir, common_dir) = (dirs.next().context("no git dir")?, dirs.next().context("no git common dir")?);
 
-    let home_dir = data_dir.join("sandbox-home").join(session.to_string());
+    let home_dir = data_dir.join("sandbox-home").join(home_session.to_string());
     tokio::fs::create_dir_all(home_dir.join(".tmp")).await.context("create sandbox home")?;
     let auth_in_env = AUTH_ENV[..3].iter().any(|n| std::env::var_os(n).is_some_and(|v| !v.is_empty()));
     let creds = std::env::var_os("HOME").map(|h| Path::new(&h).join(".claude/.credentials.json"));

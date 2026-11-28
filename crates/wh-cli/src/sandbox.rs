@@ -257,7 +257,7 @@ async fn smoke_session(d: &DockerSandbox) -> Result<()> {
 
     let session = SessionId::new();
     let wt = Worktree::create(&repo, "HEAD", &root.join("wt"), "wh/smoke").await?;
-    let container = docker::prepare(session, d, &wt.path, &root).await?;
+    let container = docker::prepare(session, session, d,&wt.path, &root).await?;
     let req = AgentRequest {
         prompt: "Use the Bash tool to run `cat hello.txt` and `git log --oneline`, then create a file \
                  written.txt containing `ok`. Reply with the contents of hello.txt only."

@@ -1,10 +1,11 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 use wh_core::{
-    Actor, BenchmarkRunId, EventMeta, FailureClass, NewEvent, Sandbox, SessionId, TaskId,
+    Actor, BenchmarkRunId, EventMeta, FailureClass, NewEvent, Question, Sandbox, SessionId, TaskId, parse_questions,
     session::SessionEvent,
     task::{StageOutcome, TaskEvent, Verdict, parse_verdict},
 };
@@ -73,6 +74,35 @@ pub struct RunSpec {
     /// Fetch and merge this before the agent runs. The agent resolves conflicts and
     /// WorkHub commits the merge, so it needs no network or git write access.
     pub merge: Option<Merge>,
+    /// Pause instead of ending the stage when the agent's final message ends with
+    /// `QUESTION:` lines. Only for callers that can [`Runner::resume`] it.
+    pub pause_on_question: bool,
+}
+
+/// A stage waiting for the user: its worktree (and sandbox home) are kept, nothing
+/// is committed and there is no `StageExited`. Everything [`Runner::resume`] needs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Paused {
+    /// The session that asked (the last turn).
+    pub session: SessionId,
+    /// The first turn; names `worktrees/<id>` and `sandbox-home/<id>`.
+    pub home_session: SessionId,
+    pub runtime_session_id: String,
+    pub branch: String,
+    /// Paths of a merge's conflicts, checked for markers before committing.
+    pub conflicts: Vec<String>,
+    pub questions: Vec<Question>,
+}
+
+/// Result of [`Runner::resume`].
+#[derive(Debug, Clone)]
+pub enum Resumed {
+    /// The turn ran: the stage ended, or paused again.
+    Ran(RunReport),
+    /// The worktree, sandbox home or conversation is gone. There is no `StageExited`
+    /// and what is left on disk stays. `session` is the failed session, if one was
+    /// recorded.
+    Lost { reason: String, session: Option<SessionId> },
 }
 
 #[derive(Debug, Clone)]
@@ -88,8 +118,11 @@ pub struct SessionReport {
 #[derive(Debug, Clone)]
 pub struct RunReport {
     pub attempts: Vec<SessionReport>,
-    /// Outcome recorded on `StageExited` (includes the verdict).
-    pub stage_outcome: StageOutcome,
+    /// Outcome recorded on `StageExited` (includes the verdict). `None` = the stage
+    /// has not ended (paused).
+    pub stage_outcome: Option<StageOutcome>,
+    /// Set when the stage is waiting for the user's answer.
+    pub paused: Option<Paused>,
 }
 
 impl RunReport {
@@ -117,6 +150,7 @@ impl<R: AgentRuntime> Runner<R> {
     /// `spec.max_retries` times. Each attempt is its own session (fresh worktree) linked
     /// by `retry_of`. The task stream gets one `StageEntered` and one final `StageExited`.
     /// Agent failures are recorded and returned; `Err` means WorkHub itself failed.
+    /// With `pause_on_question`, an attempt that asks ends the run without `StageExited`.
     pub async fn run(&self, spec: RunSpec, mut on_signal: impl FnMut(&Signal) + Send) -> anyhow::Result<RunReport> {
         let mut attempts = Vec::new();
         let mut retry_of = None;
@@ -128,16 +162,17 @@ impl<R: AgentRuntime> Runner<R> {
                 let entered = TaskEvent::StageEntered { stage: spec.stage.clone(), feedback: spec.feedback.clone() };
                 rec.task(entered, expected).await?;
             }
-            let report = self.attempt(&spec, &mut rec, attempt, retry_of, &mut on_signal).await?;
+            let (report, end) = self.attempt(&spec, &mut rec, attempt, retry_of, &mut on_signal).await?;
+            if let End::Paused(paused) = end {
+                attempts.push(report);
+                return Ok(RunReport { attempts, stage_outcome: None, paused: Some(paused) });
+            }
             let retry = attempt <= spec.max_retries
                 && matches!(report.outcome.status, OutcomeStatus::Failed { retryable: true, .. });
             if !retry {
-                let (outcome, summary) = stage_result(&report.outcome, spec.verdict_required);
-                let exited =
-                    TaskEvent::StageExited { stage: spec.stage.clone(), outcome, summary, session: Some(session_id) };
-                rec.task(exited, ExpectedVersion::Any).await?;
+                let outcome = exit_stage(&spec, &mut rec, &report.outcome).await?;
                 attempts.push(report);
-                return Ok(RunReport { attempts, stage_outcome: outcome });
+                return Ok(RunReport { attempts, stage_outcome: Some(outcome), paused: None });
             }
             if let OutcomeStatus::Failed { class, message, .. } = &report.outcome.status {
                 tracing::warn!(attempt, max = spec.max_retries + 1, class = class.as_str(), "{message}; retrying");
@@ -149,6 +184,50 @@ impl<R: AgentRuntime> Runner<R> {
         unreachable!("the last attempt never retries")
     }
 
+    /// Continue a paused stage with the user's `answer`: one new session in the same
+    /// worktree (and sandbox home), never retried, with the full timeout and budget of
+    /// `spec`. The stage is committed and gets `StageExited` only if it really ends.
+    /// No `StageEntered` is appended, so the caller must make sure it resumes only once.
+    pub async fn resume(
+        &self,
+        spec: RunSpec,
+        paused: &Paused,
+        answer: &str,
+        mut on_signal: impl FnMut(&Signal) + Send,
+    ) -> anyhow::Result<Resumed> {
+        let home = paused.home_session.to_string();
+        let path = self.config.data_dir.join("worktrees").join(&home);
+        let lost = |reason: String| Ok(Resumed::Lost { reason, session: None });
+        let worktree = match Worktree::open(&spec.repo, &path, &paused.branch).await {
+            Ok(w) => w,
+            Err(e) => return lost(format!("{e:#}")),
+        };
+        // Checked here because `docker::prepare` would create an empty one.
+        let home_dir = self.config.data_dir.join("sandbox-home").join(&home);
+        if spec.sandbox.docker().is_some() && !home_dir.is_dir() {
+            return lost(format!("sandbox home {} is gone", home_dir.display()));
+        }
+        let mut rec = Recorder::new(&self.store, SessionId::new(), spec.task_id, spec.factory_version.clone());
+        let turn = Turn {
+            // The fixed prefix also keeps an answer starting with `-` from being read as a flag.
+            prompt: format!("The user answered your question(s):\n\n{answer}"),
+            conflicts: paused.conflicts.clone(),
+            home_session: paused.home_session,
+            mode: SessionMode::Resume(paused.runtime_session_id.clone()),
+            attempt: 1,
+            retry_of: None,
+            resume_of: Some(paused.session),
+        };
+        let (report, end) = self.turn(&spec, &mut rec, turn, Ok(worktree), &mut on_signal).await?;
+        let (stage_outcome, paused) = match end {
+            End::Lost(reason) => return Ok(Resumed::Lost { reason, session: Some(report.session_id) }),
+            End::Paused(paused) => (None, Some(paused)),
+            End::Finished => (Some(exit_stage(&spec, &mut rec, &report.outcome).await?), None),
+        };
+        Ok(Resumed::Ran(RunReport { attempts: vec![report], stage_outcome, paused }))
+    }
+
+    /// The first turn of an attempt: a fresh worktree (and merge), then [`Self::turn`].
     async fn attempt(
         &self,
         spec: &RunSpec,
@@ -156,7 +235,7 @@ impl<R: AgentRuntime> Runner<R> {
         attempt: u32,
         retry_of: Option<SessionId>,
         on_signal: &mut (impl FnMut(&Signal) + Send),
-    ) -> anyhow::Result<SessionReport> {
+    ) -> anyhow::Result<(SessionReport, End)> {
         let session_id = s.session_id;
         let branch = spec.branch.clone().unwrap_or_else(|| {
             let suffix = &session_id.0.simple().to_string()[20..];
@@ -173,7 +252,7 @@ impl<R: AgentRuntime> Runner<R> {
                 Ok(files) => {
                     prompt.push_str("\n\n");
                     prompt.push_str(&w.merge_note(&m.base, &files).await);
-                    conflicts = files;
+                    conflicts = files.into_iter().map(|f| f.path).collect();
                 }
                 Err(e) => {
                     if let Err(e) = w.remove().await {
@@ -183,6 +262,31 @@ impl<R: AgentRuntime> Runner<R> {
                 }
             }
         }
+        let turn = Turn {
+            prompt,
+            conflicts,
+            home_session: session_id,
+            mode: SessionMode::Persist,
+            attempt,
+            retry_of,
+            resume_of: None,
+        };
+        self.turn(spec, s, turn, setup, on_signal).await
+    }
+
+    /// Record and run one session in the prepared worktree, then keep it (paused or
+    /// lost) or commit and clean up. `StageEntered`/`StageExited` are the caller's.
+    async fn turn(
+        &self,
+        spec: &RunSpec,
+        s: &mut Recorder<'_>,
+        turn: Turn,
+        setup: anyhow::Result<Worktree>,
+        on_signal: &mut (impl FnMut(&Signal) + Send),
+    ) -> anyhow::Result<(SessionReport, End)> {
+        let session_id = s.session_id;
+        let Turn { prompt, conflicts, home_session, mode, attempt, retry_of, resume_of } = turn;
+        let resuming = matches!(mode, SessionMode::Resume(_));
         s.session(SessionEvent::AgentDispatched {
             task_id: spec.task_id,
             agent: spec.agent.clone(),
@@ -194,34 +298,41 @@ impl<R: AgentRuntime> Runner<R> {
             timeout_secs: spec.timeout.as_secs(),
             attempt,
             retry_of,
-            resume_of: None,
+            resume_of,
             benchmark: spec.benchmark,
         })
         .await?;
 
+        // A turn that never got to run the agent.
+        let not_started = |outcome| {
+            let report = SessionReport { session_id, attempt, outcome, workdir: None, branch: None };
+            Ok((report, End::Finished))
+        };
         let worktree = match setup {
             Ok(w) => w,
             Err(e) => {
                 let outcome = Outcome::failed(FailureClass::EnvSetup, format!("{e:#}"), false, Duration::ZERO);
                 s.finish(&outcome, None, None).await?;
-                return Ok(SessionReport { session_id, attempt, outcome, workdir: None, branch: None });
+                return not_started(outcome);
             }
         };
         let container = match spec.sandbox.docker() {
             None => None,
-            Some(cfg) => match docker::prepare(session_id, cfg, &worktree.path, &self.config.data_dir).await {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    let msg = format!("docker sandbox: {e:#}");
-                    let outcome = Outcome::failed(FailureClass::EnvSetup, msg, false, Duration::ZERO);
-                    s.finish(&outcome, None, None).await?;
-                    if let Err(e) = worktree.remove().await {
-                        tracing::warn!("failed to remove worktree {}: {e:#}", worktree.path.display());
+            Some(cfg) => {
+                match docker::prepare(session_id, home_session, cfg, &worktree.path, &self.config.data_dir).await {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        let msg = format!("docker sandbox: {e:#}");
+                        let outcome = Outcome::failed(FailureClass::EnvSetup, msg, false, Duration::ZERO);
+                        s.finish(&outcome, None, None).await?;
+                        if let Err(e) = worktree.remove().await {
+                            tracing::warn!("failed to remove worktree {}: {e:#}", worktree.path.display());
+                        }
+                        remove_home(&self.config.data_dir, home_session).await;
+                        return not_started(outcome);
                     }
-                    remove_home(&self.config.data_dir, session_id).await;
-                    return Ok(SessionReport { session_id, attempt, outcome, workdir: None, branch: None });
                 }
-            },
+            }
         };
         s.session(SessionEvent::AgentSessionStarted {
             workdir: worktree.path.display().to_string(),
@@ -247,31 +358,68 @@ impl<R: AgentRuntime> Runner<R> {
             tools: spec.tools.clone(),
             container,
             env: spec.env.clone(),
-            session: SessionMode::Ephemeral,
+            session: mode,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let fut = self.runtime.run(&req, tx);
         tokio::pin!(fut);
-        let outcome = loop {
+        let mut runtime_session_id = None;
+        let mut observe = |sig: &Signal| {
+            if let Signal::Ready { runtime_session_id: Some(id), .. } = sig {
+                runtime_session_id = Some(id.clone());
+            }
+            on_signal(sig);
+        };
+        let mut outcome = loop {
             tokio::select! {
                 outcome = &mut fut => break outcome,
                 Some(sig) = rx.recv() => {
-                    on_signal(&sig);
+                    observe(&sig);
                     s.signal(sig).await?;
                 }
             }
         };
         while let Ok(sig) = rx.try_recv() {
-            on_signal(&sig);
+            observe(&sig);
             s.signal(sig).await?;
         }
+
+        // Asking comes before the marker check and the verdict: the work is unfinished.
+        let questions = match (&outcome.status, outcome.summary.as_deref()) {
+            (OutcomeStatus::Succeeded, Some(text)) if spec.pause_on_question => parse_questions(text),
+            _ => Vec::new(),
+        };
+        let end = match (&outcome.status, runtime_session_id) {
+            (OutcomeStatus::Failed { class: FailureClass::SessionLost, message, .. }, _) if resuming => {
+                End::Lost(message.clone())
+            }
+            (_, Some(runtime_session_id)) if !questions.is_empty() => End::Paused(Paused {
+                session: session_id,
+                home_session,
+                runtime_session_id,
+                branch: worktree.branch.clone(),
+                conflicts: conflicts.clone(),
+                questions,
+            }),
+            _ => End::Finished,
+        };
         if req.container.is_some() {
-            // The throwaway home may hold a copy of the user's credentials.
-            remove_home(&self.config.data_dir, session_id).await;
+            // The throwaway home may hold a copy of the user's credentials. A home that
+            // is kept loses only that copy (`docker::prepare` makes it again).
+            match end {
+                End::Finished => remove_home(&self.config.data_dir, home_session).await,
+                End::Paused(_) | End::Lost(_) => remove_credentials(&self.config.data_dir, home_session).await,
+            }
+        }
+        let transcript = transcript_path.exists().then(|| transcript_path.display().to_string());
+        if !matches!(end, End::Finished) {
+            s.finish(&outcome, transcript, None).await?;
+            let workdir = Some(worktree.path);
+            let report = SessionReport { session_id, attempt, outcome, workdir, branch: Some(worktree.branch) };
+            return Ok((report, end));
         }
 
-        let mut outcome = outcome;
         let mut commit = None;
         if outcome.status == OutcomeStatus::Succeeded {
             let left = worktree.with_markers(&conflicts).await;
@@ -296,7 +444,6 @@ impl<R: AgentRuntime> Runner<R> {
                 }
             }
         }
-        let transcript = transcript_path.exists().then(|| transcript_path.display().to_string());
         s.finish(&outcome, transcript, commit).await?;
 
         let workdir = if spec.keep_worktree {
@@ -307,8 +454,38 @@ impl<R: AgentRuntime> Runner<R> {
             }
             None
         };
-        Ok(SessionReport { session_id, attempt, outcome, workdir, branch: Some(worktree.branch) })
+        let report = SessionReport { session_id, attempt, outcome, workdir, branch: Some(worktree.branch) };
+        Ok((report, end))
     }
+}
+
+/// What differs between a first turn and a resumed one.
+struct Turn {
+    prompt: String,
+    conflicts: Vec<String>,
+    home_session: SessionId,
+    mode: SessionMode,
+    attempt: u32,
+    retry_of: Option<SessionId>,
+    resume_of: Option<SessionId>,
+}
+
+/// How a turn left the stage.
+enum End {
+    /// Committed and cleaned up, or failed: the stage can be exited.
+    Finished,
+    Paused(Paused),
+    /// The conversation to resume is gone (reason).
+    Lost(String),
+}
+
+/// Append the stage's `StageExited` for its final session.
+async fn exit_stage(spec: &RunSpec, rec: &mut Recorder<'_>, o: &Outcome) -> anyhow::Result<StageOutcome> {
+    let (outcome, summary) = stage_result(o, spec.verdict_required);
+    let session = Some(rec.session_id);
+    let exited = TaskEvent::StageExited { stage: spec.stage.clone(), outcome, summary, session };
+    rec.task(exited, ExpectedVersion::Any).await?;
+    Ok(outcome)
 }
 
 /// Appends session events with optimistic concurrency (the runner is the only
@@ -402,6 +579,15 @@ async fn remove_home(data_dir: &std::path::Path, session: SessionId) {
         && e.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!("failed to remove sandbox home {}: {e}", dir.display());
+    }
+}
+
+async fn remove_credentials(data_dir: &std::path::Path, session: SessionId) {
+    let file = data_dir.join("sandbox-home").join(session.to_string()).join(".claude/.credentials.json");
+    if let Err(e) = tokio::fs::remove_file(&file).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("failed to remove {}: {e}", file.display());
     }
 }
 
