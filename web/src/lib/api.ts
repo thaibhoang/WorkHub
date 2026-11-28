@@ -196,8 +196,8 @@ export interface TaskDetail {
   events: WhEvent[]
   sessions: SessionDetail[]
   scores: ScoreRow[]
-  /** What the autopilot decided (autopilot tasks only), oldest first. */
-  autopilot: AutopilotRun[]
+  /** What the autopilot decided (autopilot tasks only), oldest first. Missing from older servers. */
+  autopilot?: AutopilotRun[]
 }
 
 /** One scorer run (LLM-as-judge grading one session); `score_results` row. */

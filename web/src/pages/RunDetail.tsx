@@ -125,7 +125,7 @@ export default function RunDetail() {
       {pipeline ? <PipelineStrip factory={pipeline} detail={data} /> : null}
       <ActionPanel key={id} id={id} detail={data} factory={pipeline} />
       <PrPanel detail={data} />
-      <AutopilotPanel runs={data.autopilot} />
+      <AutopilotPanel runs={data.autopilot ?? []} />
       {task?.benchmark_run ? null : <Subtasks id={id} title={title} detail={data} />}
 
       <Tabs defaultValue="timeline" className="mt-6">
@@ -258,7 +258,8 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
   const start = useCommand(id, (subtree: boolean) => api.startTask(id, subtree, autopilot))
   // The autopilot run for the request the task is waiting on (it decides by request version).
   const requestVersion = [...detail.events].reverse().find((e) => e.type === 'GateRequested')?.stream_version
-  const pendingRun = detail.autopilot.find((r) => r.request_version === requestVersion)
+  // Older servers do not send `autopilot`.
+  const pendingRun = (detail.autopilot ?? []).find((r) => r.request_version === requestVersion)
   const autopilotNote = state.autopilot ? <AutopilotNote run={pendingRun} what="gate" /> : null
 
   if (state.status === 'awaiting_gate') {
