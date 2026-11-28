@@ -440,7 +440,7 @@ pub fn render(o: &Observation) -> String {
     if o.past_proposals.is_empty() {
         p.push_str("None yet.\n");
     } else {
-        p.push_str("Do not re-propose something a human rejected unless you have new evidence.\n\n");
+        p.push_str("Do not re-propose something a human rejected unless you have new evidence. A withdrawn proposal was approved but never rolled out; the reviewer comment says why.\n\n");
         for pp in &o.past_proposals {
             let files: Vec<&str> =
                 pp.files.as_array().map(|a| a.iter().filter_map(|f| f.as_str()).collect()).unwrap_or_default();

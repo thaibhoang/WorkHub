@@ -259,6 +259,10 @@ async fn proposes_reviews_applies_and_measures(pool: PgPool) {
     let row = proposals::proposal(&pool, id.0).await.unwrap().unwrap();
     assert_eq!((row.status.as_str(), row.rolled_out_version.as_deref()), ("rolled_out", Some(proposed.as_str())));
     assert_eq!(row.decided_by.as_deref(), Some("tester"));
+    assert!(matches!(
+        commands::withdraw(&store, human(), id, "too late".into()).await,
+        Err(commands::CommandError::InvalidState(_))
+    ));
 
     // Measure: metrics per factory version (sessions of the old version so far).
     let versions = proposals::version_stats(&pool, Some("test")).await.unwrap();
@@ -388,4 +392,45 @@ async fn detects_rollout_when_loaded_factory_has_the_proposed_version(pool: PgPo
     let row = proposals::proposal(&pool, id.0).await.unwrap().unwrap();
     assert_eq!((row.status.as_str(), row.rolled_out_version), ("rolled_out", Some(reloaded.version.clone())));
     assert!(svc.detect_rollouts().await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn approved_proposal_whose_repo_is_gone_can_be_withdrawn(pool: PgPool) {
+    let (dir, f) = setup();
+    let repo = f.path.parent().unwrap().parent().unwrap().to_owned();
+    let data = dir.path().join("data");
+    let store = EventStore::new(pool.clone());
+    let rt = FakeImprover::leak(Act::Edit {
+        path: "factory/agents/review.md",
+        content: "ROLE: review with file:line",
+        reply: proposal_reply("Cite file:line", &[]),
+    });
+    let (id, _) = service(&store, &f, &data, rt).run_now(human(), None).await.unwrap();
+    assert!(matches!(
+        commands::withdraw(&store, human(), id, "x".into()).await,
+        Err(commands::CommandError::InvalidState(m)) if m.contains("reject it instead")
+    ));
+    commands::decide(&store, human(), id, true, None).await.unwrap();
+
+    std::fs::remove_dir_all(&repo).unwrap();
+    match commands::apply(&store, human(), id).await {
+        Err(commands::CommandError::InvalidState(m)) => {
+            assert!(m.contains("no longer exists") && m.contains("wh proposal withdraw"), "{m}")
+        }
+        r => panic!("expected InvalidState, got {r:?}"),
+    }
+
+    assert!(matches!(
+        commands::withdraw(&store, human(), id, "  ".into()).await,
+        Err(commands::CommandError::InvalidState(_))
+    ));
+    commands::withdraw(&store, human(), id, "demo repo was deleted".into()).await.unwrap();
+    let row = proposals::proposal(&pool, id.0).await.unwrap().unwrap();
+    assert_eq!(
+        (row.status.as_str(), row.decision_comment.as_deref(), row.decided_by.as_deref()),
+        ("withdrawn", Some("demo repo was deleted"), Some("tester"))
+    );
+    assert!(commands::withdraw(&store, human(), id, "again".into()).await.is_err());
+    let stats = proposals::improver_stats(&pool, Some("test")).await.unwrap();
+    assert_eq!((stats.proposals, stats.approved), (1, 0));
 }

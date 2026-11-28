@@ -75,6 +75,12 @@ pub enum ProposalEvent {
         reviewer: String,
         comment: Option<String>,
     },
+    /// An approved proposal is closed without rolling it out, e.g. because its
+    /// factory repo or commit no longer exists. `comment` says why (the improver reads it).
+    ProposalWithdrawn {
+        reviewer: String,
+        comment: String,
+    },
     /// The change is live: the factory now loads with `factory_version`.
     ProposalRolledOut {
         factory_version: String,
@@ -92,6 +98,7 @@ impl DomainEvent for ProposalEvent {
             Self::ImprovementSkipped { .. } => "ImprovementSkipped",
             Self::ImprovementFailed { .. } => "ImprovementFailed",
             Self::ProposalDecided { .. } => "ProposalDecided",
+            Self::ProposalWithdrawn { .. } => "ProposalWithdrawn",
             Self::ProposalRolledOut { .. } => "ProposalRolledOut",
         }
     }
@@ -109,6 +116,8 @@ pub enum ProposalStatus {
     Failed,
     Approved,
     Rejected,
+    /// Approved, then closed without a rollout.
+    Withdrawn,
     RolledOut,
 }
 
@@ -122,6 +131,7 @@ impl ProposalStatus {
             Self::Failed => "failed",
             Self::Approved => "approved",
             Self::Rejected => "rejected",
+            Self::Withdrawn => "withdrawn",
             Self::RolledOut => "rolled_out",
         }
     }
@@ -183,6 +193,7 @@ impl ProposalState {
             ProposalEvent::ProposalDecided { approved, .. } => {
                 self.status = if approved { ProposalStatus::Approved } else { ProposalStatus::Rejected }
             }
+            ProposalEvent::ProposalWithdrawn { .. } => self.status = ProposalStatus::Withdrawn,
             ProposalEvent::ProposalRolledOut { .. } => self.status = ProposalStatus::RolledOut,
         }
     }

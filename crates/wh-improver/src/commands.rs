@@ -99,6 +99,28 @@ pub async fn apply(store: &EventStore, actor: Actor, id: ProposalId) -> Result<S
     };
     let repo = Path::new(repo);
     let factory_path = repo.join(file);
+    let withdraw_hint = format!("withdraw it instead: wh proposal withdraw {id} --comment \"...\"");
+    if !repo.is_dir() {
+        return Err(CommandError::InvalidState(format!(
+            "the repo of factory `{}` no longer exists at {}, so this proposal cannot be applied; {withdraw_hint}",
+            s.factory,
+            repo.display()
+        )));
+    }
+    if !factory_path.is_file() {
+        return Err(CommandError::InvalidState(format!(
+            "factory file {} no longer exists, so this proposal cannot be applied; {withdraw_hint}",
+            factory_path.display()
+        )));
+    }
+    let commit_ref = format!("{commit}^{{commit}}");
+    if git::run(repo, &["cat-file", "-e", &commit_ref]).await.is_err() {
+        return Err(CommandError::InvalidState(format!(
+            "commit {commit} (branch {}) is not in {} any more, so this proposal cannot be applied; {withdraw_hint}",
+            s.branch.as_deref().unwrap_or("?"),
+            repo.display()
+        )));
+    }
     let current = Factory::load(&factory_path).map_err(|e| CommandError::Other(e.context("load current factory")))?;
     let (version, applied) = if Some(&current.version) == s.proposed_factory_version.as_ref() {
         // Already live (merged by hand).
@@ -129,6 +151,25 @@ pub async fn apply(store: &EventStore, actor: Actor, id: ProposalId) -> Result<S
     meta.factory_version = Some(version.clone());
     append(store, id, ExpectedVersion::Exact(s.version), meta, ev).await?;
     Ok(version)
+}
+
+/// Close an approved proposal without rolling it out (its repo or commit is gone,
+/// or it is no longer wanted). Needs a comment: the improver reads it next time.
+pub async fn withdraw(store: &EventStore, actor: Actor, id: ProposalId, comment: String) -> Result<()> {
+    if comment.trim().is_empty() {
+        return Err(CommandError::InvalidState("withdrawing a proposal needs a comment for the improver".into()));
+    }
+    let s = load(store, id).await?;
+    if s.status != ProposalStatus::Approved {
+        return Err(CommandError::InvalidState(format!(
+            "only approved proposals can be withdrawn (proposal is {}){}",
+            s.status.as_str(),
+            if s.status == ProposalStatus::Open { "; reject it instead" } else { "" }
+        )));
+    }
+    let ev = ProposalEvent::ProposalWithdrawn { reviewer: actor_name(&actor), comment };
+    let meta = EventMeta::new(id.0, actor);
+    append(store, id, ExpectedVersion::Exact(s.version), meta, ev).await
 }
 
 pub(crate) async fn append(

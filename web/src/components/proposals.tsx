@@ -27,6 +27,7 @@ const STATUS: Record<ProposalStatus, { label: string; dot: string; text: string 
   failed: { label: 'Failed', dot: 'bg-fail', text: 'text-fail' },
   approved: { label: 'Approved', dot: 'bg-info', text: 'text-info' },
   rejected: { label: 'Rejected', dot: 'bg-muted-foreground/50', text: 'text-muted-foreground' },
+  withdrawn: { label: 'Withdrawn', dot: 'bg-muted-foreground/50', text: 'text-muted-foreground' },
   rolled_out: { label: 'Rolled out', dot: 'bg-ok', text: 'text-ok' },
 }
 
