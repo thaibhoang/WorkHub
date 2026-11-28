@@ -85,6 +85,9 @@ enum Cmd {
         /// Do not poll GitHub (PR reviews / CI / merges, issue intake); shipping still happens
         #[arg(long)]
         no_github: bool,
+        /// Do not run the autopilot (gates and questions of autopilot tasks then wait for a human)
+        #[arg(long)]
+        no_autopilot: bool,
         #[arg(long, env = "WH_GH_BIN", default_value = "gh")]
         gh_bin: PathBuf,
     },
@@ -157,6 +160,9 @@ enum Cmd {
         /// With --foreman: do not poll GitHub (shipping still happens)
         #[arg(long)]
         no_github: bool,
+        /// With --foreman: do not run the autopilot
+        #[arg(long)]
+        no_autopilot: bool,
         #[arg(long, env = "WH_GH_BIN", default_value = "gh")]
         gh_bin: PathBuf,
         /// Directory of benchmark suites offered in the UI
@@ -311,6 +317,9 @@ enum TaskCmd {
         /// Start it right away (default: a draft that waits for `wh task start`)
         #[arg(long)]
         start: bool,
+        /// With --start: autopilot mode, an agent decides gates and answers questions instead of you
+        #[arg(long, requires = "start")]
+        autopilot: bool,
     },
     /// Start a draft task; the foreman then runs its pipeline
     Start {
@@ -318,6 +327,9 @@ enum TaskCmd {
         /// Also start every draft subtask below it
         #[arg(long)]
         subtree: bool,
+        /// Autopilot mode: an agent decides gates and answers questions instead of you
+        #[arg(long)]
+        autopilot: bool,
     },
     /// Move a task under another parent (tasks form a tree; cycles are refused)
     Move {
@@ -560,9 +572,9 @@ async fn main() -> Result<()> {
         .database_url
         .or_else(|| std::env::var("DATABASE_URL").ok())
         .ok_or_else(|| anyhow::anyhow!("DATABASE_URL is not set (see .env.example)"))?;
-    // Every following consumer (5 projections, SSE, foreman, scorer, improver, bench) holds a
-    // LISTEN connection for its lifetime, so leave plenty of room for queries.
-    let pool = PgPoolOptions::new().max_connections(20).connect(&url).await?;
+    // Every following consumer (5 projections, SSE, foreman, scorer, improver, bench, autopilot)
+    // holds a LISTEN connection for its lifetime, so leave plenty of room for queries.
+    let pool = PgPoolOptions::new().max_connections(24).connect(&url).await?;
     let store = EventStore::new(pool.clone());
 
     match cli.cmd {
@@ -600,19 +612,19 @@ async fn main() -> Result<()> {
             println!("migrations applied");
         }
         Cmd::Task { cmd } => match cmd {
-            TaskCmd::Create { title, body, factory, no_factory, parent, start } => {
+            TaskCmd::Create { title, body, factory, no_factory, parent, start, autopilot } => {
                 let factory = task_factory(no_factory, &factory)?;
-                let t = NewTask { title, body, source: TaskSource::Cli, factory, parent, start };
+                let t = NewTask { title, body, source: TaskSource::Cli, factory, parent, start, autopilot };
                 let id = commands::create_task(&store, local_user(), t).await?;
                 println!("{id}");
                 if !start {
                     eprintln!("draft: start it with `wh task start {id}`");
                 }
             }
-            TaskCmd::Start { task, subtree } => {
-                let started = commands::activate(&store, local_user(), task, subtree).await?;
+            TaskCmd::Start { task, subtree, autopilot } => {
+                let started = commands::activate(&store, local_user(), task, subtree, autopilot).await?;
                 for id in &started {
-                    println!("started {id}");
+                    println!("started {id}{}", if autopilot { " (autopilot)" } else { "" });
                 }
                 if started.is_empty() {
                     println!("no draft tasks to start");
@@ -636,6 +648,7 @@ async fn main() -> Result<()> {
                         t.title,
                         t.blocked_reason.map(|r| format!("  [blocked: {}]", first_line(&r))).unwrap_or_default()
                             + &t.pr_url.map(|u| format!("  [PR {}: {u}]", t.pr_state.as_deref().unwrap_or("?"))).unwrap_or_default()
+                            + if t.autopilot { "  [autopilot]" } else { "" }
                     );
                 }
             }
@@ -734,22 +747,24 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Foreman { factory, max_parallel, claude_bin, no_scorers, no_improver, no_bench, no_github, gh_bin } => {
+        Cmd::Foreman { factory, max_parallel, claude_bin, no_scorers, no_improver, no_bench, no_github, no_autopilot, gh_bin } => {
             let f = Factory::load(&factory)?;
             println!("foreman for factory '{}' (version {}), Ctrl+C to stop", f.name, f.version);
             let scorer = run_scorer(&store, f.clone(), max_parallel, claude_bin.clone(), !no_scorers);
             let improver = run_improver(&store, f.clone(), claude_bin.clone(), !no_improver);
             let bench = run_bench_worker(&store, claude_bin.clone(), !no_bench);
             let gh = run_github(&store, f.clone(), gh_bin.clone(), !no_github);
-            let (a, b, c, d, e, g) = tokio::join!(
+            let autopilot = run_autopilot(&store, f.clone(), max_parallel, claude_bin.clone(), !no_autopilot);
+            let (a, b, c, d, e, g, h) = tokio::join!(
                 run_foreman(&store, f, max_parallel, claude_bin, gh_bin, None),
                 run_projections(&store),
                 scorer,
                 improver,
                 bench,
-                gh
+                gh,
+                autopilot
             );
-            a.and(b).and(c).and(d).and(e).and(g)?;
+            a.and(b).and(c).and(d).and(e).and(g).and(h)?;
         }
         Cmd::Cleanup { factory, dry_run, grace_hours, cache_max_gb } => {
             let f = Factory::load(&factory)?;
@@ -923,6 +938,7 @@ async fn main() -> Result<()> {
             no_improver,
             no_bench,
             no_github,
+            no_autopilot,
             gh_bin,
             bench_dir,
             web_dir,
@@ -982,14 +998,16 @@ async fn main() -> Result<()> {
                         let improver = run_improver(&store, f.clone(), claude_bin.clone(), !no_improver);
                         let bench = run_bench_worker(&store, claude_bin.clone(), !no_bench);
                         let gh = run_github(&store, f.clone(), gh_bin.clone(), !no_github);
-                        let (a, b, c, d, e) = tokio::join!(
+                        let autopilot = run_autopilot(&store, f.clone(), max_parallel, claude_bin.clone(), !no_autopilot);
+                        let (a, b, c, d, e, g) = tokio::join!(
                             run_foreman(&store, f, max_parallel, claude_bin, gh_bin, Some(drain)),
                             scorer,
                             improver,
                             bench,
-                            gh
+                            gh,
+                            autopilot
                         );
-                        a.and(b).and(c).and(d).and(e)
+                        a.and(b).and(c).and(d).and(e).and(g)
                     }
                     _ => Ok(()),
                 }
@@ -1169,6 +1187,22 @@ async fn run_scorer(store: &EventStore, f: Factory, max_parallel: usize, claude_
     }
     if svc.start_from_head_if_new().await? {
         println!("scorers start from now; grade older sessions with `wh score session <id>`");
+    }
+    Subscription::new(store.clone()).run(&mut svc, ctrl_c()).await
+}
+
+/// Autopilot consumer until Ctrl+C: finishes or starts the decisions pending for
+/// autopilot tasks first, then decides gates and questions as they come.
+async fn run_autopilot(store: &EventStore, f: Factory, max_parallel: usize, claude_bin: PathBuf, enabled: bool) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    println!("autopilot: {} (gates and questions of tasks started with autopilot)", f.autopilot.model);
+    let dispatch = wh_autopilot::Dispatch::Spawn(std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel)));
+    let mut svc = wh_autopilot::AutopilotService::new(store.clone(), f, ClaudeCode::new(claude_bin), data_dir(), dispatch);
+    svc.start_from_head_if_new().await?;
+    for (task, handled) in svc.recover().await? {
+        println!("autopilot: task {task} at startup: {handled:?}");
     }
     Subscription::new(store.clone()).run(&mut svc, ctrl_c()).await
 }
@@ -1358,7 +1392,10 @@ async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {
         println!("subtask: {}  {:<10}  {}", c.task_id, c.status, c.title);
     }
     if state.status == wh_core::task::TaskStatus::Draft {
-        println!("draft: start it with `wh task start {task}`");
+        println!("draft: start it with `wh task start {task}` (add --autopilot to let an agent decide gates and questions)");
+    }
+    if state.autopilot {
+        println!("autopilot: gates and questions are decided by the autopilot agent");
     }
     if let Some(pending) = &state.pending_questions {
         println!("questions from {}:", pending.stage);
@@ -1458,7 +1495,7 @@ async fn run_agent(store: &EventStore, a: RunArgs) -> Result<()> {
         Some(t) => t,
         None => {
             let title: String = a.prompt.chars().take(80).collect();
-            let t = NewTask { title, body: Some(a.prompt.clone()), source: TaskSource::Cli, factory: None, parent: None, start: true };
+            let t = NewTask { title, body: Some(a.prompt.clone()), source: TaskSource::Cli, factory: None, parent: None, start: true, autopilot: false };
             commands::create_task(store, local_user(), t).await?
         }
     };

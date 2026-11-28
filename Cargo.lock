@@ -2251,6 +2251,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "wh-autopilot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wh-core",
+ "wh-eventstore",
+ "wh-factory",
+ "wh-runner",
+]
+
+[[package]]
 name = "wh-bench"
 version = "0.1.0"
 dependencies = [
@@ -2289,6 +2306,7 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "wh-api",
+ "wh-autopilot",
  "wh-bench",
  "wh-core",
  "wh-eventstore",

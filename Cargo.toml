@@ -32,3 +32,4 @@ wh-scorer = { path = "crates/wh-scorer" }
 wh-improver = { path = "crates/wh-improver" }
 wh-bench = { path = "crates/wh-bench" }
 wh-github = { path = "crates/wh-github" }
+wh-autopilot = { path = "crates/wh-autopilot" }

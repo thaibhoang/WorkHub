@@ -4,7 +4,7 @@
 //! instead of silently overriding a newer one. Shared by the CLI and the API.
 
 use wh_core::{
-    Actor, Answer, EventMeta, NewEvent, Question, SessionId, TaskId,
+    Actor, Answer, EventMeta, NewEvent, SessionId, TaskId,
     task::{TaskEvent, TaskSource, TaskState, TaskStatus},
 };
 use wh_eventstore::{EventStore, ExpectedVersion, StoreError};
@@ -55,6 +55,8 @@ pub struct NewTask {
     pub parent: Option<TaskId>,
     /// Start right away instead of creating a draft that waits for `activate`.
     pub start: bool,
+    /// Start in autopilot mode (needs `start`; drafts choose it in `activate`).
+    pub autopilot: bool,
 }
 
 pub async fn create_task(store: &EventStore, actor: Actor, t: NewTask) -> Result<TaskId> {
@@ -63,6 +65,12 @@ pub async fn create_task(store: &EventStore, actor: Actor, t: NewTask) -> Result
         return Err(CommandError::InvalidState("title must not be empty".into()));
     }
     let body = t.body.filter(|b| !b.trim().is_empty());
+    if t.autopilot && !t.start {
+        return Err(CommandError::InvalidState("autopilot is chosen when the task starts: start it now, or pick it when starting the draft".into()));
+    }
+    if t.autopilot && t.factory.is_none() {
+        return Err(CommandError::InvalidState("autopilot needs a factory pipeline".into()));
+    }
     if let Some(p) = t.parent {
         let parent = load_task(store, p).await.map_err(|e| match e {
             CommandError::NotFound(_) => CommandError::InvalidState(format!("parent task {p} not found")),
@@ -83,6 +91,7 @@ pub async fn create_task(store: &EventStore, actor: Actor, t: NewTask) -> Result
         external_ref: None,
         parent: t.parent,
         draft: !t.start,
+        autopilot: t.autopilot,
     };
     append(store, id, ExpectedVersion::NoStream, actor, ev).await?;
     Ok(id)
@@ -134,36 +143,9 @@ pub async fn answer(
     if asked.is_some_and(|s| s != pending.session) {
         return Err(CommandError::Conflict);
     }
-    let answers = check_answers(&pending.questions, answers)?;
+    let answers = wh_core::check_answers(&pending.questions, answers).map_err(CommandError::InvalidState)?;
     let ev = TaskEvent::UserAnswered { stage: pending.stage.clone(), answers, user: actor_name(&actor) };
     append(store, task, ExpectedVersion::Exact(state.version), actor, ev).await
-}
-
-/// One answer per question, each with an offered option and/or free text (both
-/// only when there is a single question). Blank text counts as none.
-fn check_answers(questions: &[Question], answers: Vec<Answer>) -> Result<Vec<Answer>> {
-    let invalid = |m: String| Err(CommandError::InvalidState(m));
-    if answers.len() != questions.len() {
-        return invalid(format!("expected {} answer(s), got {}", questions.len(), answers.len()));
-    }
-    let mut checked = Vec::with_capacity(answers.len());
-    for (i, (q, mut a)) in questions.iter().zip(answers).enumerate() {
-        let n = i + 1;
-        a.text = a.text.filter(|t| !t.trim().is_empty());
-        if a.option.is_none() && a.text.is_none() {
-            return invalid(format!("answer {n} is empty"));
-        }
-        if let Some(o) = &a.option
-            && !q.options.contains(o)
-        {
-            return invalid(format!("answer {n}: {o:?} is not one of the offered options"));
-        }
-        if questions.len() > 1 && a.option.is_some() && a.text.is_some() {
-            return invalid(format!("answer {n}: give an option or text, not both, when there are several questions"));
-        }
-        checked.push(a);
-    }
-    Ok(checked)
 }
 
 /// Restart a blocked task, optionally at another stage, with guidance for the agent.
@@ -188,13 +170,19 @@ pub async fn resume(
 }
 
 /// Start a draft task (the foreman then runs its first stage). With `subtree`,
-/// also every draft below it, parents first. Returns the tasks started.
-pub async fn activate(store: &EventStore, actor: Actor, task: TaskId, subtree: bool) -> Result<Vec<TaskId>> {
+/// also every draft below it, parents first. With `autopilot`, the autopilot agent
+/// decides their gates and answers their agents' questions instead of a human.
+/// Returns the tasks started.
+pub async fn activate(store: &EventStore, actor: Actor, task: TaskId, subtree: bool, autopilot: bool) -> Result<Vec<TaskId>> {
     let state = load_task(store, task).await?;
+    if autopilot && state.factory.is_none() && !subtree {
+        return Err(CommandError::InvalidState("autopilot needs a factory pipeline".into()));
+    }
     let mut started = Vec::new();
     match state.status {
         TaskStatus::Draft => {
-            append(store, task, ExpectedVersion::Exact(state.version), actor.clone(), TaskEvent::TaskActivated {}).await?;
+            let ev = TaskEvent::TaskActivated { autopilot: autopilot && state.factory.is_some() };
+            append(store, task, ExpectedVersion::Exact(state.version), actor.clone(), ev).await?;
             started.push(task);
         }
         _ if subtree => {}
@@ -210,7 +198,8 @@ pub async fn activate(store: &EventStore, actor: Actor, task: TaskId, subtree: b
         for id in wh_metrics::queries::descendants(store.pool(), task.0).await?.into_iter().map(TaskId) {
             let s = load_task(store, id).await?;
             if s.status == TaskStatus::Draft {
-                append(store, id, ExpectedVersion::Exact(s.version), actor.clone(), TaskEvent::TaskActivated {}).await?;
+                let ev = TaskEvent::TaskActivated { autopilot: autopilot && s.factory.is_some() };
+                append(store, id, ExpectedVersion::Exact(s.version), actor.clone(), ev).await?;
                 started.push(id);
             }
         }

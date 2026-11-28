@@ -28,6 +28,9 @@ const DEFAULT_IMPROVER_TIMEOUT_MIN: u64 = 20;
 const DEFAULT_WINDOW_DAYS: u32 = 14;
 const DEFAULT_MIN_SESSIONS: u64 = 5;
 const DEFAULT_MAX_OPEN_PROPOSALS: u32 = 3;
+const DEFAULT_AUTOPILOT_MODEL: &str = "claude-sonnet-5-5";
+const DEFAULT_AUTOPILOT_BUDGET_USD: f64 = 0.5;
+const DEFAULT_AUTOPILOT_TIMEOUT_MIN: u64 = 10;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +50,19 @@ struct FactoryFile {
     improvement: Option<ImprovementFile>,
     github: Option<GithubFile>,
     task_database: Option<TaskDatabase>,
+    autopilot: Option<AutopilotFile>,
+}
+
+/// `autopilot:`: the agent that decides gates and answers questions for tasks
+/// started in autopilot mode. Optional; every field has a default.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutopilotFile {
+    /// Extra policy for the autopilot (markdown, relative to the factory file).
+    prompt: Option<PathBuf>,
+    model: Option<String>,
+    budget_usd: Option<f64>,
+    timeout_min: Option<u64>,
 }
 
 /// `task_database:`: every task gets its own database on this server, and its
@@ -459,6 +475,18 @@ pub struct Factory {
     pub improvement: Option<Improvement>,
     pub github: Option<Github>,
     pub task_database: Option<TaskDatabase>,
+    /// Always set (defaults when the file has no `autopilot:`).
+    pub autopilot: Autopilot,
+}
+
+/// Settings of the autopilot agent (see `autopilot:` in factory.yaml).
+#[derive(Debug, Clone)]
+pub struct Autopilot {
+    /// Factory-specific policy added to the autopilot's prompt (None = built-in only).
+    pub guidelines: Option<String>,
+    pub model: String,
+    pub budget_usd: f64,
+    pub timeout: Duration,
 }
 
 impl Factory {
@@ -684,6 +712,35 @@ impl Factory {
             }
         };
 
+        let autopilot = {
+            let ap = file.autopilot.as_ref();
+            let guidelines = match ap.and_then(|a| a.prompt.as_ref()) {
+                None => None,
+                Some(p) => {
+                    let path = base.join(p);
+                    let text = std::fs::read_to_string(&path)
+                        .with_context(|| format!("autopilot: read prompt {}", path.display()))?;
+                    hasher.update(b"autopilot:");
+                    hasher.update(text.as_bytes());
+                    Some(text)
+                }
+            };
+            let budget_usd = ap.and_then(|a| a.budget_usd).unwrap_or(DEFAULT_AUTOPILOT_BUDGET_USD);
+            ensure!(budget_usd > 0.0, "autopilot: budget_usd must be > 0");
+            ensure!(ap.and_then(|a| a.timeout_min) != Some(0), "autopilot: timeout_min must be > 0");
+            Autopilot {
+                guidelines,
+                model: ap
+                    .and_then(|a| a.model.clone())
+                    .or_else(|| d.model.clone())
+                    .unwrap_or_else(|| DEFAULT_AUTOPILOT_MODEL.into()),
+                budget_usd,
+                timeout: Duration::from_secs(
+                    60 * ap.and_then(|a| a.timeout_min).unwrap_or(DEFAULT_AUTOPILOT_TIMEOUT_MIN),
+                ),
+            }
+        };
+
         let repo_path = base.join(&file.repo);
         let repo = std::fs::canonicalize(&repo_path)
             .with_context(|| format!("repo {} not found", repo_path.display()))?;
@@ -706,6 +763,7 @@ impl Factory {
             improvement,
             github,
             task_database: file.task_database,
+            autopilot,
         })
     }
 
@@ -821,6 +879,37 @@ improvement:
             ("unknown field", OK.replace("max_retries: 1 }", "max_retries: 1, max_question: 2 }")),
         ] {
             let err = format!("{:#}", load(&yaml).unwrap_err());
+            assert!(err.contains(needle), "expected '{needle}' in: {err}");
+        }
+    }
+
+    #[test]
+    fn autopilot_defaults_override_and_versioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), OK);
+        let base = Factory::load(&path).unwrap();
+        let ap = &base.autopilot;
+        assert_eq!((ap.model.as_str(), ap.budget_usd, ap.guidelines.is_none()), ("claude-sonnet-5-5", 0.5, true));
+        assert_eq!(ap.timeout, Duration::from_secs(10 * 60));
+
+        let yaml = format!("{OK}autopilot: {{ prompt: autopilot.md, model: claude-haiku-5-5, budget_usd: 0.2, timeout_min: 3 }}\n");
+        let path = write(dir.path(), &yaml);
+        std::fs::write(dir.path().join("autopilot.md"), "policy").unwrap();
+        let f = Factory::load(&path).unwrap();
+        let ap = &f.autopilot;
+        assert_eq!((ap.model.as_str(), ap.budget_usd, ap.guidelines.as_deref()), ("claude-haiku-5-5", 0.2, Some("policy")));
+        assert_eq!(ap.timeout, Duration::from_secs(3 * 60));
+        let v1 = f.version.clone();
+        std::fs::write(dir.path().join("autopilot.md"), "new policy").unwrap();
+        assert_ne!(Factory::load(&path).unwrap().version, v1, "the policy is part of the version");
+
+        for (needle, tail) in [
+            ("budget_usd must be > 0", "autopilot: { budget_usd: 0 }\n"),
+            ("timeout_min must be > 0", "autopilot: { timeout_min: 0 }\n"),
+            ("unknown field", "autopilot: { modle: x }\n"),
+            ("read prompt", "autopilot: { prompt: missing.md }\n"),
+        ] {
+            let err = format!("{:#}", Factory::load(&write(dir.path(), &format!("{OK}{tail}"))).unwrap_err());
             assert!(err.contains(needle), "expected '{needle}' in: {err}");
         }
     }
