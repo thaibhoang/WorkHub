@@ -146,6 +146,7 @@ async fn full_pipeline_with_gate_and_review_rework(pool: PgPool) {
         external_ref: None,
         parent: None,
         draft: false,
+        autopilot: false,
     };
     append(&store, task, created).await;
     sub.catch_up(&mut foreman).await.unwrap();
@@ -207,7 +208,7 @@ fn foreman_name() -> &'static str {
 async fn run_to_gate_and_approve(store: &EventStore, foreman: &mut Foreman<Fake>, task: TaskId) {
     let sub = Subscription::new(store.clone());
     let created =
-        TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("test".into()), benchmark: None, external_ref: None, parent: None, draft: false };
+        TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("test".into()), benchmark: None, external_ref: None, parent: None, draft: false, autopilot: false };
     append(store, task, created).await;
     sub.catch_up(foreman).await.unwrap();
     append(store, task, TaskEvent::GateDecided {
@@ -253,7 +254,7 @@ async fn failed_stage_blocks_and_gate_reject_reruns_stage(pool: PgPool) {
     // Gate rejection sends spec back with the reviewer's comment as feedback.
     let task = TaskId::new();
     let created =
-        TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("test".into()), benchmark: None, external_ref: None, parent: None, draft: false };
+        TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("test".into()), benchmark: None, external_ref: None, parent: None, draft: false, autopilot: false };
     append(&store, task, created).await;
     sub.catch_up(&mut foreman).await.unwrap();
     append(&store, task, TaskEvent::GateDecided {
@@ -284,7 +285,7 @@ async fn failed_stage_blocks_and_gate_reject_reruns_stage(pool: PgPool) {
 
     // Tasks without this factory are ignored.
     let manual = TaskId::new();
-    append(&store, manual, TaskEvent::TaskCreated { title: "m".into(), body: None, source: TaskSource::Cli, factory: None, benchmark: None, external_ref: None, parent: None, draft: false }).await;
+    append(&store, manual, TaskEvent::TaskCreated { title: "m".into(), body: None, source: TaskSource::Cli, factory: None, benchmark: None, external_ref: None, parent: None, draft: false, autopilot: false }).await;
     sub.catch_up(&mut foreman).await.unwrap();
     assert_eq!(load(&store, manual).await.version, 1);
 }
@@ -293,7 +294,7 @@ async fn failed_stage_blocks_and_gate_reject_reruns_stage(pool: PgPool) {
 async fn paused_task(store: &EventStore, home: wh_core::SessionId) -> TaskId {
     let task = TaskId::new();
     let created =
-        TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("test".into()), benchmark: None, external_ref: None, parent: None, draft: false };
+        TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("test".into()), benchmark: None, external_ref: None, parent: None, draft: false, autopilot: false };
     append(store, task, created).await;
     append(store, task, TaskEvent::StageEntered { stage: "spec".into(), feedback: None }).await;
     let resume = wh_core::task::ResumeHandle {
@@ -355,7 +356,7 @@ async fn interrupted_stage_is_blocked_on_startup_and_resumable(pool: PgPool) {
     let store = EventStore::new(pool.clone());
     let task = TaskId::new();
     let created =
-        TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("test".into()), benchmark: None, external_ref: None, parent: None, draft: false };
+        TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("test".into()), benchmark: None, external_ref: None, parent: None, draft: false, autopilot: false };
     append(&store, task, created).await;
     // Simulate a foreman that died right after dispatching: StageEntered + dangling session.
     append(&store, task, TaskEvent::StageEntered { stage: "spec".into(), feedback: None }).await;

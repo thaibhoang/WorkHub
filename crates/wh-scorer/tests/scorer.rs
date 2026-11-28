@@ -115,6 +115,7 @@ async fn create_task(store: &EventStore, factory: Option<&str>) -> TaskId {
         external_ref: None,
         parent: None,
         draft: false,
+        autopilot: false,
     };
     let meta = EventMeta::new(task.0, Actor::Human { user: "t".into() });
     store.append(&task.stream_id(), ExpectedVersion::NoStream, vec![NewEvent::from_domain(&ev, meta).unwrap()]).await.unwrap();

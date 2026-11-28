@@ -86,6 +86,26 @@ export interface TaskSummary {
   pr_rework_loops: number
   /** Parent task (tasks form a tree). */
   parent_id: string | null
+  /** Gates and questions are decided by the autopilot agent. */
+  autopilot: boolean
+}
+
+/** One gate decision / question set handled by the autopilot. */
+export interface AutopilotRun {
+  request_version: number
+  kind: 'gate' | 'questions'
+  stage: string
+  gate: string | null
+  model: string | null
+  /** failed = left to a human */
+  status: 'running' | 'decided' | 'failed'
+  decision: 'approve' | 'reject' | 'answered' | null
+  /** Comment for the agent, or the answers. */
+  detail: string | null
+  rationale: string | null
+  message: string | null
+  cost_usd: number
+  started_at: string
 }
 
 export interface EventMeta {
@@ -162,6 +182,8 @@ export interface TaskState {
   pr_rework_loops: number
   external_ref: { repo: string; issue: number; url: string } | null
   parent: string | null
+  /** Gates and questions are decided by the autopilot agent. */
+  autopilot: boolean
 }
 
 export interface TaskDetail {
@@ -174,6 +196,8 @@ export interface TaskDetail {
   events: WhEvent[]
   sessions: SessionDetail[]
   scores: ScoreRow[]
+  /** What the autopilot decided (autopilot tasks only), oldest first. Missing from older servers. */
+  autopilot?: AutopilotRun[]
 }
 
 /** One scorer run (LLM-as-judge grading one session); `score_results` row. */
@@ -542,14 +566,15 @@ export const api = {
   // The Runs page pages through the list itself; the server returns at most 1000.
   tasks: (status?: string) => request<TaskSummary[]>('GET', `/tasks?limit=1000${status ? `&status=${status}` : ''}`),
   task: (id: string) => request<TaskDetail>('GET', `/tasks/${id}`),
-  createTask: (b: { title: string; body?: string; pipeline?: boolean; parent?: string; start?: boolean }) =>
+  createTask: (b: { title: string; body?: string; pipeline?: boolean; parent?: string; start?: boolean; autopilot?: boolean }) =>
     request<{ task_id: string; factory: string | null }>('POST', '/tasks', b),
   decideGate: (id: string, approved: boolean, comment?: string) =>
     request<{ message: string }>('POST', `/tasks/${id}/gate`, { approved, comment }),
   resume: (id: string, stage?: string, comment?: string) =>
     request<{ message: string }>('POST', `/tasks/${id}/resume`, { stage, comment }),
   cancel: (id: string, reason: string) => request<{ message: string }>('POST', `/tasks/${id}/cancel`, { reason }),
-  startTask: (id: string, subtree = false) => request<{ message: string }>('POST', `/tasks/${id}/start`, { subtree }),
+  startTask: (id: string, subtree = false, autopilot = false) =>
+    request<{ message: string }>('POST', `/tasks/${id}/start`, { subtree, autopilot }),
   moveTask: (id: string, parent: string | null) => request<{ message: string }>('POST', `/tasks/${id}/move`, { parent }),
   sessions: (limit = 100) => request<SessionDetail[]>('GET', `/sessions?limit=${limit}`),
   transcript: (id: string) => request<Transcript>('GET', `/sessions/${id}/transcript`),

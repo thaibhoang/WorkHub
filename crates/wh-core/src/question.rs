@@ -58,6 +58,33 @@ pub fn format_answers(questions: &[Question], answers: &[Answer]) -> String {
     blocks.join("\n\n")
 }
 
+/// Validate answers to `questions`: one per question, each with an offered option
+/// and/or free text (both only when there is a single question). Blank text counts
+/// as none. Returns the cleaned answers or a message for the one who answered. Pure.
+pub fn check_answers(questions: &[Question], answers: Vec<Answer>) -> Result<Vec<Answer>, String> {
+    if answers.len() != questions.len() {
+        return Err(format!("expected {} answer(s), got {}", questions.len(), answers.len()));
+    }
+    let mut checked = Vec::with_capacity(answers.len());
+    for (i, (q, mut a)) in questions.iter().zip(answers).enumerate() {
+        let n = i + 1;
+        a.text = a.text.filter(|t| !t.trim().is_empty());
+        if a.option.is_none() && a.text.is_none() {
+            return Err(format!("answer {n} is empty"));
+        }
+        if let Some(o) = &a.option
+            && !q.options.contains(o)
+        {
+            return Err(format!("answer {n}: {o:?} is not one of the offered options"));
+        }
+        if questions.len() > 1 && a.option.is_some() && a.text.is_some() {
+            return Err(format!("answer {n}: give an option or text, not both, when there are several questions"));
+        }
+        checked.push(a);
+    }
+    Ok(checked)
+}
+
 /// The part after `QUESTION:`, without surrounding markdown.
 fn question_json(line: &str) -> Option<&str> {
     const PREFIX: &str = "QUESTION:";

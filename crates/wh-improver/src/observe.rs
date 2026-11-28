@@ -193,7 +193,8 @@ pub async fn gather(pool: &PgPool, factory: &str, version: &str, window_days: u3
 
     // Review rejections, human gate rejections, blocks and resume guidance (text lives in the log).
     let feedback: Vec<Feedback> = sqlx::query_as(
-        "SELECT e.event_type AS kind, e.payload->>'stage' AS stage, \
+        "SELECT CASE WHEN e.event_type = 'GateDecided' AND e.payload->>'reviewer' = 'autopilot' \
+             THEN 'AutopilotGateDecided' ELSE e.event_type END AS kind, e.payload->>'stage' AS stage, \
            COALESCE(e.payload->>'summary', e.payload->>'comment', e.payload->>'reason', \
              CASE WHEN e.event_type = 'PrReviewed' THEN e.payload->>'state' || ' by ' || (e.payload->>'reviewer') || ': ' \
                || COALESCE(e.payload->>'body', '') || COALESCE((SELECT ' | ' || string_agg( \
@@ -419,6 +420,7 @@ pub fn render(o: &Observation) -> String {
             let kind = match f.kind.as_str() {
                 "StageExited" => "review REJECT",
                 "GateDecided" => "human gate rejected",
+                "AutopilotGateDecided" => "autopilot gate rejected",
                 "TaskBlocked" => "task blocked",
                 "TaskResumed" => "human resumed with guidance",
                 "PrReviewed" => "human PR review",

@@ -420,6 +420,7 @@ impl<R: AgentRuntime + 'static> Inner<R> {
             external_ref: None,
             parent: None,
             draft: false,
+            autopilot: false,
         };
         let mut meta = EventMeta::new(task.0, Actor::System { component: "bench".into() });
         meta.causation_id = log.cause;

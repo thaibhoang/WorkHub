@@ -24,7 +24,7 @@ pub fn decide(state: &TaskState, f: &Factory) -> Option<Action> {
     match state.last.as_ref()? {
         // A draft waits for a human to activate it.
         TaskEvent::TaskCreated { draft: true, .. } => None,
-        TaskEvent::TaskCreated { .. } | TaskEvent::TaskActivated {} => Some(run(&f.first_stage().id, None)),
+        TaskEvent::TaskCreated { .. } | TaskEvent::TaskActivated { .. } => Some(run(&f.first_stage().id, None)),
         TaskEvent::StageExited { stage, outcome, summary, .. } => {
             let Some(st) = f.stage(stage) else {
                 return Some(block(Some(stage), format!("stage '{stage}' is not in factory '{}'", f.name)));
@@ -292,16 +292,17 @@ mod tests {
             external_ref: None,
             parent: None,
             draft,
+            autopilot: false,
         };
         let moved = || TaskEvent::TaskMoved { parent: Some(TaskId::new()) };
         let runs = |a: Option<Action>| matches!(a, Some(Action::RunStage { stage, feedback: None }) if stage == "impl");
         assert_eq!(decide(&state(vec![created(true)]), &f), None);
         assert_eq!(decide(&state(vec![created(true), moved()]), &f), None);
-        assert!(runs(decide(&state(vec![created(true), TaskEvent::TaskActivated {}]), &f)));
+        assert!(runs(decide(&state(vec![created(true), TaskEvent::TaskActivated { autopilot: false }]), &f)));
         assert!(runs(decide(&state(vec![created(false)]), &f)));
         // A move landing before the foreman acted must not swallow the start.
         assert!(runs(decide(&state(vec![created(false), moved()]), &f)));
-        assert!(runs(decide(&state(vec![created(true), TaskEvent::TaskActivated {}, moved()]), &f)));
+        assert!(runs(decide(&state(vec![created(true), TaskEvent::TaskActivated { autopilot: false }, moved()]), &f)));
         let entered = TaskEvent::StageEntered { stage: "impl".into(), feedback: None };
         assert_eq!(decide(&state(vec![created(false), entered, moved()]), &f), None);
     }

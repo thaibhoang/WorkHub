@@ -57,6 +57,7 @@ id_type!(SessionId, "session");
 id_type!(ProposalId, "proposal");
 id_type!(ScoreId, "score");
 id_type!(BenchmarkRunId, "bench");
+id_type!(AutopilotId, "autopilot");
 
 #[cfg(test)]
 mod tests {

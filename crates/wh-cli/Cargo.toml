@@ -20,6 +20,7 @@ wh-scorer.workspace = true
 wh-improver.workspace = true
 wh-bench.workspace = true
 wh-github.workspace = true
+wh-autopilot.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dotenvy.workspace = true

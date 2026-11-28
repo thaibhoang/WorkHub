@@ -58,7 +58,7 @@ async fn task_ev(store: &EventStore, task: TaskId, e: TaskEvent) {
 async fn answer_is_validated_and_recorded_once(pool: PgPool) {
     let (_, store) = app(&pool, None);
     let user = || Actor::Human { user: "thai".into() };
-    let new = NewTask { title: "t".into(), body: None, source: TaskSource::Cli, factory: None, parent: None, start: true };
+    let new = NewTask { title: "t".into(), body: None, source: TaskSource::Cli, factory: None, parent: None, start: true, autopilot: false };
     let task = commands::create_task(&store, user(), new).await.unwrap();
     let one = |option: Option<&str>, text: Option<&str>| {
         vec![Answer { option: option.map(Into::into), text: text.map(Into::into) }]
@@ -217,6 +217,54 @@ async fn drafts_start_on_demand_and_tasks_form_a_tree(pool: PgPool) {
     let types: Vec<_> =
         store.read_stream(&format!("task-{grandchild}")).await.unwrap().iter().map(|e| e.event_type.clone()).collect();
     assert_eq!(types, ["TaskCreated", "TaskMoved", "TaskMoved", "TaskActivated"], "the no-op move wrote nothing");
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn autopilot_is_chosen_when_starting(pool: PgPool) {
+    let (app, store) = app(&pool, Some(factory()));
+    let (st, err) = call(&app, "POST", "/api/tasks", Some(json!({"title": "x", "autopilot": true}))).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "a draft cannot pick autopilot yet");
+    assert!(err["error"].as_str().unwrap().contains("autopilot"), "{err}");
+    let (st, _) = call(&app, "POST", "/api/tasks", Some(json!({"title": "x", "pipeline": false, "start": true, "autopilot": true}))).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "no pipeline, nothing to decide");
+
+    let (st, r) = call(&app, "POST", "/api/tasks", Some(json!({"title": "now", "start": true, "autopilot": true}))).await;
+    assert_eq!(st, StatusCode::CREATED);
+    let now = r["task_id"].as_str().unwrap().to_owned();
+    let (_, r) = call(&app, "POST", "/api/tasks", Some(json!({"title": "later"}))).await;
+    let later = r["task_id"].as_str().unwrap().to_owned();
+    let (_, r) = call(&app, "POST", "/api/tasks", Some(json!({"title": "manual"}))).await;
+    let manual = r["task_id"].as_str().unwrap().to_owned();
+    let (st, r) = call(&app, "POST", &format!("/api/tasks/{later}/start"), Some(json!({"autopilot": true}))).await;
+    assert_eq!((st, r["message"].as_str()), (StatusCode::OK, Some("task started on autopilot")));
+    call(&app, "POST", &format!("/api/tasks/{manual}/start"), None).await;
+
+    for (t, on) in [(&now, true), (&later, true), (&manual, false)] {
+        let (_, d) = call(&app, "GET", &format!("/api/tasks/{t}"), None).await;
+        assert_eq!((d["state"]["autopilot"].as_bool(), d["task"]["autopilot"].as_bool()), (Some(on), Some(on)), "{t}");
+    }
+
+    // The autopilot's decisions show on the task.
+    let task: TaskId = later.parse().unwrap();
+    task_ev(&store, task, TaskEvent::GateRequested { gate: "g".into(), stage: "spec".into() }).await;
+    let version = store.read_stream(&task.stream_id()).await.unwrap().len() as i64;
+    let stream = wh_core::AutopilotId::for_request(task, version).stream_id();
+    let meta = || EventMeta::new(task.0, Actor::System { component: "autopilot".into() });
+    let started = wh_core::autopilot::AutopilotEvent::AutopilotStarted {
+        task_id: task,
+        kind: wh_core::autopilot::AutopilotKind::Gate,
+        stage: "spec".into(),
+        gate: Some("g".into()),
+        request_version: version,
+        model: Some("m".into()),
+    };
+    let failed = wh_core::autopilot::AutopilotEvent::AutopilotFailed { message: "no JSON".into(), cost_usd: 0.03, duration_ms: 1, transcript: None };
+    let evs = vec![NewEvent::from_domain(&started, meta()).unwrap(), NewEvent::from_domain(&failed, meta()).unwrap()];
+    store.append(&stream, ExpectedVersion::NoStream, evs).await.unwrap();
+    let (_, d) = call(&app, "GET", &format!("/api/tasks/{later}"), None).await;
+    let run = &d["autopilot"][0];
+    assert_eq!((run["status"].as_str(), run["kind"].as_str(), run["message"].as_str()), (Some("failed"), Some("gate"), Some("no JSON")));
+    assert_eq!(run["cost_usd"], 0.03);
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
@@ -551,6 +599,7 @@ async fn sse_replays_after_cursor_and_filters_by_task(pool: PgPool) {
         external_ref: None,
         parent: None,
         draft: false,
+        autopilot: false,
     };
     task_ev(&store, a, created("a")).await;
     task_ev(&store, b, created("b")).await;

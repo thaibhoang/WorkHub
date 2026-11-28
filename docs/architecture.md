@@ -98,6 +98,8 @@ Mỗi stage và gate đều có thể cấu hình bật/tắt, agent nào, model
 
 **Draft và cây task.** Task tạo từ CLI/UI/API mặc định là **draft** (`TaskCreated.draft = true`, trạng thái `draft`): foreman không chạy gì cho tới khi người kích hoạt (`TaskActivated`, `wh task start`, nút Start; `--subtree` / "Start with subtasks" kích hoạt luôn mọi draft bên dưới, cha trước con). `--start` / `start: true` bỏ qua bước draft. Event cũ không có field này (= false) nên chạy ngay như trước; task từ GitHub issue, benchmark và `wh run` cũng chạy ngay. Task có thể có cha (`TaskCreated.parent`) và đổi cha bằng `TaskMoved` (`wh task move`, nút Move). Cây luôn là **tree**: tạo con với id mới không thể tạo vòng; `move_task` đi ngược tổ tiên của cha mới trên event stream (không dùng read model) và từ chối nếu gặp chính task đó, dưới một advisory lock riêng để hai lần move song song không cùng nhau tạo vòng. `TaskMoved` không phải event pipeline: `TaskState.last` bỏ qua nó, nên một lần move chen vào trước khi foreman hành động không làm mất bước tiếp theo. Cha và con chạy độc lập (kích hoạt, huỷ, hoàn thành của cha không lan xuống con). Read model: `tasks_view.parent_id` (migration 0013).
 
+**Autopilot (chạy không cần người).** Khi start task (`wh task create --start --autopilot`, `wh task start --autopilot`, ô "Autopilot" ở UI, API `start`/`autopilot`), người dùng chọn chế độ autopilot: `TaskCreated.autopilot` (chỉ khi `start`, draft thì chọn lúc kích hoạt) hoặc `TaskActivated{autopilot}` (cả `--subtree`). Task cần có factory. Khi task đó dừng ở **gate** (`GateRequested`, cả gate `ship` và `conflict`) hoặc agent **hỏi** (`AgentAsked`), một agent độc lập (`wh-autopilot`, §5.9) đọc yêu cầu rồi quyết định thay người, ghi `GateDecided` / `UserAnswered` với reviewer/user `autopilot` và actor `System{autopilot}`. Foreman không đổi gì, chỉ chạy tiếp như khi người duyệt. Người vẫn có thể tự duyệt: quyết định nào tới trước được tính (`Exact`). Autopilot không bao giờ resume task bị block (vượt `max_rework_loops`, stage fail): những trường hợp đó vẫn cần người. Hiện pipeline chưa bật pause (phần 4b), nên trên thực tế autopilot mới chỉ quyết định gate. Phần trả lời câu hỏi đã làm và có test, sẽ tự chạy khi `AgentAsked` được phát. Read model: `tasks_view.autopilot` (migration 0014).
+
 ---
 
 ## 4. Event model
@@ -130,7 +132,7 @@ pub struct EventMeta {
 
 ### 4.2 Danh mục event chính
 
-**Task**: `TaskCreated{source, title, body, factory, benchmark, external_ref, parent, draft}`, `TaskActivated{}`, `TaskMoved{parent}`, `TaskTriaged{priority, kind, estimate}`, `StageEntered{stage, feedback}`, `StageExited{stage, outcome, summary, session}`, `GateRequested{gate, stage}`, `GateDecided{gate, stage, approved, reviewer, comment}`, `TaskBlocked{stage, reason}`, `TaskResumed{stage, comment}`, `TaskCompleted{branch}`, `TaskCancelled{reason}`. Mỗi `GateRequested` chỉ nhận một quyết định: status vẫn là chờ gate cho tới khi foreman hành động (`TaskState.gate_decided`), quyết định lặp lại trả 409 và không ghi thêm `GateDecided`.
+**Task**: `TaskCreated{source, title, body, factory, benchmark, external_ref, parent, draft, autopilot}`, `TaskActivated{autopilot}`, `TaskMoved{parent}`, `TaskTriaged{priority, kind, estimate}`, `StageEntered{stage, feedback}`, `StageExited{stage, outcome, summary, session}`, `GateRequested{gate, stage}`, `GateDecided{gate, stage, approved, reviewer, comment}`, `TaskBlocked{stage, reason}`, `TaskResumed{stage, comment}`, `TaskCompleted{branch}`, `TaskCancelled{reason}`. Mỗi `GateRequested` chỉ nhận một quyết định: status vẫn là chờ gate cho tới khi foreman hành động (`TaskState.gate_decided`), quyết định lặp lại trả 409 và không ghi thêm `GateDecided`.
 
 **Hỏi đáp** (cũng trên stream `task-{id}`): `AgentAsked{stage, session, questions[{text, options[]}], resume{home_session, runtime_session_id, branch, conflicts[]}}`, `UserAnswered{stage, answers[{option, text}], user}` (`answers[i]` trả lời `questions[i]`, `option` là nội dung lựa chọn), `StageResumed{stage}` (nhận việc chạy tiếp, vì resume không ghi `StageEntered`). `resume` được **lưu** trên event chứ không dựng lại (đường dẫn conflict khi merge không có ở event nào khác); event cũ không có = `None`. `TaskState` giữ câu hỏi đang chờ, số lượt hỏi kể từ `StageEntered` gần nhất (giới hạn bởi `max_questions`, sẽ áp dụng ở phần 4b), `paused` (stage, session, `resume`; xóa khi `StageEntered`/`StageExited`) và `dialogue` (các lượt hỏi đáp, xóa khi `StageEntered`); cả hai còn nguyên qua `TaskBlocked`/`TaskResumed`.
 
@@ -148,6 +150,8 @@ Lệnh trả lời (`wh_api::commands::answer`, dùng chung CLI và API sau này
 - `AgentSessionFailed{failure_class, message, retryable}`
 
 **Quality / Improvement** (stream `score-{id}`): `ScoreStarted{scorer, target_session, task_id, agent, stage, model, pass_threshold, manual}`, `ScoreRecorded{score, pass, classification, rationale, cost_usd, usage}`, `ScoreFailed{message, cost_usd}`.
+
+**Autopilot** (stream `autopilot-{id}`, id = UUIDv5(task, version của `GateRequested`/`AgentAsked`)): `AutopilotStarted{task_id, kind: gate|questions, stage, gate, request_version, model}` (append `NoStream` để claim, mỗi yêu cầu chỉ chạy model một lần), rồi `AutopilotDecided{decision: approve|reject|answered, detail, rationale, cost_usd, usage, duration_ms, transcript}` | `AutopilotFailed{message, cost_usd, duration_ms, transcript}` (để lại cho người).
 
 **Benchmark** (stream `bench-{id}`): `BenchmarkRequested{suite, suite_file, git_ref, proposal, label, repeat, cases}`, `BenchmarkStarted{factory, factory_version, factory_commit, suite_version, planned, pid}`, `BenchmarkCaseStarted{case, repeat, task_id}`, `BenchmarkCaseFinished{case, repeat, task_id, task_status, passed, check, cost_usd, duration_ms, sessions, rework_loops, message}`, `BenchmarkCompleted{cases, passed, cost_usd, duration_ms, aborted}` | `BenchmarkFailed{message}`.
 
@@ -242,6 +246,15 @@ Tập task cố định (có check chấm tự động) để chạy lại với
 - Phase 6 thêm Benchmarks (suite, danh sách run, chạy run, so sánh hai run), trang chi tiết run benchmark (từng case kèm output của check), thẻ Benchmark trên trang proposal (base vs proposal) và banner "benchmark case" trên trang task.
 - Phase 3 đã làm: Runs, Run detail (pipeline strip, duyệt gate / resume / cancel, Gantt session theo stage, stage outputs, transcript, raw events), Inbox (gate + blocked; proposal đợi phase 5), Dashboard, Factory. Phase 4 thêm Scorers (pass rate / cost theo scorer, kết quả gần đây), điểm trên từng session, ô pass rate + judge cost trên Dashboard. Phase 5 thêm Self-improvement (track record của improver, proposal, metrics theo factory_version kèm delta), trang proposal (diff, evidence, duyệt/áp dụng, before → after) và proposal trong Inbox. Agents để phase sau.
 
+### 5.9 Autopilot (`wh-autopilot`)
+- `AutopilotService` (consumer `autopilot:<factory>`, chạy trong `wh foreman` / `serve --foreman`, tắt bằng `--no-autopilot`) nghe `GateRequested` và `AgentAsked`. Nó chỉ xử lý task có `autopilot`, thuộc factory của nó và không phải benchmark (benchmark đã tự duyệt gate).
+- Claim bằng `AutopilotStarted` (`NoStream`, id theo (task, request version)) rồi chạy Claude Code **không tool** (`tools: []`, `Ephemeral`, thư mục tạm), giống judge của scorer. Prompt (`prompt.rs`, thuần, có unit test) gồm task, các stage của pipeline, output của các stage (output mới nhất đầy đủ), số rework loop đã dùng / giới hạn, `git diff --stat --patch <base_ref>...wh/task/<id>`, các lượt hỏi đáp trước đó, policy riêng của factory (`autopilot.prompt`) và loại yêu cầu: gate thường, `ship`, hay `conflict` (kèm base).
+- Model trả lời bằng JSON ở cuối. Gate: `{"decision": "approve"|"reject", "comment", "rationale"}`, reject bắt buộc có comment. Câu hỏi: `{"answers": [{"option"}|{"text"}], "rationale"}`, kiểm bằng `wh_core::check_answers` (dùng chung với `commands::answer`). Option khớp không phân biệt hoa thường; option không có trong danh sách thì chuyển thành text.
+- Quyết định được append `Exact` trên version hiện tại của task, nhưng chỉ khi task **vẫn chờ đúng yêu cầu đó** (event không liên quan như `TaskMoved` hay PR poll chen vào thì vẫn ghi được; người duyệt trước hoặc task bị huỷ thì bỏ). Sau đó append `AutopilotDecided` (`Exact(1)`). Model lỗi, câu trả lời không dùng được, hoặc task đã đi tiếp thì ghi `AutopilotFailed`: gate/câu hỏi để lại cho người, UI hiện lý do.
+- Khởi động: lần đầu checkpoint nhảy tới head. `recover()` làm tiếp các claim dở (chỉ có `AutopilotStarted`, process trước chết giữa chừng; nếu task đã đi tiếp thì đóng bằng `AutopilotFailed`). Sau đó nó quyết định mọi yêu cầu đang chờ của task autopilot mà chưa có claim. Yêu cầu đã `AutopilotFailed` thì không thử lại.
+- Cost của autopilot nằm trên stream `autopilot-*` (không phải session), nên không lẫn vào metrics của agent. Improver thấy gate bị autopilot reject với nhãn "autopilot gate rejected". API `GET /api/tasks/:id` trả `autopilot[]` (đọc stream theo từng `GateRequested`/`AgentAsked`). UI hiện badge, thẻ "Autopilot decisions" (quyết định, comment/câu trả lời, lý do, cost) và ghi chú trên thẻ gate.
+- Chưa có: read model / tổng cost autopilot trên Dashboard, bật/tắt autopilot giữa chừng, chạy lại sau khi fail (người tự duyệt).
+
 ---
 
 ## 6. Factory-as-code (ví dụ)
@@ -303,6 +316,12 @@ improvement:
     - { metric: stage_failure_rate, stage: implement, above: 0.3 }
     - { metric: stage_reject_rate, stage: code_review, above: 0.5 }
     - { metric: scorer_fail_rate, scorer: test-evidence, above: 0.4 }
+
+autopilot:                         # tuỳ chọn; chỉ dùng cho task start ở chế độ autopilot
+  prompt: autopilot.md             # policy riêng (tuỳ chọn, tính vào factory_version)
+  model: claude-sonnet-5-5         # mặc định: defaults.model, rồi claude-sonnet-5-5
+  budget_usd: 0.5                  # mỗi quyết định
+  timeout_min: 10
 ```
 
 ---
@@ -322,6 +341,7 @@ WorkHub/
 │   ├── wh-scorer/
 │   ├── wh-improver/
 │   ├── wh-bench/             # benchmark suites, runs, comparison
+│   ├── wh-autopilot/         # agent quyết định gate / trả lời câu hỏi thay người (chế độ autopilot)
 │   ├── wh-artifacts/         # transcript / diff / report storage
 │   ├── wh-api/               # axum, SSE
 │   └── wh-cli/               # `wh` binary: task create, run, replay projection…

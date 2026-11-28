@@ -160,6 +160,7 @@ impl GithubService {
                 external_ref: Some(ExternalRef { repo: repo.to_owned(), issue: i.number, url: i.url.clone() }),
                 parent: None,
                 draft: false,
+                autopilot: false,
             };
             let Ok(new) = NewEvent::from_domain(&ev, self.meta(task)) else { continue };
             match self.store.append(&task.stream_id(), ExpectedVersion::NoStream, vec![new]).await {
