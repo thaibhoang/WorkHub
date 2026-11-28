@@ -26,7 +26,7 @@ fn factory() -> Factory {
 
 fn app(pool: &PgPool, factory: Option<Factory>) -> (Router, EventStore) {
     let store = EventStore::new(pool.clone());
-    let state = AppState { store: store.clone(), factory: factory.map(Arc::new), live: Live::detached(0), bench_dir: PathBuf::from("benchmarks"), auth: Default::default() };
+    let state = AppState { store: store.clone(), factory: factory.map(Arc::new), live: Live::detached(0), bench_dir: PathBuf::from("benchmarks"), auth: Default::default(), self_update: Default::default() };
     (wh_api::app(state, None), store)
 }
 
@@ -527,7 +527,7 @@ async fn benchmark_suites_queue_and_runs(pool: PgPool) {
     .unwrap();
     std::fs::write(dir.path().join("broken.yaml"), "name: broken\n").unwrap();
     let store = EventStore::new(pool.clone());
-    let state = AppState { store: store.clone(), factory: None, live: Live::detached(0), bench_dir: dir.path().to_owned(), auth: Default::default() };
+    let state = AppState { store: store.clone(), factory: None, live: Live::detached(0), bench_dir: dir.path().to_owned(), auth: Default::default(), self_update: Default::default() };
     let app = wh_api::app(state, None);
 
     let (st, suites) = call(&app, "GET", "/api/benchmarks/suites", None).await;
@@ -570,6 +570,7 @@ fn auth_app(pool: &PgPool) -> (Router, EventStore) {
         live: Live::detached(0),
         bench_dir: PathBuf::from("benchmarks"),
         auth: wh_api::auth::AuthConfig::new(true, Some("https://wh.example.com".into()), true),
+        self_update: Default::default(),
     };
     (wh_api::app(state, None), store)
 }
@@ -784,7 +785,7 @@ async fn the_ui_is_revalidated_but_hashed_assets_are_cached(pool: PgPool) {
     std::fs::write(dir.join("index.html"), "<html></html>").unwrap();
     std::fs::write(dir.join("assets/index-abc.js"), "1").unwrap();
     let store = EventStore::new(pool.clone());
-    let state = AppState { store, factory: None, live: Live::detached(0), bench_dir: PathBuf::from("benchmarks"), auth: Default::default() };
+    let state = AppState { store, factory: None, live: Live::detached(0), bench_dir: PathBuf::from("benchmarks"), auth: Default::default(), self_update: Default::default() };
     let app = wh_api::app(state, Some(dir.clone()));
     let cache = |uri: &'static str| {
         let app = app.clone();
@@ -799,4 +800,18 @@ async fn the_ui_is_revalidated_but_hashed_assets_are_cached(pool: PgPool) {
     assert_eq!(cache("/assets/index-abc.js").await.as_deref(), Some("public, max-age=31536000, immutable"));
     assert_eq!(cache("/api/health").await, None);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn self_update_is_refused_when_disabled(pool: PgPool) {
+    let (app, _) = app(&pool, None);
+    let (s, v) = call(&app, "GET", "/api/system", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["self_update"]["enabled"], false);
+    assert!(v["self_update"]["reason"].as_str().is_some());
+    assert!(!v["boot_id"].as_str().unwrap().is_empty());
+    let (s, _) = call(&app, "POST", "/api/system/update", None).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    let (s, _) = call(&app, "POST", "/api/system/update/check", None).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
 }

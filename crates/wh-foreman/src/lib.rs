@@ -58,6 +58,10 @@ pub struct Foreman<R> {
     janitor: Option<Arc<Notify>>,
     /// Server for per-task databases: the value of `task_database.admin_url_env`.
     task_db_admin: Option<String>,
+    /// Restart coordination (`wh serve` self-update): while draining, no new event
+    /// is handled (so none is checkpointed, and it is redelivered after the
+    /// restart) and stage runs already accepted are counted until they finish.
+    drain: Option<Arc<wh_core::Drain>>,
 }
 
 /// Reviewer recorded on gates a benchmark foreman approves.
@@ -76,7 +80,14 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             name,
             gh: wh_github::Gh::default(),
             janitor: None,
+            drain: None,
         }
+    }
+
+    /// Take part in draining before a restart (see the `drain` field).
+    pub fn with_drain(mut self, drain: Arc<wh_core::Drain>) -> Self {
+        self.drain = Some(drain);
+        self
     }
 
     /// Notify `wake` whenever one of this foreman's tasks is done or cancelled.
@@ -116,6 +127,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             name,
             gh: wh_github::Gh::default(),
             janitor: None,
+            drain: None,
         }
     }
 
@@ -268,7 +280,9 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             Dispatch::Inline => run.await,
             Dispatch::Spawn(limit) => {
                 let limit = limit.clone();
+                let guard = self.drain.as_ref().map(|d| d.track());
                 tokio::spawn(async move {
+                    let _guard = guard;
                     let _permit = limit.acquire_owned().await;
                     if let Err(e) = run.await {
                         tracing::error!(%task, "stage run failed: {e:#}");
@@ -374,6 +388,16 @@ impl<R: AgentRuntime + 'static> EventHandler for Foreman<R> {
     }
 
     async fn handle(&mut self, ev: &RecordedEvent) -> anyhow::Result<()> {
+        // While draining, hold the event (never checkpointed) until the process is replaced.
+        let _guard = match &self.drain {
+            Some(d) => loop {
+                match d.enter() {
+                    Some(g) => break Some(g),
+                    None => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+                }
+            },
+            None => None,
+        };
         let Some(task) = TaskId::from_stream_id(&ev.stream_id) else {
             return Ok(());
         };

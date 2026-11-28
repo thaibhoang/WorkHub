@@ -504,7 +504,38 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return data as T
 }
 
+export type UpdateStepStatus = 'pending' | 'running' | 'done' | 'skipped' | 'failed'
+export interface UpdateJob {
+  state: 'running' | 'failed' | 'restarting'
+  steps: { id: string; label: string; status: UpdateStepStatus; output: string }[]
+  started_at: string
+  finished_at: string | null
+  error: string | null
+  from: string | null
+  to: string | null
+  force: boolean
+}
+export interface SystemInfo {
+  boot_id: string
+  version: string
+  commit: string | null
+  self_update: { enabled: boolean; reason: string | null; branch: string | null; repo: string | null }
+  job: UpdateJob | null
+  busy: number
+}
+export interface UpdateCheck {
+  branch: string
+  expected_branch: string
+  dirty: boolean
+  head: string
+  commits: { sha: string; subject: string }[]
+  blocked: string | null
+}
+
 export const api = {
+  system: () => request<SystemInfo>('GET', '/system'),
+  checkUpdate: () => request<UpdateCheck>('POST', '/system/update/check'),
+  startUpdate: (force = false) => request<{ message: string }>('POST', '/system/update', { force }),
   me: () => request<Me>('GET', '/auth/me'),
   login: (username: string, password: string) => request<Me>('POST', '/auth/login', { username, password }),
   logout: () => request<null>('POST', '/auth/logout'),
