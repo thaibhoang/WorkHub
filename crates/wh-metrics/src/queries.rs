@@ -39,13 +39,15 @@ pub struct TaskSummary {
     pub changes_requested: i32,
     pub ci_failures: i32,
     pub pr_rework_loops: i32,
+    /// Parent task (tasks form a tree).
+    pub parent_id: Option<Uuid>,
 }
 
 const TASK_SUMMARY_SQL: &str = "SELECT t.task_id, t.title, t.source, t.factory, t.status, t.current_stage, \
      t.rework_loops, t.gate_rejections, t.blocked_reason, t.created_at, t.updated_at, t.completed_at, \
      COALESCE(s.sessions, 0) AS sessions, COALESCE(s.cost_usd, 0) AS cost_usd, \
      t.benchmark_run, t.benchmark_case, t.external_ref, t.pr_url, t.pr_number, t.pr_state, t.shipped_at, \
-     t.first_review_at, t.merged_at, t.pr_reviews, t.changes_requested, t.ci_failures, t.pr_rework_loops \
+     t.first_review_at, t.merged_at, t.pr_reviews, t.changes_requested, t.ci_failures, t.pr_rework_loops, t.parent_id \
      FROM tasks_view t LEFT JOIN ( \
        SELECT task_id, count(*) AS sessions, sum(cost_usd) AS cost_usd FROM session_facts GROUP BY task_id \
      ) s ON s.task_id = t.task_id";
@@ -58,6 +60,29 @@ pub async fn tasks(pool: &PgPool, status: Option<&str>, limit: i64) -> anyhow::R
     ))
     .bind(status)
     .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Direct subtasks of a task, oldest first.
+pub async fn children(pool: &PgPool, id: Uuid) -> anyhow::Result<Vec<TaskSummary>> {
+    Ok(sqlx::query_as(&format!("{TASK_SUMMARY_SQL} WHERE t.parent_id = $1 ORDER BY t.created_at"))
+        .bind(id)
+        .fetch_all(pool)
+        .await?)
+}
+
+/// Every task below `id` in the tree, parents before their children.
+pub async fn descendants(pool: &PgPool, id: Uuid) -> anyhow::Result<Vec<Uuid>> {
+    Ok(sqlx::query_scalar(
+        "WITH RECURSIVE d(task_id, depth, path) AS ( \
+           SELECT task_id, 1, ARRAY[task_id] FROM tasks_view WHERE parent_id = $1 \
+           UNION ALL \
+           SELECT t.task_id, d.depth + 1, d.path || t.task_id FROM tasks_view t JOIN d ON t.parent_id = d.task_id \
+           WHERE NOT t.task_id = ANY(d.path) \
+         ) SELECT task_id FROM d ORDER BY depth, task_id",
+    )
+    .bind(id)
     .fetch_all(pool)
     .await?)
 }

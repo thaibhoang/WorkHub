@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Check, Play, X } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, FolderTree, Play, Plus, X } from 'lucide-react'
 import { useState } from 'react'
 import { Link, useParams } from 'react-router'
 import { toast } from 'sonner'
+import { NewTaskDialog } from '@/components/NewTaskDialog'
 import { PageHeader } from '@/components/PageHeader'
 import { ScoreChip } from '@/components/scores'
 import { SessionSheet } from '@/components/SessionSheet'
@@ -10,6 +11,15 @@ import { OUTCOME_TEXT, PrLink, SessionStatusBadge, TaskStatusBadge } from '@/com
 import { Timeline } from '@/components/Timeline'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -23,6 +33,8 @@ import {
   fmtTime,
   fmtUsd,
   shortId,
+  subtreeIds,
+  taskTree,
   type FactoryDef,
   type ScoreRow,
   type SessionDetail,
@@ -55,6 +67,18 @@ export default function RunDetail() {
       <Link to="/" className="mb-3 inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
         <ArrowLeft className="size-4" /> Runs
       </Link>
+      {data.ancestors.length ? (
+        <nav className="mb-1 flex flex-wrap items-center gap-1 text-sm text-muted-foreground">
+          {data.ancestors.map((a) => (
+            <span key={a.task_id} className="flex items-center gap-1">
+              <Link to={`/runs/${a.task_id}`} className="max-w-64 truncate hover:text-foreground hover:underline">
+                {a.title}
+              </Link>
+              <ChevronRight className="size-3.5" />
+            </span>
+          ))}
+        </nav>
+      ) : null}
       <PageHeader
         title={title}
         description={
@@ -79,7 +103,12 @@ export default function RunDetail() {
             ) : null}
           </span>
         }
-        actions={<CancelButton id={id} status={state.status} />}
+        actions={
+          <>
+            {task?.benchmark_run ? null : <MoveDialog id={id} parent={state.parent} />}
+            <CancelButton id={id} status={state.status} />
+          </>
+        }
       />
 
       {task?.benchmark_run ? (
@@ -94,6 +123,7 @@ export default function RunDetail() {
       {pipeline ? <PipelineStrip factory={pipeline} detail={data} /> : null}
       <ActionPanel key={id} id={id} detail={data} factory={pipeline} />
       <PrPanel detail={data} />
+      {task?.benchmark_run ? null : <Subtasks id={id} title={title} detail={data} />}
 
       <Tabs defaultValue="timeline" className="mt-6">
         <TabsList>
@@ -221,6 +251,7 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
   )
   const resume = useCommand(id, (_version: number) => api.resume(id, stage || undefined, comment || undefined), setSentAt)
   const reset = () => setComment('')
+  const start = useCommand(id, (subtree: boolean) => api.startTask(id, subtree))
 
   if (state.status === 'awaiting_gate') {
     const output =
@@ -277,6 +308,32 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
               </div>
             </>
           )}
+        </CardContent>
+      </Card>
+    )
+  }
+
+  if (state.status === 'draft') {
+    const draftKids = detail.children.some((c) => c.status === 'draft')
+    return (
+      <Card className="border-dashed">
+        <CardHeader>
+          <CardTitle>Draft, not started</CardTitle>
+          <CardDescription>
+            {factory
+              ? `Nothing runs until you start it. Starting hands it to the ${factory.name} pipeline (${factory.stages[0]?.id ?? 'first stage'} first).`
+              : 'Nothing runs until you start it.'}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-wrap gap-2">
+          <Button onClick={() => start.mutate(false)} disabled={start.isPending}>
+            <Play /> Start
+          </Button>
+          {draftKids ? (
+            <Button variant="outline" onClick={() => start.mutate(true)} disabled={start.isPending}>
+              <Play /> Start with subtasks
+            </Button>
+          ) : null}
         </CardContent>
       </Card>
     )
@@ -400,6 +457,114 @@ function prEventText(e: WhEvent) {
     default:
       return e.type
   }
+}
+
+/** Direct subtasks, a way to add one, and starting the drafts below this task. */
+function Subtasks({ id, title, detail }: { id: string; title: string; detail: TaskDetail }) {
+  const { data: all } = useQuery({ queryKey: ['tasks'], queryFn: () => api.tasks() })
+  const startAll = useCommand(id, () => api.startTask(id, true))
+  // Whole subtree from the task list (the detail only has direct children).
+  const below = all ? taskTree(all.filter((t) => subtreeIds(all, id).has(t.task_id) && t.task_id !== id)) : []
+  const rows = below.length ? below : detail.children.map((task) => ({ task, depth: 0 }))
+  const drafts = rows.filter((r) => r.task.status === 'draft').length
+  const add = (
+    <NewTaskDialog
+      parent={{ id, title }}
+      trigger={
+        <Button variant="outline" size="sm">
+          <Plus /> Add subtask
+        </Button>
+      }
+    />
+  )
+  if (!rows.length) return <div className="mt-4">{add}</div>
+  return (
+    <Card className="mt-4">
+      <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2">
+        <div>
+          <CardTitle>Subtasks</CardTitle>
+          <CardDescription>
+            {rows.length} below this task{drafts ? ` · ${drafts} not started` : ''}
+          </CardDescription>
+        </div>
+        <div className="flex gap-2">
+          {drafts ? (
+            <Button size="sm" onClick={() => startAll.mutate(undefined)} disabled={startAll.isPending}>
+              <Play /> Start {detail.state.status === 'draft' ? 'all' : `${drafts} draft${drafts > 1 ? 's' : ''}`}
+            </Button>
+          ) : null}
+          {add}
+        </div>
+      </CardHeader>
+      <CardContent>
+        <ul className="grid gap-1">
+          {rows.map(({ task: c, depth }) => (
+            <li key={c.task_id} className="flex items-center gap-3 text-sm" style={{ paddingLeft: `${depth * 1.25}rem` }}>
+              <TaskStatusBadge status={c.status} className="w-24 shrink-0" />
+              <Link to={`/runs/${c.task_id}`} className="truncate hover:underline">
+                {c.title}
+              </Link>
+              <span className="ml-auto font-mono text-xs text-muted-foreground">{c.current_stage ?? ''}</span>
+            </li>
+          ))}
+        </ul>
+      </CardContent>
+    </Card>
+  )
+}
+
+/** Move the task under another parent (or to the top level). Tasks below it are not offered. */
+function MoveDialog({ id, parent }: { id: string; parent: string | null }) {
+  const [open, setOpen] = useState(false)
+  const [target, setTarget] = useState<string>(parent ?? '__root')
+  const { data: all } = useQuery({ queryKey: ['tasks'], queryFn: () => api.tasks(), enabled: open })
+  const move = useCommand(id, (p: string | null) => api.moveTask(id, p), () => setOpen(false))
+  const banned = all ? subtreeIds(all, id) : new Set([id])
+  const options = all ? taskTree(all).filter(({ task }) => !banned.has(task.task_id)) : []
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(o) => {
+        setOpen(o)
+        if (o) setTarget(parent ?? '__root')
+      }}
+    >
+      <DialogTrigger asChild>
+        <Button variant="ghost" size="sm" className="text-muted-foreground">
+          <FolderTree /> Move
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Move task</DialogTitle>
+          <DialogDescription>Pick its new parent. Tasks form a tree, so this task and its subtasks are not offered.</DialogDescription>
+        </DialogHeader>
+        <Select value={target} onValueChange={setTarget}>
+          <SelectTrigger className="w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent className="max-h-80">
+            <SelectItem value="__root">Top level (no parent)</SelectItem>
+            {options.map(({ task, depth }) => (
+              <SelectItem key={task.task_id} value={task.task_id}>
+                <span style={{ paddingLeft: `${depth}rem` }} className="truncate">
+                  {task.title} <span className="font-mono text-xs text-muted-foreground">{shortId(task.task_id)}</span>
+                </span>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <DialogFooter>
+          <Button
+            onClick={() => move.mutate(target === '__root' ? null : target)}
+            disabled={move.isPending || target === (parent ?? '__root')}
+          >
+            Move
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 function CancelButton({ id, status }: { id: string; status: string }) {

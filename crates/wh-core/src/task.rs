@@ -57,6 +57,20 @@ pub enum TaskEvent {
         /// The external item this task came from (a GitHub issue).
         #[serde(default)]
         external_ref: Option<ExternalRef>,
+        /// Parent task (tasks form a tree; see `TaskMoved`).
+        #[serde(default)]
+        parent: Option<TaskId>,
+        /// Created as a draft: the pipeline waits for `TaskActivated`. Older events
+        /// (false) start right away.
+        #[serde(default)]
+        draft: bool,
+    },
+    /// A human started a draft task; the foreman runs its first stage.
+    TaskActivated {},
+    /// The task was moved under another parent (None = top level). The command
+    /// refuses a move that would make a task its own ancestor.
+    TaskMoved {
+        parent: Option<TaskId>,
     },
     StageEntered {
         stage: String,
@@ -273,6 +287,8 @@ impl DomainEvent for TaskEvent {
     fn event_type(&self) -> &'static str {
         match self {
             Self::TaskCreated { .. } => "TaskCreated",
+            Self::TaskActivated { .. } => "TaskActivated",
+            Self::TaskMoved { .. } => "TaskMoved",
             Self::StageEntered { .. } => "StageEntered",
             Self::StageExited { .. } => "StageExited",
             Self::GateRequested { .. } => "GateRequested",
@@ -295,6 +311,8 @@ impl DomainEvent for TaskEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TaskStatus {
+    /// Created but not started: waits for a human to activate it.
+    Draft,
     #[default]
     Open,
     Running { stage: String },
@@ -354,6 +372,7 @@ pub struct TaskState {
     pub body: Option<String>,
     pub factory: Option<String>,
     pub benchmark: Option<BenchmarkContext>,
+    pub parent: Option<TaskId>,
     pub status: TaskStatus,
     /// The current gate already has a decision (only meaningful while `AwaitingGate`):
     /// the status stays until the foreman acts on it.
@@ -376,6 +395,8 @@ pub struct TaskState {
     pub pr_feedback: Vec<String>,
     /// Kept until a stage succeeds, so a failed merge stage merges again on resume.
     pub conflict: Option<Conflict>,
+    /// Last pipeline event (`TaskMoved` is not one: moving a task never hides the
+    /// event the foreman still has to act on).
     pub last: Option<TaskEvent>,
 }
 
@@ -391,13 +412,19 @@ impl TaskState {
     pub fn apply(&mut self, version: i64, ev: TaskEvent) {
         self.version = version;
         match &ev {
-            TaskEvent::TaskCreated { title, body, factory, benchmark, external_ref, .. } => {
+            TaskEvent::TaskCreated { title, body, factory, benchmark, external_ref, parent, draft, .. } => {
                 self.title = title.clone();
                 self.body = body.clone();
                 self.factory = factory.clone();
                 self.benchmark = benchmark.clone();
                 self.external_ref = external_ref.clone();
-                self.status = TaskStatus::Open;
+                self.parent = *parent;
+                self.status = if *draft { TaskStatus::Draft } else { TaskStatus::Open };
+            }
+            TaskEvent::TaskActivated {} => self.status = TaskStatus::Open,
+            TaskEvent::TaskMoved { parent } => {
+                self.parent = *parent;
+                return;
             }
             TaskEvent::StageEntered { stage, feedback } => {
                 self.pr_feedback.clear();
@@ -570,7 +597,7 @@ mod tests {
     #[test]
     fn fold_tracks_status_and_rework() {
         let s = TaskState::fold([
-            (1, TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("f".into()), benchmark: None, external_ref: None }),
+            (1, TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("f".into()), benchmark: None, external_ref: None, parent: None, draft: false }),
             (2, TaskEvent::StageEntered { stage: "impl".into(), feedback: None }),
             (3, TaskEvent::StageExited { stage: "impl".into(), outcome: StageOutcome::Succeeded, summary: None, session: None }),
             (4, TaskEvent::StageEntered { stage: "impl".into(), feedback: Some("fix".into()) }),
@@ -654,6 +681,33 @@ mod tests {
         s.apply(8, entered());
         s.apply(9, exited(StageOutcome::Succeeded));
         assert_eq!((s.conflict, s.pr_rework_loops), (None, 2));
+    }
+
+    #[test]
+    fn drafts_wait_and_moves_keep_the_last_pipeline_event() {
+        let created = |draft| TaskEvent::TaskCreated {
+            title: "t".into(),
+            body: None,
+            source: TaskSource::Cli,
+            factory: None,
+            benchmark: None,
+            external_ref: None,
+            parent: None,
+            draft,
+        };
+        let parent = TaskId::new();
+        let mut s = TaskState::fold([(1, created(true))]);
+        assert_eq!(s.status, TaskStatus::Draft);
+        s.apply(2, TaskEvent::TaskMoved { parent: Some(parent) });
+        assert_eq!((s.version, s.parent, s.status.clone()), (2, Some(parent), TaskStatus::Draft));
+        assert!(matches!(s.last, Some(TaskEvent::TaskCreated { draft: true, .. })));
+        s.apply(3, TaskEvent::TaskActivated {});
+        assert_eq!(s.status, TaskStatus::Open);
+        assert_eq!(TaskState::fold([(1, created(false))]).status, TaskStatus::Open);
+
+        // Events written before drafts existed start right away.
+        let v = serde_json::json!({"type": "TaskCreated", "title": "t", "body": null, "source": "cli"});
+        assert!(matches!(serde_json::from_value(v).unwrap(), TaskEvent::TaskCreated { draft: false, parent: None, .. }));
     }
 
     #[test]
