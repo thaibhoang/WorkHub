@@ -11,7 +11,7 @@ use sqlx::PgPool;
 use wh_core::{
     Actor, DomainEvent, EventMeta, NewEvent, SessionId, TaskId,
     session::SessionEvent,
-    task::{TaskEvent, TaskSource, task_branch},
+    task::{ResumeHandle, StageOutcome, TaskEvent, TaskSource, task_branch},
 };
 use wh_eventstore::{EventStore, ExpectedVersion};
 use wh_foreman::cleanup::{CleanupConfig, CleanupReport, sweep};
@@ -70,6 +70,7 @@ async fn session(store: &EventStore, task: TaskId, finished: bool) -> SessionId 
             summary: None,
             transcript: None,
             commit: None,
+            paused: false,
         };
         append(store, &s.stream_id(), task, done).await;
     }
@@ -164,7 +165,7 @@ async fn sweeps_finished_work_and_keeps_the_rest(pool: PgPool) {
 
     // Once nothing runs, the oversized cache is wiped.
     let s = running.stream_id();
-    let ev = SessionEvent::AgentSessionCompleted { num_turns: 1, duration_ms: 1, summary: None, transcript: None, commit: None };
+    let ev = SessionEvent::AgentSessionCompleted { num_turns: 1, duration_ms: 1, summary: None, transcript: None, commit: None, paused: false };
     append(&store, &s, open, ev).await;
     let r = sweep(&store, &cfg).await.unwrap();
     assert!(r.errors.is_empty(), "{:?}", r.errors);
@@ -209,6 +210,88 @@ async fn keeps_a_running_session_when_its_pr_is_closed(pool: PgPool) {
     assert!(r.errors.is_empty(), "{:?}", r.errors);
     assert!(r.removed.is_empty(), "{:?}", r.removed);
     assert!(worktree.exists() && home.exists() && cache.exists());
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn paused_stage_keeps_its_directories_until_it_is_over(pool: PgPool) {
+    let store = EventStore::new(pool);
+    let dir = tempfile::tempdir().unwrap();
+    let (repo, _) = repo_with_remote(dir.path());
+    let data = dir.path().join("data");
+    let cache = dir.path().join("cargo-target");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("big"), vec![0u8; 4096]).unwrap();
+    let cfg = CleanupConfig {
+        data_dir: data.clone(),
+        repo,
+        remote: None,
+        grace: Duration::ZERO,
+        caches: vec![(cache.clone(), 1024)],
+        dry_run: false,
+        task_db: None,
+    };
+    let entered = || TaskEvent::StageEntered { stage: "implement".into(), feedback: None };
+    let completed = |paused| SessionEvent::AgentSessionCompleted {
+        num_turns: 1,
+        duration_ms: 1,
+        summary: None,
+        transcript: None,
+        commit: None,
+        paused,
+    };
+    let asked = |home: SessionId| TaskEvent::AgentAsked {
+        stage: "implement".into(),
+        session: home,
+        questions: vec![],
+        resume: Some(ResumeHandle {
+            home_session: home,
+            runtime_session_id: "rt".into(),
+            branch: "work".into(),
+            conflicts: vec![],
+        }),
+    };
+    let dirs = |s: SessionId| [data.join("worktrees").join(s.to_string()), data.join("sandbox-home").join(s.to_string())];
+    // A task whose first session has completed paused, with both directories.
+    let paused = async || {
+        let t = task(&store, Some(entered())).await;
+        let s = session(&store, t, false).await;
+        append(&store, &s.stream_id(), t, completed(true)).await;
+        for d in dirs(s) {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        (t, s)
+    };
+    let kept = async |s: SessionId| {
+        let r = sweep(&store, &cfg).await.unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        dirs(s).iter().all(|d| d.exists())
+    };
+
+    let (t, s) = paused().await;
+    assert!(kept(s).await, "completed, AgentAsked not recorded yet");
+    assert!(cache.exists(), "the stage is still running");
+    append(&store, &t.stream_id(), t, asked(s)).await;
+    assert!(kept(s).await, "waiting");
+    assert!(!cache.exists(), "nothing runs while waiting");
+    let answered = TaskEvent::UserAnswered { stage: "implement".into(), answers: vec![], user: "u".into() };
+    append(&store, &t.stream_id(), t, answered).await;
+    assert!(kept(s).await, "answered");
+    append(&store, &t.stream_id(), t, TaskEvent::StageResumed { stage: "implement".into() }).await;
+    assert!(kept(s).await, "resumed");
+
+    let over = [
+        TaskEvent::TaskBlocked { stage: Some("implement".into()), reason: "x".into() },
+        TaskEvent::TaskCancelled { reason: "no".into() },
+        TaskEvent::StageExited { stage: "implement".into(), outcome: StageOutcome::Succeeded, summary: None, session: None },
+    ];
+    for ev in over {
+        let (t, s) = paused().await;
+        append(&store, &t.stream_id(), t, asked(s)).await;
+        assert!(kept(s).await);
+        append(&store, &t.stream_id(), t, ev).await;
+        assert!(!kept(s).await);
+        assert!(dirs(s).iter().all(|d| !d.exists()));
+    }
 }
 
 /// A repo with one commit whose `origin` is a local bare repo.

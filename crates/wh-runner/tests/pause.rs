@@ -191,8 +191,35 @@ async fn pause_keeps_the_worktree_and_leaves_the_stage_open(pool: PgPool) {
     let events = env.store.read_stream(&paused.session.stream_id()).await.unwrap();
     assert!(matches!(
         events.last().unwrap().decode::<SessionEvent>().unwrap(),
-        SessionEvent::AgentSessionCompleted { commit: None, .. }
+        SessionEvent::AgentSessionCompleted { commit: None, paused: true, .. }
     ));
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn pause_flag_is_off_on_a_turn_that_ends_the_stage(pool: PgPool) {
+    let env = env(pool, [says("done")]);
+    let report = env.runner.run(env.spec(TaskId::new()), |_| {}).await.unwrap();
+    let events = env.store.read_stream(&report.last().session_id.stream_id()).await.unwrap();
+    let done = events.last().unwrap().decode::<SessionEvent>().unwrap();
+    assert!(matches!(done, SessionEvent::AgentSessionCompleted { paused: false, .. }));
+    // Events recorded before the field existed still decode.
+    let mut old = serde_json::to_value(&done).unwrap();
+    old.as_object_mut().unwrap().remove("paused");
+    let old: SessionEvent = serde_json::from_value(old).unwrap();
+    assert!(matches!(old, SessionEvent::AgentSessionCompleted { paused: false, .. }));
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn discard_frees_the_branch_and_can_be_repeated(pool: PgPool) {
+    let env = env(pool, [says(ASK)]);
+    let paused = env.pause(env.spec(TaskId::new())).await;
+    std::fs::create_dir_all(env.home(&paused)).unwrap();
+
+    env.runner.discard(&env.repo, paused.home_session).await.unwrap();
+    assert!(!env.worktree(&paused).exists() && !env.home(&paused).exists());
+    let again = env.data.join("again");
+    git(&env.repo, &["worktree", "add", "-q", again.to_str().unwrap(), "work"]);
+    env.runner.discard(&env.repo, paused.home_session).await.unwrap();
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]

@@ -162,7 +162,7 @@ async fn session(store: &EventStore, f: &Factory, stage: &str, failed: bool, rej
             transcript: None,
         }
     } else {
-        SessionEvent::AgentSessionCompleted { num_turns: 2, duration_ms: 1000, summary: None, transcript: None, commit: None }
+        SessionEvent::AgentSessionCompleted { num_turns: 2, duration_ms: 1000, summary: None, transcript: None, commit: None, paused: false }
     };
     append(store, &s.stream_id(), task.0, v, end).await;
     let outcome = match (failed, rejected) {

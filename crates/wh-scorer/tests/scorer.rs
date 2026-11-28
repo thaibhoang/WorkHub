@@ -3,9 +3,9 @@ use std::{path::Path, process::Command, sync::Mutex, time::Duration};
 use sqlx::PgPool;
 use tokio::sync::mpsc::UnboundedSender;
 use wh_core::{
-    Actor, EventMeta, NewEvent, ScoreId, SessionId, TaskId,
+    Actor, EventMeta, FailureClass, NewEvent, ScoreId, SessionId, TaskId,
     score::ScoreEvent,
-    session::TokenUsage,
+    session::{SessionEvent, TokenUsage},
     task::{TaskEvent, TaskSource},
 };
 use wh_eventstore::{EventStore, ExpectedVersion, Subscription};
@@ -225,6 +225,74 @@ async fn grades_target_sessions_once_and_projects_results(pool: PgPool) {
     wh_metrics::catch_up_all(&store).await.unwrap();
     let rows = scores::scores(&pool, &ScoreFilter { session: Some(graded.0), ..Default::default() }, 10).await.unwrap();
     assert_eq!(rows.iter().filter(|r| r.manual).count(), 1);
+}
+
+/// Record a session of agent `impl` that ends with `end`.
+async fn record_session(store: &EventStore, task: TaskId, prompt: &str, resume_of: Option<SessionId>, end: SessionEvent) -> SessionId {
+    let session = SessionId::new();
+    let dispatched = SessionEvent::AgentDispatched {
+        task_id: task,
+        agent: "impl".into(),
+        stage: "implement".into(),
+        runtime: "fake".into(),
+        model: None,
+        prompt: prompt.into(),
+        budget_usd: None,
+        timeout_secs: 60,
+        attempt: 1,
+        retry_of: None,
+        resume_of,
+        benchmark: None,
+    };
+    for ev in [dispatched, end] {
+        let meta = EventMeta::new(task.0, Actor::System { component: "runner".into() });
+        let new = NewEvent::from_domain(&ev, meta).unwrap();
+        store.append(&session.stream_id(), ExpectedVersion::Any, vec![new]).await.unwrap();
+    }
+    session
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn paused_and_lost_turns_are_skipped_and_a_resumed_one_keeps_the_first_prompt(pool: PgPool) {
+    let (dir, _) = setup();
+    let yaml = dir.path().join("factory/factory.yaml");
+    let text = std::fs::read_to_string(&yaml).unwrap().replace("pass_threshold: 0.6", "pass_threshold: 0.6, include_failed: true");
+    std::fs::write(&yaml, text).unwrap();
+    let factory = Factory::load(&yaml).unwrap();
+    let store = EventStore::new(pool);
+    let judge = leak(Judge::new("{\"score\": 1.0, \"classification\": \"ok\", \"rationale\": \"fine\"}"));
+    let completed = |paused| SessionEvent::AgentSessionCompleted {
+        num_turns: 1,
+        duration_ms: 1,
+        summary: Some("done".into()),
+        transcript: None,
+        commit: None,
+        paused,
+    };
+    let lost = SessionEvent::AgentSessionFailed {
+        failure_class: FailureClass::SessionLost,
+        message: "gone".into(),
+        retryable: false,
+        num_turns: 0,
+        duration_ms: 0,
+        transcript: None,
+    };
+    let task = create_task(&store, Some("test")).await;
+    let first = record_session(&store, task, "FIRST PROMPT", None, completed(true)).await;
+    let second = record_session(&store, task, "answer one", Some(first), completed(true)).await;
+    let gone = record_session(&store, task, "answer two", Some(second), lost).await;
+    let last = record_session(&store, task, "answer three", Some(second), completed(false)).await;
+
+    let cfg = ScorerConfig { data_dir: dir.path().join("data") };
+    let mut svc = ScorerService::new(store.clone(), factory, judge, cfg, Dispatch::Inline);
+    Subscription::new(store.clone()).catch_up(&mut svc).await.unwrap();
+
+    for (session, graded) in [(first, false), (second, false), (gone, false), (last, true)] {
+        let events = store.read_stream(&ScoreId::for_session(session, "scope").stream_id()).await.unwrap();
+        assert_eq!(!events.is_empty(), graded);
+    }
+    let prompt = judge.prompts.lock().unwrap()[0].prompt.clone();
+    assert!(prompt.contains("FIRST PROMPT") && !prompt.contains("answer three"), "{prompt}");
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]

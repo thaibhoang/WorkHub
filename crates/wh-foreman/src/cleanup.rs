@@ -6,6 +6,7 @@
 //!   crashes and `wh run` worktrees kept for inspection;
 //! - `sandbox-home/<session>` of finished sessions, right away (it may hold a copy
 //!   of the user's credentials);
+//! - neither of these while the session's stage is paused or resumed;
 //! - `scorer-work/*` and `bench/<run>` (finished runs) left by a crash, after the
 //!   grace period;
 //!
@@ -40,7 +41,7 @@ use anyhow::Context;
 use sqlx::{Connection, PgConnection};
 use tokio::{process::Command, sync::Notify};
 use wh_core::{
-    BenchmarkRunId, SessionId, TaskId,
+    BenchmarkRunId, RecordedEvent, SessionId, TaskId,
     session::SessionEvent,
     task::{TaskEvent, TaskState, TaskStatus, task_branch},
 };
@@ -185,16 +186,31 @@ pub async fn sweep(store: &EventStore, cfg: &CleanupConfig) -> anyhow::Result<Cl
     let finished = |name: &str| name.parse::<SessionId>().ok().map(|id| sessions.get(&id).copied().unwrap_or(true));
 
     let mut running = 0;
-    for (path, name) in entries(&cfg.data_dir.join("worktrees")).await {
-        match finished(&name) {
-            Some(true) if age(&path) >= cfg.grace => remove_tree(&path, "worktree", cfg, &mut r).await,
-            Some(false) => running += 1,
-            _ => {}
-        }
-    }
-    for (path, name) in entries(&cfg.data_dir.join("sandbox-home")).await {
-        if finished(&name) == Some(true) {
-            remove_tree(&path, "sandbox-home", cfg, &mut r).await;
+    for kind in ["worktree", "sandbox-home"] {
+        let root = if kind == "worktree" { "worktrees" } else { kind };
+        for (path, name) in entries(&cfg.data_dir.join(root)).await {
+            match finished(&name) {
+                Some(true) => {}
+                Some(false) => {
+                    running += usize::from(kind == "worktree");
+                    continue;
+                }
+                None => continue,
+            }
+            // A finished session may still belong to a paused stage.
+            let held = match name.parse::<SessionId>() {
+                Ok(id) => held_by_pause(store, id).await,
+                Err(_) => Ok(None),
+            };
+            match held {
+                Ok(Some(task_running)) => running += usize::from(task_running),
+                // A sandbox home may hold credentials: no grace period for it.
+                Ok(None) if kind == "sandbox-home" || age(&path) >= cfg.grace => {
+                    remove_tree(&path, kind, cfg, &mut r).await
+                }
+                Ok(None) => {}
+                Err(e) => r.errors.push(format!("keep {}: {e:#}", path.display())),
+            }
         }
     }
     // A grading takes minutes; never race one, whatever the grace period.
@@ -244,6 +260,35 @@ pub async fn sweep(store: &EventStore, cfg: &CleanupConfig) -> anyhow::Result<Cl
         }
     }
     Ok(r)
+}
+
+/// Whether the directories of `session` belong to a stage that paused and has not
+/// ended: `Some(true)` while it is running, `Some(false)` while it waits for answers.
+async fn held_by_pause(store: &EventStore, session: SessionId) -> anyhow::Result<Option<bool>> {
+    let events = store.read_stream(&session.stream_id()).await?;
+    let Some(first) = events.first() else { return Ok(None) };
+    let SessionEvent::AgentDispatched { task_id, .. } = first.decode()? else { return Ok(None) };
+    // `AgentAsked` is appended after this, so the task may not know of the pause yet.
+    let ended_paused = match events.last() {
+        Some(e) => matches!(e.decode()?, SessionEvent::AgentSessionCompleted { paused: true, .. }),
+        None => false,
+    };
+    let state = task_state(&store.read_stream(&task_id.stream_id()).await?)?;
+    let running = match state.status {
+        TaskStatus::Running { .. } => true,
+        TaskStatus::AwaitingInput { .. } => false,
+        _ => return Ok(None),
+    };
+    let is_home = state.paused.and_then(|p| p.resume).is_some_and(|h| h.home_session == session);
+    Ok((is_home || (running && ended_paused)).then_some(running))
+}
+
+fn task_state(events: &[RecordedEvent]) -> anyhow::Result<TaskState> {
+    let mut state = TaskState::default();
+    for e in events {
+        state.apply(e.stream_version, e.decode::<TaskEvent>()?);
+    }
+    Ok(state)
 }
 
 async fn delete_task_branches(store: &EventStore, cfg: &CleanupConfig, r: &mut CleanupReport) -> anyhow::Result<()> {
@@ -343,10 +388,7 @@ async fn branches_due(store: &EventStore, stream: &str, head: &str, grace: Durat
 /// The folded status of a task, and whether its last event is older than `grace`.
 async fn task_status(store: &EventStore, stream: &str, grace: Duration) -> anyhow::Result<(TaskStatus, bool)> {
     let events = store.read_stream(stream).await?;
-    let mut state = TaskState::default();
-    for e in &events {
-        state.apply(e.stream_version, e.decode::<TaskEvent>()?);
-    }
+    let state = task_state(&events)?;
     let aged = events.last().is_some_and(|e| (chrono::Utc::now() - e.recorded_at).to_std().unwrap_or_default() >= grace);
     Ok((state.status, aged))
 }

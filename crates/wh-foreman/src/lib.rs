@@ -239,7 +239,9 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
         }
     }
 
-    async fn run_stage(&self, mut spec: RunSpec) -> anyhow::Result<()> {
+    /// `leftover` is the home session of an earlier paused run of this task: its
+    /// worktree still holds the task branch, so it is discarded before running.
+    async fn run_stage(&self, mut spec: RunSpec, leftover: Option<SessionId>) -> anyhow::Result<()> {
         let (task, stage) = (spec.task_id, spec.stage.clone());
         tracing::info!(%task, stage, "dispatching stage");
         let runner = self.runner.clone();
@@ -266,6 +268,12 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
                         Err(e) => Err(e.into()),
                     };
                 }
+            }
+            if let Some(home) = leftover
+                && let Err(e) = runner.discard(&spec.repo, home).await
+            {
+                // If the branch is still held, creating the worktree reports it.
+                tracing::warn!(%task, stage, "discard the paused worktree of {home}: {e:#}");
             }
             match runner.run(spec, |_| {}).await {
                 Ok(r) => {
@@ -310,8 +318,8 @@ async fn provision_for(
     task_db::provision(store, admin, task).await.map(Some)
 }
 
-/// Block every task matching `owned` whose stream ends at `StageEntered` (its runner
-/// is gone) and fail its unfinished sessions with `reason`. Returns the blocked tasks.
+/// Block every task matching `owned` whose stream ends at `StageEntered` or
+/// `StageResumed` (its runner is gone) and fail its unfinished sessions with `reason`. Returns the blocked tasks.
 pub async fn recover_interrupted(
     store: &EventStore,
     reason: &str,
@@ -326,7 +334,8 @@ pub async fn recover_interrupted(
     let mut blocked = Vec::new();
     for (stream, _, head) in store.stream_heads(&format!("{}-", TaskId::STREAM_PREFIX)).await? {
         let Some(task) = TaskId::from_stream_id(&stream) else { continue };
-        if head != "StageEntered" {
+        // Not `AgentAsked` (waiting for a person) or `UserAnswered` (redelivered later).
+        if head != "StageEntered" && head != "StageResumed" {
             continue;
         }
         let mut state = TaskState::default();
@@ -415,15 +424,18 @@ impl<R: AgentRuntime + 'static> EventHandler for Foreman<R> {
         let Some(action) = decide(&state, &self.factory) else {
             return Ok(());
         };
+        let leftover = state.paused.as_ref().and_then(|p| p.resume.as_ref()).map(|r| r.home_session);
         match action {
-            Action::RunStage { stage, feedback } => self.run_stage(self.run_spec(task, &state, &stage, feedback)).await,
+            Action::RunStage { stage, feedback } => {
+                self.run_stage(self.run_spec(task, &state, &stage, feedback), leftover).await
+            }
             Action::ResolveConflict { stage, feedback } => {
                 let (Some(g), Some(c)) = (&self.factory.github, &state.conflict) else {
                     return Ok(());
                 };
                 let mut spec = self.run_spec(task, &state, &stage, Some(feedback));
                 spec.merge = Some(Merge { remote: g.remote.clone(), base: c.base.clone() });
-                self.run_stage(spec).await
+                self.run_stage(spec, leftover).await
             }
             Action::RequestGate { gate, stage } if matches!(self.scope, Scope::Benchmark(_)) => {
                 // Benchmarks measure the agents, not human latency: approve the gate
