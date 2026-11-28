@@ -2368,6 +2368,8 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "wh-api",
+ "wh-autopilot",
  "wh-core",
  "wh-eventstore",
  "wh-factory",

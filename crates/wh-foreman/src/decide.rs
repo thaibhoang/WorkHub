@@ -4,6 +4,8 @@ use wh_factory::Factory;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     RunStage { stage: String, feedback: Option<String> },
+    /// Hand the user's answers to the paused `stage`.
+    ResumeStage { stage: String },
     /// Run `stage` after WorkHub merged the PR's base into the task branch.
     ResolveConflict { stage: String, feedback: String },
     RequestGate { gate: String, stage: String },
@@ -20,6 +22,15 @@ pub fn decide(state: &TaskState, f: &Factory) -> Option<Action> {
     // `AwaitingInput` waits for a human, whatever else lands on the stream.
     if matches!(state.status, TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::AwaitingInput { .. }) {
         return None;
+    }
+    // Not the last event: others may land between the answer and the resume.
+    if let TaskStatus::Running { stage } = &state.status
+        && state.resume_pending
+    {
+        return Some(match f.stage(stage) {
+            Some(_) => Action::ResumeStage { stage: stage.clone() },
+            None => block(Some(stage), format!("stage '{stage}' is not in factory '{}'", f.name)),
+        });
     }
     match state.last.as_ref()? {
         // A draft waits for a human to activate it.
@@ -382,7 +393,29 @@ mod tests {
         assert_eq!(decide(&state(events.clone()), &f), None);
         events.push(conflicted());
         assert_eq!(decide(&state(events.clone()), &f), None);
-        events.push(TaskEvent::UserAnswered { stage: "impl".into(), answers: vec![], user: "u".into() });
-        assert_eq!(decide(&state(events), &f), None);
+    }
+
+    #[test]
+    fn resume_pending_survives_later_events_until_the_task_stops() {
+        let f = factory("{ repo: a/b }");
+        let stage = f.first_stage().id.clone();
+        let mut events = vec![
+            TaskEvent::StageEntered { stage: stage.clone(), feedback: None },
+            TaskEvent::AgentAsked { stage: stage.clone(), session: wh_core::SessionId::new(), questions: vec![], resume: None },
+            TaskEvent::UserAnswered { stage: stage.clone(), answers: vec![], user: "u".into() },
+        ];
+        let resume = Some(Action::ResumeStage { stage: stage.clone() });
+        assert_eq!(decide(&state(events.clone()), &f), resume);
+        events.extend([conflicted(), TaskEvent::TaskMoved { parent: None }]);
+        assert_eq!(decide(&state(events.clone()), &f), resume);
+        for end in [
+            TaskEvent::StageResumed { stage: stage.clone() },
+            TaskEvent::TaskBlocked { stage: Some(stage.clone()), reason: "x".into() },
+            TaskEvent::TaskCancelled { reason: "x".into() },
+        ] {
+            let mut ended = events.clone();
+            ended.push(end);
+            assert_eq!(decide(&state(ended), &f), None);
+        }
     }
 }

@@ -12,7 +12,7 @@ use std::{
 use sqlx::{Connection, PgConnection, PgPool};
 use tokio::sync::mpsc::UnboundedSender;
 use wh_core::{
-    Actor, EventMeta, NewEvent, TaskId,
+    Actor, Answer, EventMeta, NewEvent, TaskId,
     session::TokenUsage,
     task::{TaskEvent, TaskSource, TaskState, TaskStatus},
 };
@@ -32,15 +32,16 @@ fn admin_url() -> String {
 /// `DATABASE_URL` and `WH_DATA_DIR` of a session.
 type SessionEnv = (Option<String>, Option<String>);
 
-/// Records the environment of each session.
+/// Records the environment of each turn. With `.1`, the first turn asks a question.
 #[derive(Default, Clone)]
-struct Fake(Arc<Mutex<Vec<SessionEnv>>>);
+struct Fake(Arc<Mutex<Vec<SessionEnv>>>, bool);
 
 impl AgentRuntime for Fake {
     fn name(&self) -> &str {
         "fake"
     }
-    async fn run(&self, req: &AgentRequest, _tx: UnboundedSender<Signal>) -> Outcome {
+    async fn run(&self, req: &AgentRequest, tx: UnboundedSender<Signal>) -> Outcome {
+        tx.send(Signal::Ready { runtime_session_id: Some("conversation".into()), model: None }).unwrap();
         let url = req.env.get("DATABASE_URL").cloned();
         let first = self.0.lock().unwrap().is_empty();
         self.0.lock().unwrap().push((url.clone(), req.env.get("WH_DATA_DIR").cloned()));
@@ -66,7 +67,9 @@ impl AgentRuntime for Fake {
             cost_usd: 0.0,
             num_turns: 1,
             duration_ms: 1,
-            summary: Some("ok".into()),
+            summary: Some(
+                if self.1 && first { r#"QUESTION: {"text": "Which?", "options": ["A", "B"]}"# } else { "ok" }.into(),
+            ),
         }
     }
 }
@@ -179,6 +182,32 @@ async fn stages_of_a_task_share_a_database_and_tasks_do_not(pool: PgPool) {
     for t in [a, b] {
         drop_database(&pool, &task_db::db_name(t)).await;
     }
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn a_resumed_turn_gets_the_task_database(pool: PgPool) {
+    let store = EventStore::new(pool.clone());
+    let (dir, factory) = setup_agent("{ prompt: a.md, max_questions: 1 }");
+    let fake = Fake(Default::default(), true);
+    let mut foreman = foreman(&store, dir.path(), factory, fake.clone())
+        .with_task_db_admin(admin_url())
+        .with_pause(true);
+    let t = task(&store, None).await;
+    let paused = foreman.drive(t).await.unwrap();
+    let answer = Answer { option: Some("A".into()), text: None };
+    let actor = Actor::Human { user: "tester".into() };
+    wh_api::commands::answer(&store, actor, t, None, vec![answer]).await.unwrap();
+    let state = foreman.drive(t).await.unwrap();
+    drop_database(&pool, &task_db::db_name(t)).await;
+    assert!(matches!(paused.status, TaskStatus::AwaitingInput { .. }), "{:?}", paused.status);
+    assert_eq!(state.status, TaskStatus::Done);
+
+    let envs = fake.0.lock().unwrap().clone();
+    assert_eq!(envs.len(), 3, "asking turn, resumed turn, stage two");
+    let (url, data) = &envs[0];
+    assert!(url.as_ref().expect("DATABASE_URL set").contains(&task_db::db_name(t)));
+    assert!(data.is_some(), "WH_DATA_DIR set");
+    assert_eq!(envs[1], envs[0], "the resumed turn");
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]

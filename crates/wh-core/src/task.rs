@@ -431,6 +431,9 @@ pub struct TaskState {
     pub gate_decided: bool,
     /// Set only while `AwaitingInput`.
     pub pending_questions: Option<PendingQuestions>,
+    /// The paused stage has its answers and still has to be resumed: set by
+    /// `UserAnswered`, so that later events (a PR poll, a move) do not hide it.
+    pub resume_pending: bool,
     /// `AgentAsked` events since the latest `StageEntered` (limited by `max_questions`).
     pub question_rounds: u32,
     /// Set by `AgentAsked` until the stage exits or is entered anew (kept while blocked).
@@ -535,6 +538,7 @@ impl TaskState {
                         });
                     }
                     self.status = TaskStatus::Running { stage: stage.clone() };
+                    self.resume_pending = true;
                 }
             }
             TaskEvent::StageResumed { stage } => self.status = TaskStatus::Running { stage: stage.clone() },
@@ -594,6 +598,17 @@ impl TaskState {
                     self.status = TaskStatus::Blocked { reason: "pull request closed without merging".into() };
                 }
             }
+        }
+        if matches!(
+            ev,
+            TaskEvent::StageResumed { .. }
+                | TaskEvent::StageEntered { .. }
+                | TaskEvent::StageExited { .. }
+                | TaskEvent::TaskBlocked { .. }
+                | TaskEvent::TaskCancelled { .. }
+                | TaskEvent::TaskCompleted { .. }
+        ) {
+            self.resume_pending = false;
         }
         // Whatever ended the wait (answer, block, cancel, merge...) drops the questions.
         if !matches!(self.status, TaskStatus::AwaitingInput { .. }) {
