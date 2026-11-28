@@ -24,7 +24,7 @@ use wh_core::{
 };
 use wh_eventstore::{EventHandler, EventStore, ExpectedVersion, StoreError};
 use wh_factory::{Factory, Scorer};
-use wh_runner::{AgentRequest, AgentRuntime, OutcomeStatus};
+use wh_runner::{AgentRequest, AgentRuntime, OutcomeStatus, SessionMode};
 
 pub use judge::{SessionContext, build_prompt, condense_transcript, parse_judgement};
 
@@ -294,6 +294,7 @@ impl<R: AgentRuntime> Inner<R> {
             tools: Some(Vec::new()),
             container: None,
             env: Default::default(),
+            session: SessionMode::Ephemeral,
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let o = self.runtime.run(&req, tx).await;

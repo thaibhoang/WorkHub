@@ -21,7 +21,7 @@ use wh_core::{FailureClass, session::TokenUsage};
 
 use crate::{
     docker,
-    runtime::{AgentRequest, AgentRuntime, Outcome, OutcomeStatus, Signal},
+    runtime::{AgentRequest, AgentRuntime, Outcome, OutcomeStatus, SessionMode, Signal},
 };
 
 pub struct ClaudeCode {
@@ -43,8 +43,16 @@ impl ClaudeCode {
         let mut push = |s: &str| a.push(s.into());
         push("-p");
         push(&req.prompt);
-        for s in ["--output-format", "stream-json", "--verbose", "--no-session-persistence"] {
+        for s in ["--output-format", "stream-json", "--verbose"] {
             push(s);
+        }
+        match &req.session {
+            SessionMode::Ephemeral => push("--no-session-persistence"),
+            SessionMode::Persist => {}
+            SessionMode::Resume(id) => {
+                push("--resume");
+                push(id);
+            }
         }
         if let Some(m) = &req.model {
             push("--model");
@@ -367,6 +375,7 @@ mod tests {
             tools: None,
             container: None,
             env: BTreeMap::from([("CARGO_TARGET_DIR".to_string(), "/cache/target".to_string())]),
+            session: SessionMode::Ephemeral,
         };
         let cc = ClaudeCode::new("claude");
         let has_env = |cmd: &Command| {
@@ -413,6 +422,7 @@ mod tests {
             tools: None,
             container: None,
             env: BTreeMap::new(),
+            session: SessionMode::Ephemeral,
         };
         let cc = ClaudeCode::new("claude");
         // `Some(None)` = removed from the inherited environment, `None` = inherited as is.
@@ -496,5 +506,40 @@ mod tests {
         let mut p = StreamParser::default();
         p.feed(STREAM[0]);
         assert!(p.outcome().is_none());
+    }
+
+    #[test]
+    fn session_mode_selects_persistence_and_resume_flags() {
+        let args = |session: SessionMode| -> Vec<String> {
+            let req = AgentRequest {
+                prompt: "p".into(),
+                workdir: "/w".into(),
+                transcript_path: "/t".into(),
+                model: Some("m".into()),
+                budget_usd: Some(1.0),
+                permission_mode: None,
+                allowed_tools: vec![],
+                with_user_mcp: false,
+                timeout: Duration::from_secs(1),
+                tools: None,
+                container: None,
+                env: BTreeMap::new(),
+                session,
+            };
+            ClaudeCode::args(&req).iter().map(|a| a.to_string_lossy().into_owned()).collect()
+        };
+        const EPHEMERAL: &str = "--no-session-persistence";
+
+        let ephemeral = args(SessionMode::default());
+        assert!(ephemeral.iter().any(|a| a == EPHEMERAL) && !ephemeral.iter().any(|a| a == "--resume"));
+
+        let persist = args(SessionMode::Persist);
+        assert!(!persist.iter().any(|a| a == EPHEMERAL || a == "--resume"), "{persist:?}");
+
+        let resume = args(SessionMode::Resume("abc".into()));
+        assert!(resume.windows(2).any(|w| w == ["--resume", "abc"]), "{resume:?}");
+        assert!(!resume.iter().any(|a| a == EPHEMERAL));
+        let others: Vec<_> = resume.iter().filter(|a| *a != "--resume" && *a != "abc").collect();
+        assert_eq!(others, persist.iter().collect::<Vec<_>>(), "other flags are unchanged");
     }
 }
