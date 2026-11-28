@@ -35,6 +35,9 @@ pub enum SessionEvent {
         /// The failed session this one retries.
         #[serde(default)]
         retry_of: Option<SessionId>,
+        /// The session this one continues after the user answered its questions.
+        #[serde(default)]
+        resume_of: Option<SessionId>,
         /// Benchmark run this session belongs to (excluded from production metrics).
         #[serde(default)]
         benchmark: Option<BenchmarkRunId>,
@@ -96,5 +99,22 @@ impl DomainEvent for SessionEvent {
             Self::AgentSessionCompleted { .. } => "AgentSessionCompleted",
             Self::AgentSessionFailed { .. } => "AgentSessionFailed",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_of_is_absent_on_old_events() {
+        let v = serde_json::json!({
+            "type": "AgentDispatched", "task_id": TaskId::new(), "agent": "a", "stage": "s",
+            "runtime": "r", "model": null, "prompt": "p", "budget_usd": null, "timeout_secs": 1,
+        });
+        assert!(matches!(
+            serde_json::from_value::<SessionEvent>(v).unwrap(),
+            SessionEvent::AgentDispatched { resume_of: None, .. }
+        ));
     }
 }

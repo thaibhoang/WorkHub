@@ -57,6 +57,7 @@ async fn session(store: &EventStore, task: TaskId, finished: bool) -> SessionId 
         timeout_secs: 60,
         attempt: 1,
         retry_of: None,
+        resume_of: None,
         benchmark: None,
     };
     append(store, &s.stream_id(), task, dispatched).await;

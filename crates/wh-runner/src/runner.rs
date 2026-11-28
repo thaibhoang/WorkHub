@@ -194,6 +194,7 @@ impl<R: AgentRuntime> Runner<R> {
             timeout_secs: spec.timeout.as_secs(),
             attempt,
             retry_of,
+            resume_of: None,
             benchmark: spec.benchmark,
         })
         .await?;

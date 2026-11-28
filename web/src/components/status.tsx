@@ -5,6 +5,7 @@ const TASK: Record<TaskStatus, { label: string; dot: string; text: string }> = {
   open: { label: 'Queued', dot: 'bg-muted-foreground', text: 'text-muted-foreground' },
   running: { label: 'Running', dot: 'bg-info animate-pulse', text: 'text-info' },
   awaiting_gate: { label: 'Needs review', dot: 'bg-warn', text: 'text-warn' },
+  awaiting_input: { label: 'Needs answer', dot: 'bg-warn', text: 'text-warn' },
   blocked: { label: 'Blocked', dot: 'bg-fail', text: 'text-fail' },
   shipped: { label: 'PR open', dot: 'bg-info', text: 'text-info' },
   done: { label: 'Done', dot: 'bg-ok', text: 'text-ok' },

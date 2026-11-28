@@ -94,6 +94,8 @@ stateDiagram-v2
 
 Mỗi stage và gate đều có thể cấu hình bật/tắt, agent nào, model nào, budget/timeout bao nhiêu trong `factory.yaml`.
 
+**Agent hỏi người dùng** (đang làm, `docs/specs/agent-questions-resume-foundation.md`): mọi stage có agent có thể `⇄ AwaitingInput` (`AgentAsked` → chờ người, `UserAnswered` → chạy tiếp). Stage không exit trong lúc chờ và foreman không hành động. Hiện mới có event, state và read model (`tasks_view.status = awaiting_input`); chưa gì phát ra các event này (phần 3–6).
+
 ---
 
 ## 4. Event model
@@ -128,10 +130,12 @@ pub struct EventMeta {
 
 **Task**: `TaskCreated{source, title, body, factory, benchmark, external_ref}`, `TaskTriaged{priority, kind, estimate}`, `StageEntered{stage, feedback}`, `StageExited{stage, outcome, summary, session}`, `GateRequested{gate, stage}`, `GateDecided{gate, stage, approved, reviewer, comment}`, `TaskBlocked{stage, reason}`, `TaskResumed{stage, comment}`, `TaskCompleted{branch}`, `TaskCancelled{reason}`. Mỗi `GateRequested` chỉ nhận một quyết định: status vẫn là chờ gate cho tới khi foreman hành động (`TaskState.gate_decided`), quyết định lặp lại trả 409 và không ghi thêm `GateDecided`.
 
+**Hỏi đáp** (cũng trên stream `task-{id}`): `AgentAsked{stage, session, questions[{text, options[]}]}`, `UserAnswered{stage, answers[{option, text}], user}` (`answers[i]` trả lời `questions[i]`, `option` là nội dung lựa chọn). `TaskState` giữ câu hỏi đang chờ và số lượt hỏi kể từ `StageEntered` gần nhất (giới hạn bởi `max_questions`, sẽ áp dụng ở phần 4).
+
 **Pull request** (phase 8, cũng trên stream `task-{id}`): `TaskShipped{repo, pr_number, pr_url, branch, commit, created}`, `PrReviewed{review_id, reviewer, state, body, comments[], submitted_at}`, `PrChecksCompleted{commit, conclusion, failed[{name, url, log}]}`, `PrConflicted{base, commit}`, `PrMerged{merged_at, merged_by}`, `PrClosed{closed_at}`.
 
 **Run / AgentSession** (giàu dữ liệu nhất — đây là nguyên liệu cải tiến):
-- `AgentDispatched{agent, model, stage, prompt_ref, skills, budget}`
+- `AgentDispatched{agent, model, stage, prompt_ref, skills, budget, attempt, retry_of, resume_of}` (`resume_of` = session được chạy tiếp sau khi người trả lời)
 - `AgentSessionStarted{runner_id, sandbox}`
 - `AgentToolCalled{tool, duration_ms, ok}` *(ghi tóm tắt; transcript đầy đủ lưu artifact)*
 - `AgentUsageReported{input_tokens, output_tokens, cache_read, cache_write, cost_usd}` *(cộng dồn hoặc cuối phiên)*
@@ -232,6 +236,7 @@ defaults:
   model: claude-sonnet-5-5
   budget_usd_per_task: 5.0
   max_rework_loops: 3
+  max_questions: 3          # số lượt agent được hỏi mỗi lần vào stage (> 0; agent ghi đè được)
 
 stages:
   - id: triage

@@ -92,7 +92,7 @@ pub struct StageResultDto {
 impl From<&TaskState> for TaskStateDto {
     fn from(s: &TaskState) -> Self {
         let (stage, gate, blocked_reason) = match &s.status {
-            TaskStatus::Running { stage } => (Some(stage.clone()), None, None),
+            TaskStatus::Running { stage } | TaskStatus::AwaitingInput { stage } => (Some(stage.clone()), None, None),
             TaskStatus::AwaitingGate { gate, stage } => (Some(stage.clone()), Some(gate.clone()), None),
             TaskStatus::Blocked { reason } => (s.blocked_stage.clone(), None, Some(reason.clone())),
             _ => (None, None, None),

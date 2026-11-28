@@ -11,6 +11,17 @@ pub struct Question {
     pub options: Vec<String>,
 }
 
+/// The user's reply to one `Question`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Answer {
+    /// Text of the chosen option (not its index).
+    #[serde(default)]
+    pub option: Option<String>,
+    /// Free text.
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
 /// Parse the `QUESTION:` lines at the end of an agent's final message (blank lines
 /// and code fences may surround them). Malformed lines are ignored; an empty
 /// result means the agent is not asking. Pure.

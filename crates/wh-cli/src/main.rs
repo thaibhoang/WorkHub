@@ -1247,6 +1247,20 @@ async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {
                 if approved { "approved" } else { "rejected" },
                 comment.map(|c| format!(": {c}")).unwrap_or_default()
             ),
+            TaskEvent::AgentAsked { stage, questions, .. } => {
+                let texts: Vec<_> = questions.iter().map(|q| first_line(&q.text)).collect();
+                format!("{stage}: {}", texts.join(" | "))
+            }
+            TaskEvent::UserAnswered { answers, user, .. } => {
+                let replies: Vec<_> = answers
+                    .iter()
+                    .map(|a| {
+                        let parts: Vec<_> = [&a.option, &a.text].into_iter().flatten().map(|s| first_line(s)).collect();
+                        parts.join(": ")
+                    })
+                    .collect();
+                format!("by {user}: {}", replies.join(" | "))
+            }
             TaskEvent::TaskBlocked { reason, .. } => first_line(&reason).to_string(),
             TaskEvent::TaskCompleted { branch } => branch.unwrap_or_default(),
             TaskEvent::TaskShipped { pr_url, created, commit, .. } => {

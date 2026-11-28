@@ -15,6 +15,7 @@ pub use wh_core::{DockerSandbox, Sandbox};
 const DEFAULT_BUDGET_USD: f64 = 2.0;
 const DEFAULT_TIMEOUT_MIN: u64 = 30;
 const DEFAULT_MAX_RETRIES: u32 = 2;
+const DEFAULT_MAX_QUESTIONS: u32 = 3;
 const DEFAULT_PERMISSION_MODE: &str = "acceptEdits";
 const DEFAULT_MAX_REWORK_LOOPS: u32 = 3;
 const DEFAULT_SCORER_MODEL: &str = "claude-haiku-5-5";
@@ -140,6 +141,8 @@ struct Settings {
     budget_usd: Option<f64>,
     timeout_min: Option<u64>,
     max_retries: Option<u32>,
+    /// How many times per stage entry an agent may stop to ask the user.
+    max_questions: Option<u32>,
     permission_mode: Option<String>,
     allowed_tools: Option<Vec<String>>,
     /// Built-in tools the agent gets at all (Claude Code `--tools`). Unset = all
@@ -309,6 +312,8 @@ pub struct Agent {
     pub budget_usd: f64,
     pub timeout: Duration,
     pub max_retries: u32,
+    /// Asking rounds allowed per stage entry.
+    pub max_questions: u32,
     pub permission_mode: String,
     pub allowed_tools: Vec<String>,
     /// Built-in tool set (`None` = the runtime's default, all tools).
@@ -477,6 +482,7 @@ impl Factory {
 
         let d = &file.defaults;
         ensure!(d.timeout_min != Some(0), "defaults: timeout_min must be > 0");
+        ensure!(d.max_questions != Some(0), "defaults: max_questions must be > 0");
         let mut agents = BTreeMap::new();
         for (name, a) in &file.agents {
             let prompt_path = base.join(&a.prompt);
@@ -492,6 +498,7 @@ impl Factory {
             let budget_usd = s.budget_usd.or(d.budget_usd).unwrap_or(DEFAULT_BUDGET_USD);
             ensure!(budget_usd > 0.0, "agent '{name}': budget_usd must be > 0");
             ensure!(s.timeout_min != Some(0), "agent '{name}': timeout_min must be > 0");
+            ensure!(s.max_questions != Some(0), "agent '{name}': max_questions must be > 0");
             let env = resolve_env(d.env.iter().flatten().chain(s.env.iter().flatten()))
                 .with_context(|| format!("agent '{name}': env"))?;
             agents.insert(name.clone(), Agent {
@@ -502,6 +509,7 @@ impl Factory {
                 budget_usd,
                 timeout: Duration::from_secs(60 * s.timeout_min.or(d.timeout_min).unwrap_or(DEFAULT_TIMEOUT_MIN)),
                 max_retries: s.max_retries.or(d.max_retries).unwrap_or(DEFAULT_MAX_RETRIES),
+                max_questions: s.max_questions.or(d.max_questions).unwrap_or(DEFAULT_MAX_QUESTIONS),
                 permission_mode: s
                     .permission_mode
                     .clone()
@@ -793,6 +801,28 @@ improvement:
         assert_eq!(im.triggers[0].key(), "stage_failure_rate:impl>0.25");
         assert_eq!(im.triggers[1].subject, "s1");
         assert!(f.path.is_absolute());
+    }
+
+    #[test]
+    fn max_questions_defaults_override_and_validation() {
+        let load = |yaml: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            Factory::load(&write(dir.path(), yaml))
+        };
+        let rounds = |f: &Factory| (f.agents["a"].max_questions, f.agents["b"].max_questions);
+        assert_eq!(rounds(&load(OK).unwrap()), (3, 3));
+        let defaults = OK.replace("max_retries: 1 }", "max_retries: 1, max_questions: 5 }");
+        assert_eq!(rounds(&load(&defaults).unwrap()), (5, 5));
+        let agent = defaults.replace("agents/a.md }", "agents/a.md, max_questions: 1 }");
+        assert_eq!(rounds(&load(&agent).unwrap()), (1, 5));
+        for (needle, yaml) in [
+            ("defaults: max_questions must be > 0", OK.replace("max_retries: 1 }", "max_retries: 1, max_questions: 0 }")),
+            ("agent 'a': max_questions must be > 0", OK.replace("agents/a.md }", "agents/a.md, max_questions: 0 }")),
+            ("unknown field", OK.replace("max_retries: 1 }", "max_retries: 1, max_question: 2 }")),
+        ] {
+            let err = format!("{:#}", load(&yaml).unwrap_err());
+            assert!(err.contains(needle), "expected '{needle}' in: {err}");
+        }
     }
 
     #[test]
