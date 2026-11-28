@@ -51,6 +51,8 @@ pub struct TaskStateDto {
     pub status: &'static str,
     pub stage: Option<String>,
     pub gate: Option<String>,
+    /// The current gate has a decision the foreman has not acted on yet.
+    pub gate_decided: bool,
     pub blocked_reason: Option<String>,
     pub blocked_stage: Option<String>,
     pub body: Option<String>,
@@ -100,6 +102,7 @@ impl From<&TaskState> for TaskStateDto {
             status: crate::commands::status_name(&s.status),
             stage,
             gate,
+            gate_decided: matches!(s.status, TaskStatus::AwaitingGate { .. }) && s.gate_decided,
             blocked_reason,
             blocked_stage: s.blocked_stage.clone(),
             body: s.body.clone(),

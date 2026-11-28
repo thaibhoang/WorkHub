@@ -152,6 +152,42 @@ async fn gate_resume_and_cancel(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn double_gate_decision_is_rejected(pool: PgPool) {
+    let (app, store) = app(&pool, Some(factory()));
+    let (_, created) = call(&app, "POST", "/api/tasks", Some(json!({"title": "t"}))).await;
+    let id = created["task_id"].as_str().unwrap().to_owned();
+    let task: TaskId = id.parse().unwrap();
+    let url = format!("/api/tasks/{id}/gate");
+    let detail_url = format!("/api/tasks/{id}");
+    let gate = || TaskEvent::GateRequested { gate: "spec-review".into(), stage: "spec".into() };
+    let decisions = |detail: &Value| detail["events"].as_array().unwrap().iter().filter(|e| e["type"] == "GateDecided").count();
+
+    task_ev(&store, task, TaskEvent::StageEntered { stage: "spec".into(), feedback: None }).await;
+    task_ev(&store, task, gate()).await;
+    let (st, _) = call(&app, "POST", &url, Some(json!({"approved": true}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, detail) = call(&app, "GET", &detail_url, None).await;
+    assert_eq!(detail["state"]["status"], "awaiting_gate");
+    assert_eq!(detail["state"]["gate_decided"], true);
+
+    for body in [json!({"approved": true}), json!({"approved": false, "comment": "no"})] {
+        let (st, err) = call(&app, "POST", &url, Some(body)).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{err}");
+    }
+    let (_, detail) = call(&app, "GET", &detail_url, None).await;
+    assert_eq!(decisions(&detail), 1);
+
+    // A new request for the same gate can be decided again.
+    task_ev(&store, task, gate()).await;
+    let (_, detail) = call(&app, "GET", &detail_url, None).await;
+    assert_eq!(detail["state"]["gate_decided"], false);
+    let (st, _) = call(&app, "POST", &url, Some(json!({"approved": true}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, detail) = call(&app, "GET", &detail_url, None).await;
+    assert_eq!(decisions(&detail), 2);
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
 async fn sessions_stats_and_dashboard(pool: PgPool) {
     let (app, store) = app(&pool, Some(factory()));
     let (_, created) = call(&app, "POST", "/api/tasks", Some(json!({"title": "t"}))).await;

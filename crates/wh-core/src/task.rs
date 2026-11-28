@@ -330,6 +330,9 @@ pub struct TaskState {
     pub factory: Option<String>,
     pub benchmark: Option<BenchmarkContext>,
     pub status: TaskStatus,
+    /// The current gate already has a decision (only meaningful while `AwaitingGate`):
+    /// the status stays until the foreman acts on it.
+    pub gate_decided: bool,
     pub results: Vec<StageResult>,
     /// Stages re-run because of feedback (review reject, gate reject, resume comment).
     pub rework_loops: u32,
@@ -384,9 +387,11 @@ impl TaskState {
                 self.results.push(StageResult { stage: stage.clone(), outcome: *outcome, summary: summary.clone() });
             }
             TaskEvent::GateRequested { gate, stage } => {
+                self.gate_decided = false;
                 self.status = TaskStatus::AwaitingGate { gate: gate.clone(), stage: stage.clone() }
             }
             TaskEvent::GateDecided { stage, approved, .. } => {
+                self.gate_decided = true;
                 if stage == CONFLICT_STAGE
                     && let Some(c) = &mut self.conflict
                 {
@@ -604,6 +609,17 @@ mod tests {
         s.apply(8, entered());
         s.apply(9, exited(StageOutcome::Succeeded));
         assert_eq!((s.conflict, s.pr_rework_loops), (None, 2));
+    }
+
+    #[test]
+    fn gate_decided_is_set_by_a_decision_and_reset_by_a_request() {
+        let requested = || TaskEvent::GateRequested { gate: "g".into(), stage: "spec".into() };
+        let mut s = TaskState::fold([(1, requested())]);
+        assert!(!s.gate_decided);
+        s.apply(2, TaskEvent::GateDecided { gate: "g".into(), stage: "spec".into(), approved: true, reviewer: "r".into(), comment: None });
+        assert!(s.gate_decided);
+        s.apply(3, requested());
+        assert!(!s.gate_decided);
     }
 
     #[test]

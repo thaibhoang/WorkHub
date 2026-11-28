@@ -100,6 +100,7 @@ export interface TaskState {
   status: TaskStatus
   stage: string | null
   gate: string | null
+  gate_decided: boolean
   blocked_reason: string | null
   blocked_stage: string | null
   body: string | null

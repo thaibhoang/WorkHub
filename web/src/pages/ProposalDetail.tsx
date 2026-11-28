@@ -80,15 +80,19 @@ function Actions({ p }: { p: ProposalRow }) {
   const [comment, setComment] = useState('')
   const done = (r: { message: string }) => {
     toast.success(r.message)
-    for (const key of [['proposal', p.proposal_id], ['proposals'], ['improvement']]) qc.invalidateQueries({ queryKey: key })
+    // Returned so that `isPending` lasts until the fresh data has arrived.
+    return Promise.all(
+      [['proposal', p.proposal_id], ['proposals'], ['improvement']].map((key) => qc.invalidateQueries({ queryKey: key })),
+    )
   }
   const apply = useMutation({ mutationFn: () => api.applyProposal(p.proposal_id), onSuccess: done, onError: (e) => toast.error(e.message) })
   const decide = useMutation({
     mutationFn: (approved: boolean) => api.decideProposal(p.proposal_id, approved, comment || undefined),
     onSuccess: (r, approved) => {
-      done(r)
+      const refetched = done(r)
       setComment('')
       if (approved) apply.mutate()
+      return refetched
     },
     onError: (e) => toast.error(e.message),
   })
