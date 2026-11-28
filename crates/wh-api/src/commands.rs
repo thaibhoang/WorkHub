@@ -135,6 +135,7 @@ pub fn status_name(s: &TaskStatus) -> &'static str {
         TaskStatus::Open => "open",
         TaskStatus::Running { .. } => "running",
         TaskStatus::AwaitingGate { .. } => "awaiting_gate",
+        TaskStatus::AwaitingInput { .. } => "awaiting_input",
         TaskStatus::Blocked { .. } => "blocked",
         TaskStatus::Shipped => "shipped",
         TaskStatus::Done => "done",

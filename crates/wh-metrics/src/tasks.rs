@@ -109,6 +109,8 @@ impl EventHandler for TasksProjection {
             }
             TaskEvent::StageExited { .. } => self.exec(&Self::guarded("status = status"), id, ev).await?,
             TaskEvent::GateRequested { .. } => self.exec(&Self::guarded("status = 'awaiting_gate'"), id, ev).await?,
+            TaskEvent::AgentAsked { .. } => self.exec(&Self::guarded("status = 'awaiting_input'"), id, ev).await?,
+            TaskEvent::UserAnswered { .. } => self.exec(&Self::guarded("status = 'running'"), id, ev).await?,
             TaskEvent::GateDecided { approved, .. } => {
                 sqlx::query(&Self::guarded("status = 'running', gate_rejections = gate_rejections + $4"))
                     .bind(id)

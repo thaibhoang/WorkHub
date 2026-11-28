@@ -309,6 +309,7 @@ async fn interrupted_stage_is_blocked_on_startup_and_resumable(pool: PgPool) {
         timeout_secs: 60,
         attempt: 1,
         retry_of: None,
+        resume_of: None,
         benchmark: None,
     };
     let meta = EventMeta::new(task.0, Actor::System { component: "runner".into() });

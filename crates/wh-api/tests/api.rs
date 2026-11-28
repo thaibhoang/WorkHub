@@ -211,6 +211,7 @@ async fn sessions_stats_and_dashboard(pool: PgPool) {
             timeout_secs: 60,
             attempt: 1,
             retry_of: None,
+            resume_of: None,
             benchmark: None,
         },
         SessionEvent::AgentToolCalled { tool: "Read".into(), ok: true, duration_ms: 10 },

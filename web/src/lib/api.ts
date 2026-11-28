@@ -1,6 +1,6 @@
 // Typed client for the `wh serve` API (see crates/wh-api).
 
-export type TaskStatus = 'open' | 'running' | 'awaiting_gate' | 'blocked' | 'shipped' | 'done' | 'cancelled'
+export type TaskStatus = 'open' | 'running' | 'awaiting_gate' | 'awaiting_input' | 'blocked' | 'shipped' | 'done' | 'cancelled'
 
 export type PrState = 'open' | 'merged' | 'closed'
 
