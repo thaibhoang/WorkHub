@@ -9,6 +9,10 @@ Lower the score for each of these, and name it in the rationale:
 - editing an already-applied migration instead of adding a new one
 - features or options nobody asked for
 
+Rework sessions are in scope when they do what the feedback asks:
+- Failed CI or a review on the PR: a minimal fix that makes the failing check pass is in scope, even in a file the spec does not mention, as long as it fixes the code rather than weakening the test.
+- Merge conflict resolution (the task says the base branch was merged, or the commit is a merge): changes brought in from the base branch are not the agent's work. Judge only how the conflicted hunks were resolved and any edits beyond them.
+
 Score 0.0–0.3 when the change mostly does something other than the task, or games the checks.
 If there are no file changes at all, score 0.5 and classify as `no_changes`.
 
