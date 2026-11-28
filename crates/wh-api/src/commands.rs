@@ -81,6 +81,10 @@ pub async fn decide_gate(
     let TaskStatus::AwaitingGate { gate, stage } = state.status.clone() else {
         return Err(CommandError::InvalidState(format!("task is not waiting at a gate ({})", status_name(&state.status))));
     };
+    // The status stays at the gate until the foreman acts, so a repeat would pass `Exact`.
+    if state.gate_decided {
+        return Err(CommandError::Conflict);
+    }
     let reviewer = actor_name(&actor);
     let ev = TaskEvent::GateDecided { gate: gate.clone(), stage, approved, reviewer, comment };
     append(store, task, ExpectedVersion::Exact(state.version), actor, ev).await?;

@@ -92,7 +92,7 @@ export default function RunDetail() {
         </p>
       ) : null}
       {pipeline ? <PipelineStrip factory={pipeline} detail={data} /> : null}
-      <ActionPanel id={id} detail={data} factory={pipeline} />
+      <ActionPanel key={id} id={id} detail={data} factory={pipeline} />
       <PrPanel detail={data} />
 
       <Tabs defaultValue="timeline" className="mt-6">
@@ -189,14 +189,18 @@ function PipelineStrip({ factory, detail }: { factory: FactoryDef; detail: TaskD
   )
 }
 
-function useCommand<T>(id: string, fn: (arg: T) => Promise<{ message: string }>) {
+function useCommand<T>(id: string, fn: (arg: T) => Promise<{ message: string }>, onSent?: (arg: T) => void) {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: fn,
-    onSuccess: (r) => {
+    onSuccess: (r, arg) => {
       toast.success(r.message)
-      qc.invalidateQueries({ queryKey: ['task', id] })
-      qc.invalidateQueries({ queryKey: ['tasks'] })
+      onSent?.(arg)
+      // Returned so that `isPending` lasts until the fresh task data has arrived.
+      return Promise.all([
+        qc.invalidateQueries({ queryKey: ['task', id] }),
+        qc.invalidateQueries({ queryKey: ['tasks'] }),
+      ])
     },
     onError: (e) => toast.error(e.message),
   })
@@ -206,8 +210,16 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
   const { state } = detail
   const [comment, setComment] = useState('')
   const [stage, setStage] = useState<string>('')
-  const gate = useCommand(id, (approved: boolean) => api.decideGate(id, approved, comment || undefined))
-  const resume = useCommand(id, () => api.resume(id, stage || undefined, comment || undefined))
+  // Task version a command succeeded on. The refetch in `useCommand` can be cancelled by a
+  // live update, so the buttons also stay disabled while the data is still at that version.
+  const [sentAt, setSentAt] = useState<number | null>(null)
+  const sent = sentAt === state.version
+  const gate = useCommand(
+    id,
+    (d: { approved: boolean; version: number }) => api.decideGate(id, d.approved, comment || undefined),
+    (d) => setSentAt(d.version),
+  )
+  const resume = useCommand(id, (_version: number) => api.resume(id, stage || undefined, comment || undefined), setSentAt)
   const reset = () => setComment('')
 
   if (state.status === 'awaiting_gate') {
@@ -240,22 +252,31 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
         </CardHeader>
         <CardContent className="grid gap-4">
           {output?.summary ? <Summary text={output.summary} /> : null}
-          <div className="grid gap-2">
-            <Label htmlFor="gate-comment">Comment (required to reject)</Label>
-            <Textarea id="gate-comment" rows={3} value={comment} onChange={(e) => setComment(e.target.value)} />
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button onClick={() => gate.mutate(true, { onSuccess: reset })} disabled={gate.isPending}>
-              <Check /> Approve
-            </Button>
-            <Button
-              variant="outline"
-              onClick={() => gate.mutate(false, { onSuccess: reset })}
-              disabled={gate.isPending || !comment.trim()}
-            >
-              <X /> Reject with comment
-            </Button>
-          </div>
+          {state.gate_decided ? (
+            <p className="text-sm text-muted-foreground">Decision recorded, waiting for the foreman.</p>
+          ) : (
+            <>
+              <div className="grid gap-2">
+                <Label htmlFor="gate-comment">Comment (required to reject)</Label>
+                <Textarea id="gate-comment" rows={3} value={comment} onChange={(e) => setComment(e.target.value)} />
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  onClick={() => gate.mutate({ approved: true, version: state.version }, { onSuccess: reset })}
+                  disabled={gate.isPending || sent}
+                >
+                  <Check /> Approve
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => gate.mutate({ approved: false, version: state.version }, { onSuccess: reset })}
+                  disabled={gate.isPending || sent || !comment.trim()}
+                >
+                  <X /> Reject with comment
+                </Button>
+              </div>
+            </>
+          )}
         </CardContent>
       </Card>
     )
@@ -295,7 +316,7 @@ function ActionPanel({ id, detail, factory }: { id: string; detail: TaskDetail; 
             </div>
           </div>
           <div>
-            <Button onClick={() => resume.mutate(undefined, { onSuccess: reset })} disabled={resume.isPending}>
+            <Button onClick={() => resume.mutate(state.version, { onSuccess: reset })} disabled={resume.isPending || sent}>
               <Play /> Resume
             </Button>
           </div>

@@ -126,7 +126,7 @@ pub struct EventMeta {
 
 ### 4.2 Danh mục event chính
 
-**Task**: `TaskCreated{source, title, body, factory, benchmark, external_ref}`, `TaskTriaged{priority, kind, estimate}`, `StageEntered{stage, feedback}`, `StageExited{stage, outcome, summary, session}`, `GateRequested{gate, stage}`, `GateDecided{gate, stage, approved, reviewer, comment}`, `TaskBlocked{stage, reason}`, `TaskResumed{stage, comment}`, `TaskCompleted{branch}`, `TaskCancelled{reason}`.
+**Task**: `TaskCreated{source, title, body, factory, benchmark, external_ref}`, `TaskTriaged{priority, kind, estimate}`, `StageEntered{stage, feedback}`, `StageExited{stage, outcome, summary, session}`, `GateRequested{gate, stage}`, `GateDecided{gate, stage, approved, reviewer, comment}`, `TaskBlocked{stage, reason}`, `TaskResumed{stage, comment}`, `TaskCompleted{branch}`, `TaskCancelled{reason}`. Mỗi `GateRequested` chỉ nhận một quyết định: status vẫn là chờ gate cho tới khi foreman hành động (`TaskState.gate_decided`), quyết định lặp lại trả 409 và không ghi thêm `GateDecided`.
 
 **Pull request** (phase 8, cũng trên stream `task-{id}`): `TaskShipped{repo, pr_number, pr_url, branch, commit, created}`, `PrReviewed{review_id, reviewer, state, body, comments[], submitted_at}`, `PrChecksCompleted{commit, conclusion, failed[{name, url, log}]}`, `PrConflicted{base, commit}`, `PrMerged{merged_at, merged_by}`, `PrClosed{closed_at}`.
 
