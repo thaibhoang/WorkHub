@@ -60,7 +60,7 @@ function Sidebar() {
     { to: '/factory', label: 'Factory', icon: FactoryIcon },
   ]
   return (
-    <aside className="flex shrink-0 items-center gap-1 border-b bg-sidebar px-3 py-2 md:w-52 md:flex-col md:items-stretch md:border-r md:border-b-0 md:px-3 md:py-5">
+    <aside className="flex shrink-0 items-center gap-1 border-b bg-sidebar px-3 py-2 md:sticky md:top-0 md:h-svh md:w-52 md:flex-col md:items-stretch md:self-start md:overflow-y-auto md:border-r md:border-b-0 md:px-3 md:py-5">
       <div className="mr-2 flex items-center gap-2 px-2 font-semibold md:mb-5 md:mr-0">
         <span className="grid size-6 place-items-center rounded-md bg-primary text-[11px] font-bold text-primary-foreground">
           W
