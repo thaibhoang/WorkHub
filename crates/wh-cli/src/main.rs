@@ -1383,6 +1383,7 @@ async fn run_agent(store: &EventStore, a: RunArgs) -> Result<()> {
         with_user_mcp: a.with_user_mcp,
         timeout: Duration::from_secs(a.timeout_min * 60),
         keep_worktree: !a.cleanup,
+        pause_on_question: false,
         max_retries: a.max_retries,
         retry_backoff: Duration::from_secs(a.retry_backoff_secs),
         branch: None,

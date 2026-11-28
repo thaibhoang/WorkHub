@@ -228,7 +228,7 @@ impl AgentRuntime for ClaudeCode {
             let msg = format!("container failed to start (exit {}): {}", code.unwrap_or(0), tail(&stderr, 2000));
             return Outcome::failed(FailureClass::EnvSetup, msg, false, started.elapsed());
         }
-        parser.outcome().unwrap_or_else(|| {
+        let outcome = parser.outcome().unwrap_or_else(|| {
             let msg = format!(
                 "claude exited ({}) without a result. stderr: {}",
                 status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()),
@@ -239,8 +239,25 @@ impl AgentRuntime for ClaudeCode {
             }
             // Usually transient (API overload, crashed process): worth a retry.
             Outcome::failed(FailureClass::Unknown, msg, true, started.elapsed())
-        })
+        });
+        mark_session_lost(&req.session, outcome, &[&stderr, &parser.errors()])
     }
+}
+
+/// A failed resume whose conversation is missing becomes `SessionLost`. `details`
+/// are the places besides the outcome's message where Claude Code may say so. Pure.
+fn mark_session_lost(mode: &SessionMode, mut outcome: Outcome, details: &[&str]) -> Outcome {
+    const NEEDLE: &str = "no conversation found";
+    if let (SessionMode::Resume(_), OutcomeStatus::Failed { class, message, retryable }) = (mode, &mut outcome.status)
+        && let Some(text) = std::iter::once(message.as_str())
+            .chain(details.iter().copied())
+            .find(|t| t.to_lowercase().contains(NEEDLE))
+    {
+        *message = tail(text.trim(), 2000);
+        *class = FailureClass::SessionLost;
+        *retryable = false;
+    }
+    outcome
 }
 
 /// Claude Code's message when the account's usage window is exhausted, e.g.
@@ -260,6 +277,12 @@ pub struct StreamParser {
 }
 
 impl StreamParser {
+    /// The `errors` of the `result` message (set on some error subtypes), one per line.
+    fn errors(&self) -> String {
+        let errors = self.result.as_ref().and_then(|r| r["errors"].as_array());
+        errors.into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join("\n")
+    }
+
     pub fn feed(&mut self, line: &str) -> Vec<Signal> {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             return Vec::new();
@@ -506,6 +529,25 @@ mod tests {
         let mut p = StreamParser::default();
         p.feed(STREAM[0]);
         assert!(p.outcome().is_none());
+    }
+
+    #[test]
+    fn missing_conversation_is_session_lost_only_when_resuming() {
+        let mut p = StreamParser::default();
+        p.feed(r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: abc"]}"#);
+        let resume = SessionMode::Resume("abc".into());
+        let lost = |mode: &SessionMode, o: Outcome, details: &[&str]| {
+            matches!(
+                mark_session_lost(mode, o, details).status,
+                OutcomeStatus::Failed { class: FailureClass::SessionLost, retryable: false, .. }
+            )
+        };
+        let failed = || Outcome::failed(FailureClass::Unknown, "boom", true, Duration::ZERO);
+
+        assert!(lost(&resume, p.outcome().unwrap(), &[&p.errors()]), "result errors");
+        assert!(lost(&resume, failed(), &["No conversation found with session ID: abc"]), "stderr");
+        assert!(!lost(&SessionMode::Persist, p.outcome().unwrap(), &[&p.errors()]));
+        assert!(!lost(&resume, failed(), &["overloaded"]));
     }
 
     #[test]

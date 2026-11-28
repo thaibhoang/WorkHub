@@ -55,6 +55,22 @@ impl Worktree {
         Ok(Self { repo: repo.to_owned(), path: path.to_owned(), branch: branch.to_owned() })
     }
 
+    /// Reopen a worktree kept from an earlier session. Errors if the directory is
+    /// gone or is not a worktree on `branch`.
+    pub async fn open(repo: &Path, path: &Path, branch: &str) -> anyhow::Result<Self> {
+        let real = tokio::fs::canonicalize(path).await.with_context(|| format!("worktree {} is gone", path.display()))?;
+        // Compare the top level too: a plain directory inside some repo is not a worktree.
+        let top = git(path, &["rev-parse", "--show-toplevel"]).await?;
+        if tokio::fs::canonicalize(&top).await? != real {
+            bail!("{} is not a git worktree", path.display());
+        }
+        let head = git(path, &["symbolic-ref", "--short", "HEAD"]).await?;
+        if head != branch {
+            bail!("worktree {} is on {head}, not {branch}", path.display());
+        }
+        Ok(Self { repo: repo.to_owned(), path: path.to_owned(), branch: branch.to_owned() })
+    }
+
     /// Stage and commit everything the agent changed. Returns the new commit sha,
     /// or `None` when there was nothing to commit.
     pub async fn commit_all(&self, message: &str) -> anyhow::Result<Option<String>> {
@@ -126,12 +142,12 @@ impl Worktree {
     }
 
     /// Which of `files` still contain conflict markers.
-    pub async fn with_markers(&self, files: &[Conflicted]) -> Vec<String> {
+    pub async fn with_markers(&self, files: &[String]) -> Vec<String> {
         let mut out = Vec::new();
         for f in files {
-            let Ok(bytes) = tokio::fs::read(self.path.join(&f.path)).await else { continue };
+            let Ok(bytes) = tokio::fs::read(self.path.join(f)).await else { continue };
             if String::from_utf8_lossy(&bytes).lines().any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ")) {
-                out.push(f.path.clone());
+                out.push(f.clone());
             }
         }
         out

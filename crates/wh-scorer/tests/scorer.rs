@@ -139,6 +139,7 @@ async fn run_stage(store: &EventStore, factory: &Factory, data: &Path, task: Tas
         with_user_mcp: false,
         timeout: Duration::from_secs(30),
         keep_worktree: false,
+        pause_on_question: false,
         max_retries: 0,
         retry_backoff: Duration::ZERO,
         branch: Some(format!("wh/task/{}", &task.0.simple().to_string()[20..])),

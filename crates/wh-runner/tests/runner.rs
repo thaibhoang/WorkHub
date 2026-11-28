@@ -57,6 +57,7 @@ fn spec(repo: &Path, task: TaskId, base_ref: &str) -> RunSpec {
         with_user_mcp: false,
         timeout: Duration::from_secs(60),
         keep_worktree: false,
+        pause_on_question: false,
         max_retries: 0,
         retry_backoff: Duration::ZERO,
         branch: None,

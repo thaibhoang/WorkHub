@@ -222,6 +222,8 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             sandbox: agent.sandbox.clone(),
             env: agent.env.clone(),
             merge: None,
+            // Off until the pipeline can resume a paused stage.
+            pause_on_question: false,
         }
     }
 
@@ -255,7 +257,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             }
             match runner.run(spec, |_| {}).await {
                 Ok(r) => {
-                    tracing::info!(%task, stage, outcome = r.stage_outcome.as_str(), cost = r.total_cost_usd(), "stage finished");
+                    tracing::info!(%task, stage, outcome = r.stage_outcome.map_or("paused", |o| o.as_str()), cost = r.total_cost_usd(), "stage finished");
                     Ok(())
                 }
                 Err(e) if is_conflict(&e) => Ok(()), // already dispatched by an earlier delivery

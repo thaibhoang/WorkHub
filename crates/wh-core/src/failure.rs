@@ -20,6 +20,9 @@ pub enum FailureClass {
     /// window). Not the agent's fault and not worth retrying until it resets;
     /// excluded from failure rates so the improver does not "fix" it.
     UsageLimit,
+    /// The saved conversation a resume needs is gone. Not retryable: the caller
+    /// has to fall back to a fresh session.
+    SessionLost,
     Unknown,
 }
 
@@ -38,6 +41,7 @@ impl FailureClass {
             Self::AgentGaveUp => "agent_gave_up",
             Self::Infra => "infra",
             Self::UsageLimit => "usage_limit",
+            Self::SessionLost => "session_lost",
             Self::Unknown => "unknown",
         }
     }
@@ -49,7 +53,7 @@ mod tests {
 
     #[test]
     fn as_str_matches_serde() {
-        for c in [FailureClass::BudgetExceeded, FailureClass::EnvSetup, FailureClass::AgentGaveUp, FailureClass::UsageLimit] {
+        for c in [FailureClass::BudgetExceeded, FailureClass::EnvSetup, FailureClass::AgentGaveUp, FailureClass::UsageLimit, FailureClass::SessionLost] {
             assert_eq!(serde_json::to_value(c).unwrap(), c.as_str());
         }
     }
