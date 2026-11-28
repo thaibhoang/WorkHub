@@ -356,6 +356,7 @@ async fn sessions_stats_and_dashboard(pool: PgPool) {
             summary: Some("ok".into()),
             transcript: Some(transcript.display().to_string()),
             commit: None,
+            paused: false,
         },
     ];
     for e in &evs {

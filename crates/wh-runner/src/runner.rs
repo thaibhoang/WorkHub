@@ -184,6 +184,15 @@ impl<R: AgentRuntime> Runner<R> {
         unreachable!("the last attempt never retries")
     }
 
+    /// Throw away what a paused stage kept (worktree and sandbox home), so that the
+    /// task branch can be checked out again. Uncommitted work is lost.
+    pub async fn discard(&self, repo: &std::path::Path, home_session: SessionId) -> anyhow::Result<()> {
+        let path = self.config.data_dir.join("worktrees").join(home_session.to_string());
+        let worktree = crate::worktree::discard(repo, &path).await;
+        remove_home(&self.config.data_dir, home_session).await;
+        worktree
+    }
+
     /// Continue a paused stage with the user's `answer`: one new session in the same
     /// worktree (and sandbox home), never retried, with the full timeout and budget of
     /// `spec`. The stage is committed and gets `StageExited` only if it really ends.
@@ -312,7 +321,7 @@ impl<R: AgentRuntime> Runner<R> {
             Ok(w) => w,
             Err(e) => {
                 let outcome = Outcome::failed(FailureClass::EnvSetup, format!("{e:#}"), false, Duration::ZERO);
-                s.finish(&outcome, None, None).await?;
+                s.finish(&outcome, None, None, false).await?;
                 return not_started(outcome);
             }
         };
@@ -324,7 +333,7 @@ impl<R: AgentRuntime> Runner<R> {
                     Err(e) => {
                         let msg = format!("docker sandbox: {e:#}");
                         let outcome = Outcome::failed(FailureClass::EnvSetup, msg, false, Duration::ZERO);
-                        s.finish(&outcome, None, None).await?;
+                        s.finish(&outcome, None, None, false).await?;
                         if let Err(e) = worktree.remove().await {
                             tracing::warn!("failed to remove worktree {}: {e:#}", worktree.path.display());
                         }
@@ -414,7 +423,7 @@ impl<R: AgentRuntime> Runner<R> {
         }
         let transcript = transcript_path.exists().then(|| transcript_path.display().to_string());
         if !matches!(end, End::Finished) {
-            s.finish(&outcome, transcript, None).await?;
+            s.finish(&outcome, transcript, None, matches!(end, End::Paused(_))).await?;
             let workdir = Some(worktree.path);
             let report = SessionReport { session_id, attempt, outcome, workdir, branch: Some(worktree.branch) };
             return Ok((report, end));
@@ -444,7 +453,7 @@ impl<R: AgentRuntime> Runner<R> {
                 }
             }
         }
-        s.finish(&outcome, transcript, commit).await?;
+        s.finish(&outcome, transcript, commit, false).await?;
 
         let workdir = if spec.keep_worktree {
             Some(worktree.path.clone())
@@ -550,7 +559,13 @@ impl<'a> Recorder<'a> {
         .await
     }
 
-    async fn finish(&mut self, o: &Outcome, transcript: Option<String>, commit: Option<String>) -> anyhow::Result<()> {
+    async fn finish(
+        &mut self,
+        o: &Outcome,
+        transcript: Option<String>,
+        commit: Option<String>,
+        paused: bool,
+    ) -> anyhow::Result<()> {
         self.session(SessionEvent::AgentUsageReported { usage: o.usage, cost_usd: o.cost_usd }).await?;
         self.session(match &o.status {
             OutcomeStatus::Succeeded => SessionEvent::AgentSessionCompleted {
@@ -559,6 +574,7 @@ impl<'a> Recorder<'a> {
                 summary: o.summary.clone(),
                 transcript,
                 commit,
+                paused,
             },
             OutcomeStatus::Failed { class, message, retryable } => SessionEvent::AgentSessionFailed {
                 failure_class: *class,

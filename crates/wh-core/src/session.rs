@@ -73,6 +73,9 @@ pub enum SessionEvent {
         /// Commit WorkHub made on the task branch with the agent's changes.
         #[serde(default)]
         commit: Option<String>,
+        /// The turn ended on a question: its worktree and sandbox home are kept.
+        #[serde(default)]
+        paused: bool,
     },
     AgentSessionFailed {
         failure_class: FailureClass,

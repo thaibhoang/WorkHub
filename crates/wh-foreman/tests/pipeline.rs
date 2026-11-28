@@ -289,6 +289,66 @@ async fn failed_stage_blocks_and_gate_reject_reruns_stage(pool: PgPool) {
     assert_eq!(load(&store, manual).await.version, 1);
 }
 
+/// A created task whose `spec` stage asked, keeping the worktree of `home`.
+async fn paused_task(store: &EventStore, home: wh_core::SessionId) -> TaskId {
+    let task = TaskId::new();
+    let created =
+        TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: Some("test".into()), benchmark: None, external_ref: None, parent: None, draft: false };
+    append(store, task, created).await;
+    append(store, task, TaskEvent::StageEntered { stage: "spec".into(), feedback: None }).await;
+    let resume = wh_core::task::ResumeHandle {
+        home_session: home,
+        runtime_session_id: "rt".into(),
+        branch: wh_core::task::task_branch(task),
+        conflicts: vec![],
+    };
+    let asked = TaskEvent::AgentAsked { stage: "spec".into(), session: home, questions: vec![], resume: Some(resume) };
+    append(store, task, asked).await;
+    task
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn paused_stage_survives_recovery_but_a_resumed_one_is_blocked(pool: PgPool) {
+    let (dir, factory) = setup(3);
+    let store = EventStore::new(pool);
+    let waiting = paused_task(&store, wh_core::SessionId::new()).await;
+    let resumed = paused_task(&store, wh_core::SessionId::new()).await;
+    append(&store, resumed, TaskEvent::StageResumed { stage: "spec".into() }).await;
+
+    let fake = Fake { review_calls: AtomicU32::new(0), review_rejects: 0, implement_fails: false };
+    let runner = Runner::new(store.clone(), fake, RunnerConfig { data_dir: dir.path().join("data") });
+    let foreman = Foreman::new(store.clone(), factory, runner, Dispatch::Inline);
+    assert_eq!(foreman.recover_interrupted().await.unwrap(), vec![resumed]);
+    assert!(matches!(load(&store, waiting).await.status, TaskStatus::AwaitingInput { .. }));
+    assert!(matches!(load(&store, resumed).await.status, TaskStatus::Blocked { .. }));
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn paused_task_blocked_then_resumed_runs_on_the_same_branch(pool: PgPool) {
+    let (dir, factory) = setup(3);
+    let store = EventStore::new(pool);
+    let data = dir.path().join("data");
+    let home = wh_core::SessionId::new();
+    let task = paused_task(&store, home).await;
+    let worktree = data.join("worktrees").join(home.to_string());
+    let branch = wh_core::task::task_branch(task);
+    git(&dir.path().join("repo"), &["worktree", "add", "-q", "-b", &branch, worktree.to_str().unwrap(), "main"]);
+    std::fs::write(worktree.join("uncommitted"), "x").unwrap();
+    let sandbox_home = data.join("sandbox-home").join(home.to_string());
+    std::fs::create_dir_all(&sandbox_home).unwrap();
+    append(&store, task, TaskEvent::TaskBlocked { stage: Some("spec".into()), reason: "x".into() }).await;
+    append(&store, task, TaskEvent::TaskResumed { stage: Some("spec".into()), comment: None }).await;
+
+    let fake = Fake { review_calls: AtomicU32::new(0), review_rejects: 0, implement_fails: false };
+    let runner = Runner::new(store.clone(), fake, RunnerConfig { data_dir: data });
+    let mut foreman = Foreman::new(store.clone(), factory, runner, Dispatch::Inline);
+    Subscription::new(store.clone()).catch_up(&mut foreman).await.unwrap();
+
+    let state = load(&store, task).await;
+    assert!(matches!(state.status, TaskStatus::AwaitingGate { .. }), "{:?}", state.status);
+    assert!(!worktree.exists() && !sandbox_home.exists());
+}
+
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
 async fn interrupted_stage_is_blocked_on_startup_and_resumable(pool: PgPool) {
     let (dir, factory) = setup(3);

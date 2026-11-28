@@ -161,6 +161,17 @@ impl Worktree {
     }
 }
 
+/// Remove a worktree of `repo`, whatever it has checked out and uncommitted work
+/// included. One that is already gone is not an error.
+pub(crate) async fn discard(repo: &Path, path: &Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let path_str = path.to_str().context("worktree path is not valid UTF-8")?;
+    git(repo, &["worktree", "remove", "--force", path_str]).await?;
+    Ok(())
+}
+
 /// The `<<<<<<<` … `>>>>>>>` blocks of a file, each with its starting line number.
 fn conflict_hunks(text: &str) -> String {
     let mut out = String::new();

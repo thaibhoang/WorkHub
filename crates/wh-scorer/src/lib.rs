@@ -17,7 +17,7 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 use anyhow::{Context, bail};
 use tokio::sync::Semaphore;
 use wh_core::{
-    Actor, EventMeta, NewEvent, RecordedEvent, ScoreId, SessionId, TaskId,
+    Actor, EventMeta, FailureClass, NewEvent, RecordedEvent, ScoreId, SessionId, TaskId,
     score::ScoreEvent,
     session::SessionEvent,
     task::TaskEvent,
@@ -159,6 +159,8 @@ struct SessionInfo {
     finished_event: uuid::Uuid,
     /// Session of a benchmark case (not graded automatically).
     benchmark: bool,
+    /// Ended on a question or lost its conversation (not graded automatically).
+    unfinished: bool,
 }
 
 impl<R: AgentRuntime> Inner<R> {
@@ -171,13 +173,29 @@ impl<R: AgentRuntime> Inner<R> {
 
     async fn session_info(&self, session: SessionId) -> anyhow::Result<Option<SessionInfo>> {
         let events = self.store.read_stream(&session.stream_id()).await?;
-        let Some(SessionEvent::AgentDispatched { task_id, agent, stage, prompt, benchmark, .. }) =
+        let Some(SessionEvent::AgentDispatched { task_id, agent, stage, mut prompt, benchmark, mut resume_of, .. }) =
             events.first().map(|e| e.decode()).transpose()?
         else {
             return Ok(None);
         };
         let Some(last) = events.last() else { return Ok(None) };
-        let (failed, outcome, summary, transcript, commit) = match last.decode::<SessionEvent>()? {
+        // A resumed session was only sent the answers: the judge needs the first prompt.
+        while let Some(earlier) = resume_of {
+            let first = self.store.read_stream(&earlier.stream_id()).await?.into_iter().next();
+            let Some(SessionEvent::AgentDispatched { prompt: p, resume_of: of, .. }) =
+                first.map(|e| e.decode()).transpose()?
+            else {
+                break;
+            };
+            (prompt, resume_of) = (p, of);
+        }
+        let end = last.decode::<SessionEvent>()?;
+        let unfinished = matches!(
+            end,
+            SessionEvent::AgentSessionCompleted { paused: true, .. }
+                | SessionEvent::AgentSessionFailed { failure_class: FailureClass::SessionLost, .. }
+        );
+        let (failed, outcome, summary, transcript, commit) = match end {
             SessionEvent::AgentSessionCompleted { summary, transcript, commit, .. } => {
                 (false, "succeeded".to_owned(), summary, transcript, commit)
             }
@@ -199,6 +217,7 @@ impl<R: AgentRuntime> Inner<R> {
             commit,
             finished_event: last.event_id,
             benchmark: benchmark.is_some(),
+            unfinished,
         }))
     }
 
@@ -362,7 +381,7 @@ impl<R: AgentRuntime + 'static> EventHandler for ScorerService<R> {
         let Some(info) = inner.session_info(session).await? else { return Ok(()) };
         // Benchmark sessions are measured by their suite's checks; grading them would
         // mix benchmark runs into the live scorer metrics the improver reads.
-        if info.benchmark {
+        if info.benchmark || info.unfinished {
             return Ok(());
         }
         let scorers: Vec<Scorer> = inner
