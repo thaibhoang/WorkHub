@@ -301,8 +301,30 @@ enum TaskCmd {
         /// Create a manual task that no foreman drives (ignores --factory and WH_FACTORY)
         #[arg(long)]
         no_factory: bool,
+        /// Make it a subtask of this task
+        #[arg(long)]
+        parent: Option<TaskId>,
+        /// Start it right away (default: a draft that waits for `wh task start`)
+        #[arg(long)]
+        start: bool,
     },
-    /// List tasks from the tasks_view read model
+    /// Start a draft task; the foreman then runs its pipeline
+    Start {
+        task: TaskId,
+        /// Also start every draft subtask below it
+        #[arg(long)]
+        subtree: bool,
+    },
+    /// Move a task under another parent (tasks form a tree; cycles are refused)
+    Move {
+        task: TaskId,
+        #[arg(long, required_unless_present = "root", conflicts_with = "root")]
+        parent: Option<TaskId>,
+        /// Move it to the top level
+        #[arg(long)]
+        root: bool,
+    },
+    /// List tasks from the tasks_view read model, as a tree
     List,
     /// Show a task's timeline and its agent sessions
     Show { task: TaskId },
@@ -564,21 +586,39 @@ async fn main() -> Result<()> {
             println!("migrations applied");
         }
         Cmd::Task { cmd } => match cmd {
-            TaskCmd::Create { title, body, factory, no_factory } => {
+            TaskCmd::Create { title, body, factory, no_factory, parent, start } => {
                 let factory = task_factory(no_factory, &factory)?;
-                let t = NewTask { title, body, source: TaskSource::Cli, factory };
-                println!("{}", commands::create_task(&store, local_user(), t).await?);
+                let t = NewTask { title, body, source: TaskSource::Cli, factory, parent, start };
+                let id = commands::create_task(&store, local_user(), t).await?;
+                println!("{id}");
+                if !start {
+                    eprintln!("draft: start it with `wh task start {id}`");
+                }
+            }
+            TaskCmd::Start { task, subtree } => {
+                let started = commands::activate(&store, local_user(), task, subtree).await?;
+                for id in &started {
+                    println!("started {id}");
+                }
+                if started.is_empty() {
+                    println!("no draft tasks to start");
+                }
+            }
+            TaskCmd::Move { task, parent, root: _ } => {
+                commands::move_task(&store, local_user(), task, parent).await?;
+                println!("moved");
             }
             TaskCmd::List => {
                 wh_metrics::catch_up_all(&store).await?;
                 println!("{:<36}  {:<13}  {:<12}  {:>6}  title", "task", "status", "stage", "rework");
-                for t in TasksProjection::list(&pool).await? {
+                for (depth, t) in task_tree(TasksProjection::list(&pool).await?) {
                     println!(
-                        "{}  {:<13}  {:<12}  {:>6}  {}{}",
+                        "{}  {:<13}  {:<12}  {:>6}  {}{}{}",
                         t.task_id,
                         t.status,
                         t.current_stage.as_deref().unwrap_or("-"),
                         t.rework_loops,
+                        if depth == 0 { String::new() } else { format!("{}└ ", "  ".repeat(depth - 1)) },
                         t.title,
                         t.blocked_reason.map(|r| format!("  [blocked: {}]", first_line(&r))).unwrap_or_default()
                             + &t.pr_url.map(|u| format!("  [PR {}: {u}]", t.pr_state.as_deref().unwrap_or("?"))).unwrap_or_default()
@@ -1231,6 +1271,16 @@ async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {
     if let Some(pr) = &state.pr {
         println!("PR #{} {}  ({} PR rework loop(s))", pr.number, pr.url, state.pr_rework_loops);
     }
+    if let Some(p) = state.parent {
+        let title = commands::load_task(store, p).await.map(|s| s.title).unwrap_or_default();
+        println!("parent: {p}  {title}");
+    }
+    for c in wh_metrics::queries::children(store.pool(), task.0).await? {
+        println!("subtask: {}  {:<10}  {}", c.task_id, c.status, c.title);
+    }
+    if state.status == wh_core::task::TaskStatus::Draft {
+        println!("draft: start it with `wh task start {task}`");
+    }
     for e in store.read_stream(&task.stream_id()).await? {
         let detail = match e.decode::<TaskEvent>()? {
             TaskEvent::StageEntered { stage, feedback } => {
@@ -1247,6 +1297,20 @@ async fn show_task(store: &EventStore, task: TaskId) -> Result<()> {
                 if approved { "approved" } else { "rejected" },
                 comment.map(|c| format!(": {c}")).unwrap_or_default()
             ),
+            TaskEvent::AgentAsked { stage, questions, .. } => {
+                let texts: Vec<_> = questions.iter().map(|q| first_line(&q.text)).collect();
+                format!("{stage}: {}", texts.join(" | "))
+            }
+            TaskEvent::UserAnswered { answers, user, .. } => {
+                let replies: Vec<_> = answers
+                    .iter()
+                    .map(|a| {
+                        let parts: Vec<_> = [&a.option, &a.text].into_iter().flatten().map(|s| first_line(s)).collect();
+                        parts.join(": ")
+                    })
+                    .collect();
+                format!("by {user}: {}", replies.join(" | "))
+            }
             TaskEvent::TaskBlocked { reason, .. } => first_line(&reason).to_string(),
             TaskEvent::TaskCompleted { branch } => branch.unwrap_or_default(),
             TaskEvent::TaskShipped { pr_url, created, commit, .. } => {
@@ -1300,7 +1364,7 @@ async fn run_agent(store: &EventStore, a: RunArgs) -> Result<()> {
         Some(t) => t,
         None => {
             let title: String = a.prompt.chars().take(80).collect();
-            let t = NewTask { title, body: Some(a.prompt.clone()), source: TaskSource::Cli, factory: None };
+            let t = NewTask { title, body: Some(a.prompt.clone()), source: TaskSource::Cli, factory: None, parent: None, start: true };
             commands::create_task(store, local_user(), t).await?
         }
     };
@@ -1398,6 +1462,34 @@ fn fmt_ms(ms: f64) -> String {
 }
 
 /// The factory name a new task belongs to: `None` for a manual task (the file is not read).
+/// Tasks in tree order (each parent followed by its subtasks, newest roots first,
+/// subtasks oldest first) with their depth. A task whose parent is missing from
+/// the list is shown at the top level.
+fn task_tree(rows: Vec<wh_metrics::tasks::TaskRow>) -> Vec<(usize, wh_metrics::tasks::TaskRow)> {
+    use std::collections::{HashMap, HashSet};
+    let ids: HashSet<_> = rows.iter().map(|r| r.task_id).collect();
+    let mut kids: HashMap<_, Vec<wh_metrics::tasks::TaskRow>> = HashMap::new();
+    let mut roots = Vec::new();
+    for r in rows {
+        match r.parent_id.filter(|p| ids.contains(p) && *p != r.task_id) {
+            Some(p) => kids.entry(p).or_default().push(r),
+            None => roots.push(r),
+        }
+    }
+    for v in kids.values_mut() {
+        v.sort_by_key(|r| r.created_at);
+    }
+    let mut out = Vec::new();
+    let mut stack: Vec<(usize, wh_metrics::tasks::TaskRow)> = roots.into_iter().rev().map(|r| (0, r)).collect();
+    while let Some((d, r)) = stack.pop() {
+        if let Some(children) = kids.remove(&r.task_id) {
+            stack.extend(children.into_iter().rev().map(|c| (d + 1, c)));
+        }
+        out.push((d, r));
+    }
+    out
+}
+
 fn task_factory(no_factory: bool, path: &Path) -> Result<Option<String>> {
     if no_factory {
         return Ok(None);

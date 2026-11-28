@@ -1,8 +1,58 @@
 // Typed client for the `wh serve` API (see crates/wh-api).
 
-export type TaskStatus = 'open' | 'running' | 'awaiting_gate' | 'blocked' | 'shipped' | 'done' | 'cancelled'
+export type TaskStatus =
+  | 'draft'
+  | 'open'
+  | 'running'
+  | 'awaiting_gate'
+  | 'awaiting_input'
+  | 'blocked'
+  | 'shipped'
+  | 'done'
+  | 'cancelled'
 
 export type PrState = 'open' | 'merged' | 'closed'
+
+/** Tasks in tree order (parents before their subtasks) with their depth. Roots keep
+ * the given order; subtasks are oldest first. A task whose parent is not in `rows`
+ * is shown as a root. */
+export function taskTree<T extends { task_id: string; parent_id: string | null; created_at: string }>(rows: T[]): { task: T; depth: number }[] {
+  const ids = new Set(rows.map((r) => r.task_id))
+  const kids = new Map<string, T[]>()
+  const roots: T[] = []
+  for (const r of rows) {
+    if (r.parent_id && r.parent_id !== r.task_id && ids.has(r.parent_id)) {
+      kids.set(r.parent_id, [...(kids.get(r.parent_id) ?? []), r])
+    } else roots.push(r)
+  }
+  for (const v of kids.values()) v.sort((a, b) => a.created_at.localeCompare(b.created_at))
+  const out: { task: T; depth: number }[] = []
+  const seen = new Set<string>()
+  const walk = (t: T, depth: number) => {
+    if (seen.has(t.task_id)) return
+    seen.add(t.task_id)
+    out.push({ task: t, depth })
+    for (const c of kids.get(t.task_id) ?? []) walk(c, depth + 1)
+  }
+  roots.forEach((r) => walk(r, 0))
+  return out
+}
+
+/** Ids of `id` and every task below it. */
+export function subtreeIds(rows: { task_id: string; parent_id: string | null }[], id: string): Set<string> {
+  const out = new Set([id])
+  let grew = true
+  while (grew) {
+    grew = false
+    for (const r of rows) {
+      if (r.parent_id && out.has(r.parent_id) && !out.has(r.task_id)) {
+        out.add(r.task_id)
+        grew = true
+      }
+    }
+  }
+  return out
+}
 
 export interface TaskSummary {
   task_id: string
@@ -34,6 +84,8 @@ export interface TaskSummary {
   changes_requested: number
   ci_failures: number
   pr_rework_loops: number
+  /** Parent task (tasks form a tree). */
+  parent_id: string | null
 }
 
 export interface EventMeta {
@@ -109,11 +161,16 @@ export interface TaskState {
   pr: { repo: string; number: number; url: string; branch: string; commit: string; closed: boolean } | null
   pr_rework_loops: number
   external_ref: { repo: string; issue: number; url: string } | null
+  parent: string | null
 }
 
 export interface TaskDetail {
   task: TaskSummary | null
   state: TaskState
+  /** Direct subtasks, oldest first. */
+  children: TaskSummary[]
+  /** From the root down to the parent. */
+  ancestors: TaskSummary[]
   events: WhEvent[]
   sessions: SessionDetail[]
   scores: ScoreRow[]
@@ -453,13 +510,15 @@ export const api = {
   logout: () => request<null>('POST', '/auth/logout'),
   tasks: (status?: string) => request<TaskSummary[]>('GET', `/tasks${status ? `?status=${status}` : ''}`),
   task: (id: string) => request<TaskDetail>('GET', `/tasks/${id}`),
-  createTask: (b: { title: string; body?: string; pipeline?: boolean }) =>
+  createTask: (b: { title: string; body?: string; pipeline?: boolean; parent?: string; start?: boolean }) =>
     request<{ task_id: string; factory: string | null }>('POST', '/tasks', b),
   decideGate: (id: string, approved: boolean, comment?: string) =>
     request<{ message: string }>('POST', `/tasks/${id}/gate`, { approved, comment }),
   resume: (id: string, stage?: string, comment?: string) =>
     request<{ message: string }>('POST', `/tasks/${id}/resume`, { stage, comment }),
   cancel: (id: string, reason: string) => request<{ message: string }>('POST', `/tasks/${id}/cancel`, { reason }),
+  startTask: (id: string, subtree = false) => request<{ message: string }>('POST', `/tasks/${id}/start`, { subtree }),
+  moveTask: (id: string, parent: string | null) => request<{ message: string }>('POST', `/tasks/${id}/move`, { parent }),
   sessions: (limit = 100) => request<SessionDetail[]>('GET', `/sessions?limit=${limit}`),
   transcript: (id: string) => request<Transcript>('GET', `/sessions/${id}/transcript`),
   stats: () => request<Stats>('GET', '/stats'),

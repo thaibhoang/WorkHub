@@ -2,7 +2,7 @@
 
 ## Split (the full feature is XL; each part ships on its own, in this order)
 1. **Question parser + resumable runtime** (this spec): parse `QUESTION:` lines; the runtime can persist and resume a session.
-2. **Events and state**: `AgentAsked`, `UserAnswered`, `TaskStatus::AwaitingInput`, session link `resume_of`, fold, factory `max_questions` (default 3); projections and API tolerate the new events.
+2. **Events and state**: `AgentAsked`, `UserAnswered`, `TaskStatus::AwaitingInput`, session link `resume_of`, fold, factory `max_questions` (default 3); projections and API tolerate the new events. **Done** (`agent-questions-events-state.md`).
 3. **Runner pause/resume**: a stage that asks keeps its worktree and sandbox home, uncommitted, with no `StageExited`; a resume turn (own timeout, budget, usage) runs in the same cwd; commit only when the stage ends; pipeline sessions switch to `Persist`.
 4. **Foreman loop**: pure `decide` for ask → wait → answer → resume, `wh_api::commands::answer` (`Exact`, 409), `wh task answer <task> [--option N] "..."`, protection from `recover_interrupted`/janitor, fallback to a fresh session with the stage's conversation, over-limit "decide yourself" reminder, benchmark auto-answer.
 5. **API and metrics**: answer endpoint, per-stage conversation, Inbox, waiting time excluded from durations, each Q&A turn counted as a human intervention (new migration).

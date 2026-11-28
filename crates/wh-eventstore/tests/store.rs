@@ -12,7 +12,7 @@ fn ev(task: TaskId, e: TaskEvent) -> NewEvent {
 }
 
 fn created(task: TaskId) -> NewEvent {
-    ev(task, TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: None, benchmark: None, external_ref: None })
+    ev(task, TaskEvent::TaskCreated { title: "t".into(), body: None, source: TaskSource::Cli, factory: None, benchmark: None, external_ref: None, parent: None, draft: false })
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]

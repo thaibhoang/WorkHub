@@ -5,11 +5,12 @@ import { PageHeader } from '@/components/PageHeader'
 import { PrLink, TaskStatusBadge } from '@/components/status'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { api, firstLine, fmtAgo, fmtMs, fmtUsd, shortId, type TaskSummary } from '@/lib/api'
+import { api, firstLine, fmtAgo, fmtMs, fmtUsd, shortId, taskTree, type TaskSummary } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
 const FILTERS = [
   { id: 'all', label: 'All' },
+  { id: 'draft', label: 'Draft' },
   { id: 'active', label: 'Active' },
   { id: 'awaiting_gate', label: 'Needs review' },
   { id: 'blocked', label: 'Blocked' },
@@ -60,7 +61,7 @@ export default function Runs() {
         </div>
       ) : rows.length === 0 ? (
         <p className="rounded-lg border border-dashed p-10 text-center text-sm text-muted-foreground">
-          {data?.length ? 'No tasks match this filter.' : 'No tasks yet. Create one to start the pipeline.'}
+          {data?.length ? 'No tasks match this filter.' : 'No tasks yet. Create one, then start it to run the pipeline.'}
         </p>
       ) : (
         <RunsTable rows={rows} />
@@ -86,14 +87,17 @@ export function RunsTable({ rows }: { rows: TaskSummary[] }) {
           </TableRow>
         </TableHeader>
         <TableBody>
-          {rows.map((t) => {
+          {taskTree(rows).map(({ task: t, depth }) => {
             const active = t.status !== 'done' && t.status !== 'cancelled'
             const end = new Date(t.completed_at ?? (active ? Date.now() : t.updated_at)).getTime()
             return (
               <TableRow key={t.task_id} className="cursor-pointer" onClick={() => navigate(`/runs/${t.task_id}`)}>
-                <TableCell className="max-w-0 w-full">
-                  <div className="truncate font-medium">{t.title}</div>
-                  <div className="truncate text-xs text-muted-foreground">
+                <TableCell className="max-w-0 w-full" style={depth ? { paddingLeft: `${0.5 + depth * 1.25}rem` } : undefined}>
+                  <div className="truncate font-medium">
+                    {depth ? <span className="mr-1 text-muted-foreground">└</span> : null}
+                    {t.title}
+                  </div>
+                  <div className={cn('truncate text-xs text-muted-foreground', depth && 'pl-4')}>
                     <span className="font-mono">{shortId(t.task_id)}</span>
                     {t.factory ? ` · ${t.factory}` : ' · manual'}
                     {t.external_ref ? ` · ${t.external_ref}` : null}
@@ -112,7 +116,7 @@ export function RunsTable({ rows }: { rows: TaskSummary[] }) {
                 </TableCell>
                 <TableCell className="hidden text-right tabular-nums sm:table-cell">{fmtUsd(t.cost_usd)}</TableCell>
                 <TableCell className="hidden text-right tabular-nums text-muted-foreground lg:table-cell">
-                  {t.status === 'open' && t.sessions === 0 ? '–' : fmtMs(end - new Date(t.created_at).getTime())}
+                  {(t.status === 'open' || t.status === 'draft') && t.sessions === 0 ? '–' : fmtMs(end - new Date(t.created_at).getTime())}
                 </TableCell>
                 <TableCell className="text-right whitespace-nowrap text-muted-foreground">{fmtAgo(t.updated_at)}</TableCell>
               </TableRow>

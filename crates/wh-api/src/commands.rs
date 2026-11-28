@@ -51,6 +51,10 @@ pub struct NewTask {
     pub source: TaskSource,
     /// Factory name that should drive the task (None = manual only).
     pub factory: Option<String>,
+    /// Parent task: the new task becomes its subtask.
+    pub parent: Option<TaskId>,
+    /// Start right away instead of creating a draft that waits for `activate`.
+    pub start: bool,
 }
 
 pub async fn create_task(store: &EventStore, actor: Actor, t: NewTask) -> Result<TaskId> {
@@ -59,8 +63,27 @@ pub async fn create_task(store: &EventStore, actor: Actor, t: NewTask) -> Result
         return Err(CommandError::InvalidState("title must not be empty".into()));
     }
     let body = t.body.filter(|b| !b.trim().is_empty());
+    if let Some(p) = t.parent {
+        let parent = load_task(store, p).await.map_err(|e| match e {
+            CommandError::NotFound(_) => CommandError::InvalidState(format!("parent task {p} not found")),
+            e => e,
+        })?;
+        if parent.benchmark.is_some() {
+            return Err(CommandError::InvalidState("a benchmark case cannot have subtasks".into()));
+        }
+    }
+    // A brand-new id has no descendants, so creating under a parent can never close a cycle.
     let id = TaskId::new();
-    let ev = TaskEvent::TaskCreated { title, body, source: t.source, factory: t.factory, benchmark: None, external_ref: None };
+    let ev = TaskEvent::TaskCreated {
+        title,
+        body,
+        source: t.source,
+        factory: t.factory,
+        benchmark: None,
+        external_ref: None,
+        parent: t.parent,
+        draft: !t.start,
+    };
     append(store, id, ExpectedVersion::NoStream, actor, ev).await?;
     Ok(id)
 }
@@ -112,6 +135,88 @@ pub async fn resume(
     append(store, task, ExpectedVersion::Exact(state.version), actor, ev).await
 }
 
+/// Start a draft task (the foreman then runs its first stage). With `subtree`,
+/// also every draft below it, parents first. Returns the tasks started.
+pub async fn activate(store: &EventStore, actor: Actor, task: TaskId, subtree: bool) -> Result<Vec<TaskId>> {
+    let state = load_task(store, task).await?;
+    let mut started = Vec::new();
+    match state.status {
+        TaskStatus::Draft => {
+            append(store, task, ExpectedVersion::Exact(state.version), actor.clone(), TaskEvent::TaskActivated {}).await?;
+            started.push(task);
+        }
+        _ if subtree => {}
+        _ => {
+            return Err(CommandError::InvalidState(format!(
+                "only draft tasks can be started (task is {})",
+                status_name(&state.status)
+            )));
+        }
+    }
+    if subtree {
+        wh_metrics::catch_up_all(store).await?;
+        for id in wh_metrics::queries::descendants(store.pool(), task.0).await?.into_iter().map(TaskId) {
+            let s = load_task(store, id).await?;
+            if s.status == TaskStatus::Draft {
+                append(store, id, ExpectedVersion::Exact(s.version), actor.clone(), TaskEvent::TaskActivated {}).await?;
+                started.push(id);
+            }
+        }
+    }
+    Ok(started)
+}
+
+/// Advisory lock key serializing tree moves (so two concurrent moves cannot
+/// together close a cycle that each check alone would allow).
+const TREE_LOCK: i64 = 0x7768_7472_6565; // "whtree"
+
+/// Move a task under `parent` (None = top level). Refuses to make a task its own
+/// ancestor, so tasks always form a tree.
+pub async fn move_task(store: &EventStore, actor: Actor, task: TaskId, parent: Option<TaskId>) -> Result<()> {
+    let mut conn = store.pool().acquire().await.map_err(anyhow::Error::from)?;
+    sqlx::query("SELECT pg_advisory_lock($1)").bind(TREE_LOCK).execute(&mut *conn).await.map_err(anyhow::Error::from)?;
+    let res = move_locked(store, actor, task, parent).await;
+    let unlock = sqlx::query("SELECT pg_advisory_unlock($1)").bind(TREE_LOCK).execute(&mut *conn).await;
+    if unlock.is_err() {
+        // Closing the connection releases the lock.
+        let _ = conn.detach();
+    }
+    res
+}
+
+async fn move_locked(store: &EventStore, actor: Actor, task: TaskId, parent: Option<TaskId>) -> Result<()> {
+    let state = load_task(store, task).await?;
+    if state.benchmark.is_some() {
+        return Err(CommandError::InvalidState("benchmark cases cannot be moved".into()));
+    }
+    if state.parent == parent {
+        return Ok(());
+    }
+    if let Some(p) = parent {
+        // Walk up from the new parent on the event streams (not the read model): reaching
+        // `task` means the move would make it its own ancestor.
+        let mut cur = Some(p);
+        while let Some(c) = cur {
+            if c == task {
+                return Err(CommandError::InvalidState(if c == p {
+                    "a task cannot be its own parent".into()
+                } else {
+                    format!("cannot move the task under {p}: that task is below it, and tasks must form a tree")
+                }));
+            }
+            let s = load_task(store, c).await.map_err(|e| match e {
+                CommandError::NotFound(_) => CommandError::InvalidState(format!("parent task {c} not found")),
+                e => e,
+            })?;
+            if c == p && s.benchmark.is_some() {
+                return Err(CommandError::InvalidState("a benchmark case cannot have subtasks".into()));
+            }
+            cur = s.parent;
+        }
+    }
+    append(store, task, ExpectedVersion::Exact(state.version), actor, TaskEvent::TaskMoved { parent }).await
+}
+
 pub async fn cancel(store: &EventStore, actor: Actor, task: TaskId, reason: String) -> Result<()> {
     let state = load_task(store, task).await?;
     if matches!(state.status, TaskStatus::Done | TaskStatus::Cancelled) {
@@ -132,9 +237,11 @@ async fn append(store: &EventStore, task: TaskId, expected: ExpectedVersion, act
 
 pub fn status_name(s: &TaskStatus) -> &'static str {
     match s {
+        TaskStatus::Draft => "draft",
         TaskStatus::Open => "open",
         TaskStatus::Running { .. } => "running",
         TaskStatus::AwaitingGate { .. } => "awaiting_gate",
+        TaskStatus::AwaitingInput { .. } => "awaiting_input",
         TaskStatus::Blocked { .. } => "blocked",
         TaskStatus::Shipped => "shipped",
         TaskStatus::Done => "done",

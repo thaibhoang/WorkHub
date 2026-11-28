@@ -36,6 +36,8 @@ async fn task(store: &EventStore, last: Option<TaskEvent>) -> TaskId {
         factory: Some("test".into()),
         benchmark: None,
         external_ref: None,
+        parent: None,
+        draft: false,
     };
     append(store, &t.stream_id(), t, created).await;
     if let Some(ev) = last {
@@ -57,6 +59,7 @@ async fn session(store: &EventStore, task: TaskId, finished: bool) -> SessionId 
         timeout_secs: 60,
         attempt: 1,
         retry_of: None,
+        resume_of: None,
         benchmark: None,
     };
     append(store, &s.stream_id(), task, dispatched).await;

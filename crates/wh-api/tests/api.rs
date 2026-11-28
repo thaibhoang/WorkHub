@@ -62,17 +62,17 @@ async fn create_list_and_show_task(pool: PgPool) {
     let (st, list) = call(&app, "GET", "/api/tasks", None).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(list[0]["title"], "Add SSE");
-    assert_eq!(list[0]["status"], "open");
+    assert_eq!(list[0]["status"], "draft", "new tasks wait to be started");
     assert_eq!(list[0]["source"], "web");
 
-    let (_, open) = call(&app, "GET", "/api/tasks?status=open", None).await;
-    assert_eq!(open.as_array().unwrap().len(), 1);
+    let (_, drafts) = call(&app, "GET", "/api/tasks?status=draft", None).await;
+    assert_eq!(drafts.as_array().unwrap().len(), 1);
     let (_, done) = call(&app, "GET", "/api/tasks?status=done", None).await;
     assert!(done.as_array().unwrap().is_empty());
 
     let (st, detail) = call(&app, "GET", &format!("/api/tasks/{id}"), None).await;
     assert_eq!(st, StatusCode::OK);
-    assert_eq!(detail["state"]["status"], "open");
+    assert_eq!(detail["state"]["status"], "draft");
     assert_eq!(detail["state"]["body"], "details");
     assert_eq!(detail["events"][0]["type"], "TaskCreated");
     assert_eq!(detail["events"][0]["meta"]["actor"]["kind"], "human");
@@ -83,6 +83,71 @@ async fn create_list_and_show_task(pool: PgPool) {
     assert_eq!(st, StatusCode::NOT_FOUND);
     let (st, _) = call(&app, "GET", "/api/tasks/not-a-uuid", None).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
+async fn drafts_start_on_demand_and_tasks_form_a_tree(pool: PgPool) {
+    let (app, store) = app(&pool, Some(factory()));
+    let create = |body: Value| {
+        let app = app.clone();
+        async move {
+            let (st, r) = call(&app, "POST", "/api/tasks", Some(body)).await;
+            assert_eq!(st, StatusCode::CREATED, "{r}");
+            r["task_id"].as_str().unwrap().to_owned()
+        }
+    };
+    let root = create(json!({"title": "root"})).await;
+    let child = create(json!({"title": "child", "parent": root})).await;
+    let grandchild = create(json!({"title": "grandchild", "parent": child})).await;
+    let other = create(json!({"title": "other", "start": true})).await;
+
+    let (st, _) = call(&app, "POST", "/api/tasks", Some(json!({"title": "x", "parent": TaskId::new()}))).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "unknown parent");
+
+    let (_, d) = call(&app, "GET", &format!("/api/tasks/{child}"), None).await;
+    assert_eq!((d["state"]["status"].as_str(), d["state"]["parent"].as_str()), (Some("draft"), Some(root.as_str())));
+    assert_eq!(d["children"][0]["task_id"], grandchild.as_str());
+    assert_eq!(d["ancestors"][0]["task_id"], root.as_str());
+    let (_, d) = call(&app, "GET", &format!("/api/tasks/{grandchild}"), None).await;
+    let ancestors: Vec<_> = d["ancestors"].as_array().unwrap().iter().map(|a| a["title"].as_str().unwrap()).collect();
+    assert_eq!(ancestors, ["root", "child"]);
+    let (_, d) = call(&app, "GET", &format!("/api/tasks/{other}"), None).await;
+    assert_eq!(d["state"]["status"], "open", "start: true skips the draft");
+
+    // Tree only: no task may become its own ancestor.
+    let mv = |task: &str, parent: Value| {
+        let (app, uri) = (app.clone(), format!("/api/tasks/{task}/move"));
+        async move { call(&app, "POST", &uri, Some(json!({ "parent": parent }))).await }
+    };
+    assert_eq!(mv(&root, json!(root)).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    let (st, err) = mv(&root, json!(grandchild)).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(err["error"].as_str().unwrap().contains("tree"), "{err}");
+    assert_eq!(mv(&grandchild, json!(other)).await.0, StatusCode::OK);
+    assert_eq!(mv(&grandchild, json!(other)).await.0, StatusCode::OK, "moving to the same parent is a no-op");
+    let (_, d) = call(&app, "GET", &format!("/api/tasks/{child}"), None).await;
+    assert!(d["children"].as_array().unwrap().is_empty());
+    assert_eq!(mv(&root, json!(grandchild)).await.0, StatusCode::OK, "no longer below root");
+    assert_eq!(mv(&root, Value::Null).await.0, StatusCode::OK);
+    assert_eq!(mv(&grandchild, json!(child)).await.0, StatusCode::OK);
+
+    // Start one task, then a whole subtree; only drafts are started.
+    let start = |task: &str, body: Option<Value>| {
+        let (app, uri) = (app.clone(), format!("/api/tasks/{task}/start"));
+        async move { call(&app, "POST", &uri, body).await }
+    };
+    let (st, r) = start(&child, None).await;
+    assert_eq!((st, r["message"].as_str()), (StatusCode::OK, Some("task started")));
+    assert_eq!(start(&child, None).await.0, StatusCode::UNPROCESSABLE_ENTITY, "already started");
+    let (st, r) = start(&root, Some(json!({"subtree": true}))).await;
+    assert_eq!((st, r["message"].as_str()), (StatusCode::OK, Some("2 tasks started")), "root and grandchild");
+    for t in [&root, &child, &grandchild] {
+        let (_, d) = call(&app, "GET", &format!("/api/tasks/{t}"), None).await;
+        assert_eq!(d["state"]["status"], "open", "{t}");
+    }
+    let types: Vec<_> =
+        store.read_stream(&format!("task-{grandchild}")).await.unwrap().iter().map(|e| e.event_type.clone()).collect();
+    assert_eq!(types, ["TaskCreated", "TaskMoved", "TaskMoved", "TaskActivated"], "the no-op move wrote nothing");
 }
 
 #[sqlx::test(migrator = "wh_eventstore::MIGRATOR")]
@@ -211,6 +276,7 @@ async fn sessions_stats_and_dashboard(pool: PgPool) {
             timeout_secs: 60,
             attempt: 1,
             retry_of: None,
+            resume_of: None,
             benchmark: None,
         },
         SessionEvent::AgentToolCalled { tool: "Read".into(), ok: true, duration_ms: 10 },
@@ -413,6 +479,8 @@ async fn sse_replays_after_cursor_and_filters_by_task(pool: PgPool) {
         factory: None,
         benchmark: None,
         external_ref: None,
+        parent: None,
+        draft: false,
     };
     task_ev(&store, a, created("a")).await;
     task_ev(&store, b, created("b")).await;

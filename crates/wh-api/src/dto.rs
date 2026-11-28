@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 use wh_core::{
-    EventMeta, RecordedEvent,
+    EventMeta, RecordedEvent, TaskId,
     task::{TaskState, TaskStatus},
 };
 use wh_factory::Factory;
@@ -63,6 +63,8 @@ pub struct TaskStateDto {
     pub pr_rework_loops: u32,
     /// `owner/name#N` of the issue the task came from.
     pub external_ref: Option<ExternalRefDto>,
+    /// Parent task (tasks form a tree).
+    pub parent: Option<TaskId>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,7 +94,7 @@ pub struct StageResultDto {
 impl From<&TaskState> for TaskStateDto {
     fn from(s: &TaskState) -> Self {
         let (stage, gate, blocked_reason) = match &s.status {
-            TaskStatus::Running { stage } => (Some(stage.clone()), None, None),
+            TaskStatus::Running { stage } | TaskStatus::AwaitingInput { stage } => (Some(stage.clone()), None, None),
             TaskStatus::AwaitingGate { gate, stage } => (Some(stage.clone()), Some(gate.clone()), None),
             TaskStatus::Blocked { reason } => (s.blocked_stage.clone(), None, Some(reason.clone())),
             _ => (None, None, None),
@@ -121,6 +123,7 @@ impl From<&TaskState> for TaskStateDto {
                 closed: p.closed,
             }),
             pr_rework_loops: s.pr_rework_loops,
+            parent: s.parent,
             external_ref: s
                 .external_ref
                 .as_ref()
@@ -134,6 +137,10 @@ pub struct TaskDetail {
     /// `None` while the projection has not caught up with a brand-new task.
     pub task: Option<TaskSummary>,
     pub state: TaskStateDto,
+    /// Direct subtasks, oldest first.
+    pub children: Vec<TaskSummary>,
+    /// Ancestors from the root down to the parent.
+    pub ancestors: Vec<TaskSummary>,
     pub events: Vec<EventDto>,
     pub sessions: Vec<SessionDetail>,
     pub scores: Vec<ScoreRow>,
@@ -345,6 +352,25 @@ pub struct CreateTaskBody {
     pub body: Option<String>,
     /// Hand the task to the server's factory pipeline (default true when a factory is loaded).
     pub pipeline: Option<bool>,
+    /// Create it as a subtask of this task.
+    #[serde(default)]
+    pub parent: Option<TaskId>,
+    /// Start it right away (default: a draft that waits for `/start`).
+    #[serde(default)]
+    pub start: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct StartBody {
+    /// Also start every draft subtask below it.
+    #[serde(default)]
+    pub subtree: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MoveBody {
+    /// New parent; null = top level.
+    pub parent: Option<TaskId>,
 }
 
 #[derive(Debug, Deserialize)]

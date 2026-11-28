@@ -119,6 +119,8 @@ async fn task(store: &EventStore, last: Option<TaskEvent>) -> TaskId {
         factory: Some("test".into()),
         benchmark: None,
         external_ref: None,
+        parent: None,
+        draft: false,
     };
     append(store, t, created).await;
     if let Some(ev) = last {

@@ -17,11 +17,14 @@ pub enum Action {
 /// what should happen next? `None` = wait (a stage is running, a gate is open, or
 /// the task is finished).
 pub fn decide(state: &TaskState, f: &Factory) -> Option<Action> {
-    if matches!(state.status, TaskStatus::Done | TaskStatus::Cancelled) {
+    // `AwaitingInput` waits for a human, whatever else lands on the stream.
+    if matches!(state.status, TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::AwaitingInput { .. }) {
         return None;
     }
     match state.last.as_ref()? {
-        TaskEvent::TaskCreated { .. } => Some(run(&f.first_stage().id, None)),
+        // A draft waits for a human to activate it.
+        TaskEvent::TaskCreated { draft: true, .. } => None,
+        TaskEvent::TaskCreated { .. } | TaskEvent::TaskActivated {} => Some(run(&f.first_stage().id, None)),
         TaskEvent::StageExited { stage, outcome, summary, .. } => {
             let Some(st) = f.stage(stage) else {
                 return Some(block(Some(stage), format!("stage '{stage}' is not in factory '{}'", f.name)));
@@ -94,6 +97,8 @@ pub fn decide(state: &TaskState, f: &Factory) -> Option<Action> {
             Some(pr_rework(state, f, state.pr_feedback.join("\n")))
         }
         TaskEvent::StageEntered { .. }
+        | TaskEvent::AgentAsked { .. }
+        | TaskEvent::UserAnswered { .. }
         | TaskEvent::GateRequested { .. }
         | TaskEvent::TaskBlocked { .. }
         | TaskEvent::TaskCompleted { .. }
@@ -103,7 +108,8 @@ pub fn decide(state: &TaskState, f: &Factory) -> Option<Action> {
         | TaskEvent::PrChecksCompleted { .. }
         | TaskEvent::PrConflicted { .. }
         | TaskEvent::PrMerged { .. }
-        | TaskEvent::PrClosed { .. } => None,
+        | TaskEvent::PrClosed { .. }
+        | TaskEvent::TaskMoved { .. } => None,
     }
 }
 
@@ -273,6 +279,33 @@ mod tests {
     }
 
     #[test]
+    fn drafts_run_only_once_activated() {
+        use wh_core::{TaskId, task::TaskSource};
+        let f = factory("null");
+        let created = |draft| TaskEvent::TaskCreated {
+            title: "t".into(),
+            body: None,
+            source: TaskSource::Cli,
+            factory: Some("f".into()),
+            benchmark: None,
+            external_ref: None,
+            parent: None,
+            draft,
+        };
+        let moved = || TaskEvent::TaskMoved { parent: Some(TaskId::new()) };
+        let runs = |a: Option<Action>| matches!(a, Some(Action::RunStage { stage, feedback: None }) if stage == "impl");
+        assert_eq!(decide(&state(vec![created(true)]), &f), None);
+        assert_eq!(decide(&state(vec![created(true), moved()]), &f), None);
+        assert!(runs(decide(&state(vec![created(true), TaskEvent::TaskActivated {}]), &f)));
+        assert!(runs(decide(&state(vec![created(false)]), &f)));
+        // A move landing before the foreman acted must not swallow the start.
+        assert!(runs(decide(&state(vec![created(false), moved()]), &f)));
+        assert!(runs(decide(&state(vec![created(true), TaskEvent::TaskActivated {}, moved()]), &f)));
+        let entered = TaskEvent::StageEntered { stage: "impl".into(), feedback: None };
+        assert_eq!(decide(&state(vec![created(false), entered, moved()]), &f), None);
+    }
+
+    #[test]
     fn conflict_is_gated_or_resolved_right_away() {
         let gated = factory("{ conflict_gate: g }");
         let s = state(vec![shipped("c1"), conflicted()]);
@@ -336,5 +369,18 @@ mod tests {
         };
         assert!(resolves(decide(&poll_after(true), &f)).contains("rename it"));
         blocks(decide(&poll_after(false), &f), CONFLICT_STAGE);
+    }
+
+    #[test]
+    fn awaiting_input_does_nothing() {
+        let f = factory("{ repo: a/b }");
+        let asked =
+            TaskEvent::AgentAsked { stage: "impl".into(), session: wh_core::SessionId::new(), questions: vec![] };
+        let mut events = vec![TaskEvent::StageEntered { stage: "impl".into(), feedback: None }, asked];
+        assert_eq!(decide(&state(events.clone()), &f), None);
+        events.push(conflicted());
+        assert_eq!(decide(&state(events.clone()), &f), None);
+        events.push(TaskEvent::UserAnswered { stage: "impl".into(), answers: vec![], user: "u".into() });
+        assert_eq!(decide(&state(events), &f), None);
     }
 }

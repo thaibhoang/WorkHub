@@ -28,6 +28,7 @@ pub struct TaskRow {
     pub completed_at: Option<DateTime<Utc>>,
     pub pr_url: Option<String>,
     pub pr_state: Option<String>,
+    pub parent_id: Option<Uuid>,
 }
 
 impl TasksProjection {
@@ -40,7 +41,7 @@ impl TasksProjection {
     pub async fn list(pool: &PgPool) -> anyhow::Result<Vec<TaskRow>> {
         Ok(sqlx::query_as(
             "SELECT task_id, title, source, factory, status, current_stage, rework_loops, gate_rejections, \
-             blocked_reason, created_at, updated_at, completed_at, pr_url, pr_state FROM tasks_view WHERE benchmark_run IS NULL \
+             blocked_reason, created_at, updated_at, completed_at, pr_url, pr_state, parent_id FROM tasks_view WHERE benchmark_run IS NULL \
              ORDER BY created_at DESC",
         )
         .fetch_all(pool)
@@ -70,12 +71,12 @@ impl EventHandler for TasksProjection {
             return Ok(());
         };
         match ev.decode::<TaskEvent>()? {
-            TaskEvent::TaskCreated { title, source, factory, benchmark, external_ref, .. } => {
+            TaskEvent::TaskCreated { title, source, factory, benchmark, external_ref, parent, draft, .. } => {
                 sqlx::query(
                     "INSERT INTO tasks_view \
                      (task_id, title, source, factory, status, current_stage, created_at, updated_at, last_seq, \
-                      benchmark_run, benchmark_case, external_ref) \
-                     VALUES ($1, $2, $3, $4, 'open', NULL, $5, $5, $6, $7, $8, $9) ON CONFLICT (task_id) DO NOTHING",
+                      benchmark_run, benchmark_case, external_ref, parent_id) \
+                     VALUES ($1, $2, $3, $4, $10, NULL, $5, $5, $6, $7, $8, $9, $11) ON CONFLICT (task_id) DO NOTHING",
                 )
                 .bind(id)
                 .bind(title)
@@ -86,8 +87,20 @@ impl EventHandler for TasksProjection {
                 .bind(benchmark.as_ref().map(|b| b.run.0))
                 .bind(benchmark.map(|b| b.case))
                 .bind(external_ref.map(|e| format!("{}#{}", e.repo, e.issue)))
+                .bind(if draft { "draft" } else { "open" })
+                .bind(parent.map(|p| p.0))
                 .execute(&self.pool)
                 .await?;
+            }
+            TaskEvent::TaskActivated {} => self.exec(&Self::guarded("status = 'open'"), id, ev).await?,
+            TaskEvent::TaskMoved { parent } => {
+                sqlx::query(&Self::guarded("parent_id = $4"))
+                    .bind(id)
+                    .bind(ev.global_seq)
+                    .bind(ev.meta.occurred_at)
+                    .bind(parent.map(|p| p.0))
+                    .execute(&self.pool)
+                    .await?;
             }
             TaskEvent::StageEntered { stage, feedback } => {
                 // A PR rework starts while shipped, or after the conflict gate: no stage
@@ -109,6 +122,8 @@ impl EventHandler for TasksProjection {
             }
             TaskEvent::StageExited { .. } => self.exec(&Self::guarded("status = status"), id, ev).await?,
             TaskEvent::GateRequested { .. } => self.exec(&Self::guarded("status = 'awaiting_gate'"), id, ev).await?,
+            TaskEvent::AgentAsked { .. } => self.exec(&Self::guarded("status = 'awaiting_input'"), id, ev).await?,
+            TaskEvent::UserAnswered { .. } => self.exec(&Self::guarded("status = 'running'"), id, ev).await?,
             TaskEvent::GateDecided { approved, .. } => {
                 sqlx::query(&Self::guarded("status = 'running', gate_rejections = gate_rejections + $4"))
                     .bind(id)

@@ -94,6 +94,10 @@ stateDiagram-v2
 
 Mỗi stage và gate đều có thể cấu hình bật/tắt, agent nào, model nào, budget/timeout bao nhiêu trong `factory.yaml`.
 
+**Agent hỏi người dùng** (đang làm, `docs/specs/agent-questions-resume-foundation.md`): mọi stage có agent có thể `⇄ AwaitingInput` (`AgentAsked` → chờ người, `UserAnswered` → chạy tiếp). Stage không exit trong lúc chờ và foreman không hành động. Hiện mới có event, state và read model (`tasks_view.status = awaiting_input`); chưa gì phát ra các event này (phần 3–6).
+
+**Draft và cây task.** Task tạo từ CLI/UI/API mặc định là **draft** (`TaskCreated.draft = true`, trạng thái `draft`): foreman không chạy gì cho tới khi người kích hoạt (`TaskActivated`, `wh task start`, nút Start; `--subtree` / "Start with subtasks" kích hoạt luôn mọi draft bên dưới, cha trước con). `--start` / `start: true` bỏ qua bước draft. Event cũ không có field này (= false) nên chạy ngay như trước; task từ GitHub issue, benchmark và `wh run` cũng chạy ngay. Task có thể có cha (`TaskCreated.parent`) và đổi cha bằng `TaskMoved` (`wh task move`, nút Move). Cây luôn là **tree**: tạo con với id mới không thể tạo vòng; `move_task` đi ngược tổ tiên của cha mới trên event stream (không dùng read model) và từ chối nếu gặp chính task đó, dưới một advisory lock riêng để hai lần move song song không cùng nhau tạo vòng. `TaskMoved` không phải event pipeline: `TaskState.last` bỏ qua nó, nên một lần move chen vào trước khi foreman hành động không làm mất bước tiếp theo. Cha và con chạy độc lập (kích hoạt, huỷ, hoàn thành của cha không lan xuống con). Read model: `tasks_view.parent_id` (migration 0013).
+
 ---
 
 ## 4. Event model
@@ -126,12 +130,14 @@ pub struct EventMeta {
 
 ### 4.2 Danh mục event chính
 
-**Task**: `TaskCreated{source, title, body, factory, benchmark, external_ref}`, `TaskTriaged{priority, kind, estimate}`, `StageEntered{stage, feedback}`, `StageExited{stage, outcome, summary, session}`, `GateRequested{gate, stage}`, `GateDecided{gate, stage, approved, reviewer, comment}`, `TaskBlocked{stage, reason}`, `TaskResumed{stage, comment}`, `TaskCompleted{branch}`, `TaskCancelled{reason}`. Mỗi `GateRequested` chỉ nhận một quyết định: status vẫn là chờ gate cho tới khi foreman hành động (`TaskState.gate_decided`), quyết định lặp lại trả 409 và không ghi thêm `GateDecided`.
+**Task**: `TaskCreated{source, title, body, factory, benchmark, external_ref, parent, draft}`, `TaskActivated{}`, `TaskMoved{parent}`, `TaskTriaged{priority, kind, estimate}`, `StageEntered{stage, feedback}`, `StageExited{stage, outcome, summary, session}`, `GateRequested{gate, stage}`, `GateDecided{gate, stage, approved, reviewer, comment}`, `TaskBlocked{stage, reason}`, `TaskResumed{stage, comment}`, `TaskCompleted{branch}`, `TaskCancelled{reason}`. Mỗi `GateRequested` chỉ nhận một quyết định: status vẫn là chờ gate cho tới khi foreman hành động (`TaskState.gate_decided`), quyết định lặp lại trả 409 và không ghi thêm `GateDecided`.
+
+**Hỏi đáp** (cũng trên stream `task-{id}`): `AgentAsked{stage, session, questions[{text, options[]}]}`, `UserAnswered{stage, answers[{option, text}], user}` (`answers[i]` trả lời `questions[i]`, `option` là nội dung lựa chọn). `TaskState` giữ câu hỏi đang chờ và số lượt hỏi kể từ `StageEntered` gần nhất (giới hạn bởi `max_questions`, sẽ áp dụng ở phần 4).
 
 **Pull request** (phase 8, cũng trên stream `task-{id}`): `TaskShipped{repo, pr_number, pr_url, branch, commit, created}`, `PrReviewed{review_id, reviewer, state, body, comments[], submitted_at}`, `PrChecksCompleted{commit, conclusion, failed[{name, url, log}]}`, `PrConflicted{base, commit}`, `PrMerged{merged_at, merged_by}`, `PrClosed{closed_at}`.
 
 **Run / AgentSession** (giàu dữ liệu nhất — đây là nguyên liệu cải tiến):
-- `AgentDispatched{agent, model, stage, prompt_ref, skills, budget}`
+- `AgentDispatched{agent, model, stage, prompt_ref, skills, budget, attempt, retry_of, resume_of}` (`resume_of` = session được chạy tiếp sau khi người trả lời)
 - `AgentSessionStarted{runner_id, sandbox}`
 - `AgentToolCalled{tool, duration_ms, ok}` *(ghi tóm tắt; transcript đầy đủ lưu artifact)*
 - `AgentUsageReported{input_tokens, output_tokens, cache_read, cache_write, cost_usd}` *(cộng dồn hoặc cuối phiên)*
@@ -232,6 +238,7 @@ defaults:
   model: claude-sonnet-5-5
   budget_usd_per_task: 5.0
   max_rework_loops: 3
+  max_questions: 3          # số lượt agent được hỏi mỗi lần vào stage (> 0; agent ghi đè được)
 
 stages:
   - id: triage
