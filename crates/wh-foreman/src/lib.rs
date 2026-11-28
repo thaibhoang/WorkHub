@@ -17,13 +17,14 @@ use anyhow::Context;
 
 use tokio::sync::{Notify, Semaphore};
 use wh_core::{
-    Actor, BenchmarkRunId, EventMeta, FailureClass, NewEvent, RecordedEvent, Sandbox, SessionId, TaskId,
+    AUTO_ANSWER_USER, Actor, Answer, BenchmarkRunId, EventMeta, FailureClass, NewEvent, RecordedEvent, Sandbox, SessionId, TaskId,
+    format_answers,
     session::SessionEvent,
-    task::{TaskEvent, TaskState},
+    task::{ResumeHandle, TaskEvent, TaskState, TaskStatus},
 };
 use wh_eventstore::{EventHandler, EventStore, ExpectedVersion, StoreError};
 use wh_factory::Factory;
-use wh_runner::{AgentRuntime, Merge, RunSpec, Runner};
+use wh_runner::{AgentRuntime, Merge, Paused, Resumed, RunSpec, Runner};
 
 pub use decide::{Action, decide};
 pub use prompt::build_prompt;
@@ -58,6 +59,8 @@ pub struct Foreman<R> {
     janitor: Option<Arc<Notify>>,
     /// Server for per-task databases: the value of `task_database.admin_url_env`.
     task_db_admin: Option<String>,
+    /// Whether stages may pause on a question (see [`PAUSE_ENABLED`]).
+    pause: bool,
     /// Restart coordination (`wh serve` self-update): while draining, no new event
     /// is handled (so none is checkpointed, and it is redelivered after the
     /// restart) and stage runs already accepted are counted until they finish.
@@ -66,6 +69,13 @@ pub struct Foreman<R> {
 
 /// Reviewer recorded on gates a benchmark foreman approves.
 pub const BENCHMARK_REVIEWER: &str = "benchmark";
+
+/// Off until a resumed turn of the real `claude` CLI is verified (whether its cost
+/// and turn counts are per run, and the error for a lost conversation). See §5.3.
+const PAUSE_ENABLED: bool = false;
+
+/// Answers a question nobody will answer (limit reached, or a benchmark).
+const AUTO_ANSWER: &str = "No answer is coming: decide yourself and record your assumptions.";
 
 impl<R: AgentRuntime + 'static> Foreman<R> {
     pub fn new(store: EventStore, factory: Factory, runner: Runner<R>, dispatch: Dispatch) -> Self {
@@ -80,8 +90,15 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             name,
             gh: wh_github::Gh::default(),
             janitor: None,
+            pause: PAUSE_ENABLED,
             drain: None,
         }
+    }
+
+    /// Override whether stages may pause on a question (tests, until it is enabled).
+    pub fn with_pause(mut self, pause: bool) -> Self {
+        self.pause = pause;
+        self
     }
 
     /// Take part in draining before a restart (see the `drain` field).
@@ -127,6 +144,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             name,
             gh: wh_github::Gh::default(),
             janitor: None,
+            pause: PAUSE_ENABLED,
             drain: None,
         }
     }
@@ -181,12 +199,7 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
     }
 
     async fn load(&self, task: TaskId) -> anyhow::Result<TaskState> {
-        let events = self.store.read_stream(&task.stream_id()).await?;
-        let mut state = TaskState::default();
-        for e in &events {
-            state.apply(e.stream_version, e.decode::<TaskEvent>()?);
-        }
-        Ok(state)
+        load_state(&self.store, task).await
     }
 
     async fn append(&self, task: TaskId, state: &TaskState, cause: &RecordedEvent, ev: TaskEvent) -> anyhow::Result<()> {
@@ -234,8 +247,8 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             sandbox: agent.sandbox.clone(),
             env: agent.env.clone(),
             merge: None,
-            // Off until the pipeline can resume a paused stage.
-            pause_on_question: false,
+            // A new stage run has asked nothing yet; `resume_stage` applies the limit.
+            pause_on_question: self.pause,
         }
     }
 
@@ -248,26 +261,15 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
         let (store, factory, admin) = (self.store.clone(), self.factory.clone(), self.task_db_admin.clone());
         let meta = self.meta(task, None);
         let run = async move {
-            match provision_for(&store, &factory, admin.as_deref(), task).await {
-                Ok(None) => {}
-                Ok(Some(url)) => {
-                    // The factory's own `env:` wins.
-                    spec.env.entry("DATABASE_URL".into()).or_insert(url);
-                    // A `wh` run by the agent against its database knows none of our
-                    // sessions: it must not clean up the live data directory.
-                    let data = std::env::temp_dir().join(format!("wh-agent-{}", task_db::db_name(task)));
-                    spec.env.entry("WH_DATA_DIR".into()).or_insert_with(|| data.display().to_string());
-                }
-                Err(e) => {
-                    tracing::warn!(%task, stage, "task database: {e:#}");
-                    let ev = TaskEvent::TaskBlocked { stage: Some(stage), reason: format!("task database: {e:#}") };
-                    let expected = spec.task_expected_version.map_or(ExpectedVersion::Any, ExpectedVersion::Exact);
-                    let events = vec![NewEvent::from_domain(&ev, meta)?];
-                    return match store.append(&task.stream_id(), expected, events).await {
-                        Ok(_) | Err(StoreError::Conflict { .. }) => Ok(()),
-                        Err(e) => Err(e.into()),
-                    };
-                }
+            if let Err(e) = prepare_env(&store, &factory, admin.as_deref(), &mut spec).await {
+                tracing::warn!(%task, stage, "task database: {e:#}");
+                let ev = TaskEvent::TaskBlocked { stage: Some(stage), reason: format!("task database: {e:#}") };
+                let expected = spec.task_expected_version.map_or(ExpectedVersion::Any, ExpectedVersion::Exact);
+                let events = vec![NewEvent::from_domain(&ev, meta)?];
+                return match store.append(&task.stream_id(), expected, events).await {
+                    Ok(_) | Err(StoreError::Conflict { .. }) => Ok(()),
+                    Err(e) => Err(e.into()),
+                };
             }
             if let Some(home) = leftover
                 && let Err(e) = runner.discard(&spec.repo, home).await
@@ -275,15 +277,88 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
                 // If the branch is still held, creating the worktree reports it.
                 tracing::warn!(%task, stage, "discard the paused worktree of {home}: {e:#}");
             }
+            let max_questions = max_questions(&factory, &stage);
             match runner.run(spec, |_| {}).await {
                 Ok(r) => {
                     tracing::info!(%task, stage, outcome = r.stage_outcome.map_or("paused", |o| o.as_str()), cost = r.total_cost_usd(), "stage finished");
-                    Ok(())
+                    match r.paused {
+                        Some(p) => record_pause(&store, task, &stage, &meta, p, max_questions).await,
+                        None => Ok(()),
+                    }
                 }
                 Err(e) if is_conflict(&e) => Ok(()), // already dispatched by an earlier delivery
                 Err(e) => Err(e),
             }
         };
+        self.dispatch(task, run).await
+    }
+
+    /// Claim the resume with `StageResumed` (so it happens once), then hand the
+    /// answers to the paused session. Everything needed comes from the task's events.
+    async fn resume_stage(&self, task: TaskId, state: &TaskState, cause: &RecordedEvent, stage: String) -> anyhow::Result<()> {
+        let claim = TaskEvent::StageResumed { stage: stage.clone() };
+        let events = vec![NewEvent::from_domain(&claim, self.meta(task, Some(cause)))?];
+        match self.store.append(&task.stream_id(), ExpectedVersion::Exact(state.version), events).await {
+            Ok(_) => {}
+            Err(StoreError::Conflict { .. }) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        tracing::info!(%task, stage, "resuming stage");
+        let max_questions = max_questions(&self.factory, &stage);
+        // Conflicts of a merge travel in the resume handle, and the agent already has the feedback.
+        let mut spec = self.run_spec(task, state, &stage, None);
+        spec.pause_on_question = self.pause && state.question_rounds <= max_questions;
+        let paused = state.paused.as_ref().and_then(|p| {
+            let handle = p.resume.clone()?;
+            let exchange = state.dialogue.last()?;
+            let paused = Paused {
+                session: p.session,
+                home_session: handle.home_session,
+                runtime_session_id: handle.runtime_session_id,
+                branch: handle.branch,
+                conflicts: handle.conflicts,
+                questions: exchange.questions.clone(),
+            };
+            Some((paused, format_answers(&exchange.questions, &exchange.answers)))
+        });
+        let runner = self.runner.clone();
+        let (store, factory, admin) = (self.store.clone(), self.factory.clone(), self.task_db_admin.clone());
+        let meta = self.meta(task, None);
+        let run = async move {
+            let turn: Result<Option<Paused>, String> = async {
+                let (paused, answer) = paused.ok_or("the task's events hold nothing to resume from")?;
+                prepare_env(&store, &factory, admin.as_deref(), &mut spec)
+                    .await
+                    .map_err(|e| format!("task database: {e:#}"))?;
+                match runner.resume(spec, &paused, &answer, |_| {}).await {
+                    Ok(Resumed::Ran(r)) => Ok(r.paused),
+                    Ok(Resumed::Lost { reason, .. }) => Err(reason),
+                    Err(e) => Err(format!("{e:#}")),
+                }
+            }
+            .await;
+            match turn {
+                Ok(Some(p)) => record_pause(&store, task, &stage, &meta, p, max_questions).await,
+                Ok(None) => Ok(()),
+                Err(why) => {
+                    let reason = format!("cannot resume the paused conversation: {why}");
+                    tracing::warn!(%task, stage, reason, "task blocked");
+                    let blocked = |_: &TaskState| {
+                        vec![TaskEvent::TaskBlocked { stage: Some(stage.clone()), reason: reason.clone() }]
+                    };
+                    append_while_running(&store, task, &stage, &meta, blocked).await
+                }
+            }
+        };
+        self.dispatch(task, run).await
+    }
+
+    /// Await a stage run, or spawn it, as [`Dispatch`] says.
+    async fn dispatch(
+        &self,
+        task: TaskId,
+        run: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+    ) -> anyhow::Result<()> {
         match &self.dispatch {
             Dispatch::Inline => run.await,
             Dispatch::Spawn(limit) => {
@@ -300,6 +375,98 @@ impl<R: AgentRuntime + 'static> Foreman<R> {
             }
         }
     }
+}
+
+async fn load_state(store: &EventStore, task: TaskId) -> anyhow::Result<TaskState> {
+    let mut state = TaskState::default();
+    for e in store.read_stream(&task.stream_id()).await? {
+        state.apply(e.stream_version, e.decode::<TaskEvent>()?);
+    }
+    Ok(state)
+}
+
+fn max_questions(factory: &Factory, stage: &str) -> u32 {
+    factory.agent(factory.stage(stage).expect("decide only returns known stages")).max_questions
+}
+
+/// Append what `events` returns, only while the task still runs `stage`. Retried
+/// when another writer got there first: giving up would leave it `Running` forever.
+async fn append_while_running(
+    store: &EventStore,
+    task: TaskId,
+    stage: &str,
+    meta: &EventMeta,
+    events: impl Fn(&TaskState) -> Vec<TaskEvent>,
+) -> anyhow::Result<()> {
+    loop {
+        let state = load_state(store, task).await?;
+        if !matches!(&state.status, TaskStatus::Running { stage: s } if s == stage) {
+            return Ok(());
+        }
+        let new = events(&state)
+            .iter()
+            .map(|ev| NewEvent::from_domain(ev, meta.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        match store.append(&task.stream_id(), ExpectedVersion::Exact(state.version), new).await {
+            Ok(_) => return Ok(()),
+            Err(StoreError::Conflict { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Record the agent's questions. Past `max_questions`, and in benchmarks, nobody is
+/// asked: the answers are appended together with the questions.
+async fn record_pause(
+    store: &EventStore,
+    task: TaskId,
+    stage: &str,
+    meta: &EventMeta,
+    paused: Paused,
+    max_questions: u32,
+) -> anyhow::Result<()> {
+    let events = |state: &TaskState| {
+        let mut events = vec![TaskEvent::AgentAsked {
+            stage: stage.into(),
+            session: paused.session,
+            questions: paused.questions.clone(),
+            resume: Some(ResumeHandle {
+                home_session: paused.home_session,
+                runtime_session_id: paused.runtime_session_id.clone(),
+                branch: paused.branch.clone(),
+                conflicts: paused.conflicts.clone(),
+            }),
+        }];
+        if state.benchmark.is_some() || state.question_rounds >= max_questions {
+            let answer = Answer { option: None, text: Some(AUTO_ANSWER.into()) };
+            events.push(TaskEvent::UserAnswered {
+                stage: stage.into(),
+                answers: vec![answer; paused.questions.len()],
+                user: AUTO_ANSWER_USER.into(),
+            });
+        }
+        events
+    };
+    append_while_running(store, task, stage, meta, events).await
+}
+
+/// Give the session its task database and the environment that goes with it.
+async fn prepare_env(
+    store: &EventStore,
+    factory: &Factory,
+    admin: Option<&str>,
+    spec: &mut RunSpec,
+) -> anyhow::Result<()> {
+    let task = spec.task_id;
+    if let Some(url) = provision_for(store, factory, admin, task).await? {
+        // The factory's own `env:` wins.
+        spec.env.entry("DATABASE_URL".into()).or_insert(url);
+        // A `wh` run by the agent against its database knows none of our
+        // sessions: it must not clean up the live data directory.
+        let data = std::env::temp_dir().join(format!("wh-agent-{}", task_db::db_name(task)));
+        spec.env.entry("WH_DATA_DIR".into()).or_insert_with(|| data.display().to_string());
+    }
+    Ok(())
 }
 
 fn task_db_admin(factory: &Factory) -> Option<String> {
@@ -429,6 +596,7 @@ impl<R: AgentRuntime + 'static> EventHandler for Foreman<R> {
             Action::RunStage { stage, feedback } => {
                 self.run_stage(self.run_spec(task, &state, &stage, feedback), leftover).await
             }
+            Action::ResumeStage { stage } => self.resume_stage(task, &state, ev, stage).await,
             Action::ResolveConflict { stage, feedback } => {
                 let (Some(g), Some(c)) = (&self.factory.github, &state.conflict) else {
                     return Ok(());

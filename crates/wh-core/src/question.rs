@@ -11,6 +11,10 @@ pub struct Question {
     pub options: Vec<String>,
 }
 
+/// `UserAnswered.user` of answers the foreman gives itself (question limit,
+/// benchmarks). Not a human intervention.
+pub const AUTO_ANSWER_USER: &str = "foreman:auto";
+
 /// The user's reply to one `Question`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {

@@ -18,6 +18,8 @@ sqlx.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# A dev-only cycle (wh-api -> wh-bench -> wh-foreman), for `commands::answer`.
+wh-api = { path = "../wh-api" }
 wh-metrics.workspace = true
 tempfile = "3"
 serde_json.workspace = true
