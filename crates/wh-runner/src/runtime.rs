@@ -5,6 +5,19 @@ use wh_core::{FailureClass, session::TokenUsage};
 
 use crate::docker::Container;
 
+/// Whether the runtime keeps the conversation after the session ends.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SessionMode {
+    /// Nothing is saved; the conversation cannot be continued.
+    #[default]
+    Ephemeral,
+    /// Saved, so a later request can resume it.
+    Persist,
+    /// Continue the saved conversation with this runtime session id. Run it in the
+    /// same `workdir` (and sandbox home) as the session being resumed.
+    Resume(String),
+}
+
 /// Everything a runtime needs to execute one agent session.
 #[derive(Debug, Clone)]
 pub struct AgentRequest {
@@ -26,6 +39,7 @@ pub struct AgentRequest {
     /// Extra environment for the agent process. With a container, each variable is
     /// also passed in by name (values never appear on the docker command line).
     pub env: BTreeMap<String, String>,
+    pub session: SessionMode,
 }
 
 /// Live progress reported while the session runs.

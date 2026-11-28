@@ -36,7 +36,7 @@ use wh_core::{
 };
 use wh_eventstore::{EventHandler, EventStore, ExpectedVersion, StoreError};
 use wh_factory::{Factory, Improvement};
-use wh_runner::{AgentRequest, AgentRuntime, OutcomeStatus, worktree::Worktree};
+use wh_runner::{AgentRequest, AgentRuntime, OutcomeStatus, SessionMode, worktree::Worktree};
 
 pub use observe::{Observation, render};
 pub use prompt::{Answer, Fired, PrMetric, Workspace, build_prompt, evaluate_triggers, parse_answer};
@@ -400,6 +400,7 @@ impl<R: AgentRuntime> Inner<R> {
             tools: None,
             container: None,
             env: Default::default(),
+            session: SessionMode::Ephemeral,
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let o = self.runtime.run(&req, tx).await;

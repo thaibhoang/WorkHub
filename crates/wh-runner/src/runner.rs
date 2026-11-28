@@ -12,7 +12,7 @@ use wh_eventstore::{EventStore, ExpectedVersion};
 
 use crate::{
     docker,
-    runtime::{AgentRequest, AgentRuntime, Outcome, OutcomeStatus, Signal},
+    runtime::{AgentRequest, AgentRuntime, Outcome, OutcomeStatus, SessionMode, Signal},
     worktree::Worktree,
 };
 
@@ -246,6 +246,7 @@ impl<R: AgentRuntime> Runner<R> {
             tools: spec.tools.clone(),
             container,
             env: spec.env.clone(),
+            session: SessionMode::Ephemeral,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();

@@ -14,7 +14,7 @@ use wh_eventstore::EventStore;
 use wh_factory::Factory;
 use wh_metrics::queries;
 use wh_runner::{
-    AgentRequest, AgentRuntime, OutcomeStatus, Signal,
+    AgentRequest, AgentRuntime, OutcomeStatus, SessionMode, Signal,
     claude_code::ClaudeCode,
     docker::{self, AUTH_ENV},
     worktree::Worktree,
@@ -273,6 +273,7 @@ async fn smoke_session(d: &DockerSandbox) -> Result<()> {
         tools: None,
         container: Some(container),
         env: Default::default(),
+        session: SessionMode::Ephemeral,
     };
     println!("smoke: running Claude Code (Haiku) in {} ...", d.image);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
